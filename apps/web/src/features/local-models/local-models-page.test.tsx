@@ -2994,6 +2994,262 @@ describe("Model source", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows unified memory breakdown on hover/click and in Details, with Recheck memory inside Details", async () => {
+    const initialMac = macView({
+      computer: {
+        ...macView().computer,
+        host: {
+          ...macView().computer.host!,
+          memory_pressure: "normal",
+          metal_working_set_bytes: gb(17.8),
+          ram_available_bytes: gb(9.1),
+          ram_total_bytes: gb(24),
+        },
+      },
+      pools: [
+        {
+          ...memoryPool("unified", 21.5),
+          reserve_bytes: gb(2.5),
+          used_bytes: gb(14.9),
+        },
+      ],
+    });
+    const fixture = setup([initialMac]);
+    await renderPage(fixture);
+    await findModels();
+
+    const headerTrigger = screen.getByRole("button", { name: /6\.6 GB free/ });
+    fireEvent.mouseEnter(headerTrigger);
+    const popover = screen.getByRole("region", {
+      name: "Unified memory breakdown",
+    });
+    expect(popover).toHaveTextContent("Physical memory24 GB");
+    expect(popover).toHaveTextContent("Reclaimable & free9.1 GB");
+    expect(popover).toHaveTextContent("Reserved for macOS & Linger2.5 GB");
+    expect(popover).toHaveTextContent("Available for models6.6 GB");
+    expect(popover).toHaveTextContent("Per-model Metal GPU cap17.8 GB");
+
+    fireEvent.mouseLeave(headerTrigger);
+    expect(
+      screen.queryByRole("region", { name: "Unified memory breakdown" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    const detailsDialog = screen.getByRole("dialog", {
+      name: "Mac Studio details",
+    });
+    // Hardware rows do not duplicate the PoolBar breakdown popover.
+    expect(detailsDialog).not.toHaveTextContent("Reclaimable");
+    expect(detailsDialog).not.toHaveTextContent("System reserve");
+    expect(detailsDialog).not.toHaveTextContent("Metal GPU limit");
+
+    fireEvent.mouseEnter(
+      within(detailsDialog).getByRole("button", { name: "6.6 GB free" }),
+    );
+    const detailsPopover = within(detailsDialog).getByRole("region", {
+      name: "Unified memory breakdown",
+    });
+    expect(detailsPopover).toBeVisible();
+    expect(detailsPopover).toHaveTextContent("Physical memory24 GB");
+    expect(detailsPopover).toHaveTextContent("Reclaimable & free9.1 GB");
+    expect(detailsPopover).toHaveTextContent(
+      "Reserved for macOS & Linger2.5 GB",
+    );
+    expect(detailsPopover).toHaveTextContent("Available for models6.6 GB");
+    expect(detailsPopover).toHaveTextContent("Per-model Metal GPU cap17.8 GB");
+
+    const recheck = within(detailsDialog).getByRole("button", {
+      name: "Recheck memory",
+    });
+    await waitFor(() => expect(recheck).toBeEnabled());
+    fireEvent.click(recheck);
+    await waitFor(() =>
+      expect(fixture.refreshes).toEqual(["computer-mac", "computer-mac"]),
+    );
+  });
+
+  it("soft-checks live memory before downloading and supports Download only or Recheck to Download and load", async () => {
+    const lowRoomModel = modelView(
+      localModel({
+        download_bytes: gb(11.2),
+        fit: "unified",
+        fits_now: false,
+        id: "qwen3.8-27b-iq3s:UD-IQ3_S",
+        load_free_bytes: gb(6.6),
+        load_need_bytes: gb(18.4),
+        memory_bytes: gb(20.8),
+        name: "Qwen3.8 27B (UD-IQ3_S)",
+        pool: "unified",
+        state: "absent",
+      }),
+    );
+    const secondLowRoom = modelView(
+      localModel({
+        download_bytes: gb(10.5),
+        fit: "unified",
+        fits_now: false,
+        id: "gemma3-27b:Q4_K_M",
+        load_free_bytes: gb(6.6),
+        load_need_bytes: gb(17.5),
+        memory_bytes: gb(19.2),
+        name: "Gemma 3 27B",
+        pool: "unified",
+        state: "absent",
+      }),
+    );
+    const mac = macView({
+      models: [lowRoomModel, secondLowRoom],
+      pools: [
+        {
+          ...memoryPool("unified", 21.5),
+          reserve_bytes: gb(2.5),
+          used_bytes: gb(14.9),
+        },
+      ],
+    });
+    const fixture = setup([mac]);
+    await renderPage(fixture);
+    await findModels();
+
+    expect(statusOf("Qwen3.8 27B (UD-IQ3_S)")).toContain(
+      "needs 18.4 GB free to load",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Qwen3.8 27B (UD-IQ3_S)" }),
+    );
+    expect(
+      screen.getByRole("region", { name: "Qwen3.8 27B (UD-IQ3_S) details" }),
+    ).toHaveTextContent("it needs 18.4 GB free and only 6.6 GB is free");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Download Qwen3.8 27B (UD-IQ3_S)" }),
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "Not enough free memory to load now",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Download only" }),
+    );
+    await waitFor(() =>
+      expect(fixture.actions).toEqual([
+        {
+          body: { action: "download", no_autoload: true },
+          computerId: "computer-mac",
+          modelId: "qwen3.8-27b-iq3s:UD-IQ3_S",
+        },
+      ]),
+    );
+
+    // Open on a second model and use Recheck memory; once room opens up, Download and load becomes active.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Download Gemma 3 27B" }),
+    );
+    const recheckDialog = screen.getByRole("dialog", {
+      name: "Not enough free memory to load now",
+    });
+    const recheck = within(recheckDialog).getByRole("button", {
+      name: "Recheck memory",
+    });
+    await waitFor(() => expect(recheck).toBeEnabled());
+    fireEvent.click(recheck);
+    await waitFor(() =>
+      expect(fixture.refreshes).toEqual(["computer-mac", "computer-mac"]),
+    );
+
+    publishSnapshot(
+      fixture,
+      macView({
+        models: [
+          modelView({ ...lowRoomModel.model, state: "idle" }),
+          modelView({
+            ...secondLowRoom.model,
+            fits_now: true,
+            load_free_bytes: undefined,
+            load_need_bytes: undefined,
+          }),
+        ],
+        observed_at: "2026-11-13T10:08:00.000Z",
+        pools: [
+          {
+            ...memoryPool("unified", 21.5),
+            reserve_bytes: gb(2.5),
+            used_bytes: gb(1),
+          },
+        ],
+      }),
+    );
+
+    const readyDialog = await screen.findByRole("dialog", {
+      name: "Ready to download and load",
+    });
+    fireEvent.click(
+      within(readyDialog).getByRole("button", { name: "Download and load" }),
+    );
+    await waitFor(() =>
+      expect(fixture.actions).toEqual([
+        {
+          body: { action: "download", no_autoload: true },
+          computerId: "computer-mac",
+          modelId: "qwen3.8-27b-iq3s:UD-IQ3_S",
+        },
+        {
+          body: { action: "download" },
+          computerId: "computer-mac",
+          modelId: "gemma3-27b:Q4_K_M",
+        },
+      ]),
+    );
+  });
+
+  it("shows passive low-memory warning while downloading directly without no_autoload when fits_now is absent on older Computers", async () => {
+    const legacyLowRoomModel = modelView(
+      localModel({
+        download_bytes: gb(11.2),
+        fit: "unified",
+        id: "qwen3.8-27b-iq3s:UD-IQ3_S",
+        memory_bytes: gb(20.8),
+        name: "Qwen3.8 27B (UD-IQ3_S)",
+        pool: "unified",
+        state: "absent",
+      }),
+    );
+    const mac = macView({
+      models: [legacyLowRoomModel],
+      pools: [
+        {
+          ...memoryPool("unified", 21.5),
+          used_bytes: gb(14.9),
+        },
+      ],
+    });
+    const fixture = setup([mac]);
+    await renderPage(fixture);
+    await findModels();
+
+    expect(statusOf("Qwen3.8 27B (UD-IQ3_S)")).toContain(
+      "needs 20.8 GB free to load",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Qwen3.8 27B (UD-IQ3_S)" }),
+    );
+    expect(
+      screen.getByRole("region", { name: "Qwen3.8 27B (UD-IQ3_S) details" }),
+    ).toHaveTextContent("it needs 20.8 GB free and only 6.6 GB is free");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Download Qwen3.8 27B (UD-IQ3_S)" }),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(fixture.actions).toEqual([
+        {
+          body: { action: "download" },
+          computerId: "computer-mac",
+          modelId: "qwen3.8-27b-iq3s:UD-IQ3_S",
+        },
+      ]),
+    );
+  });
+
   it("shows a readable error while keeping the library when reading model source fails", async () => {
     const fixture = setup();
     fixture.runtime.server.on("GET", modelSourcePath, () =>
