@@ -473,7 +473,14 @@ Computer user's own instruction files:
   from the projected `config.toml` and its profiles.
 - Pi runs with `--no-context-files`, and it always gets `--system-prompt` and
   `--append-system-prompt`, empty when there is nothing to pass, so it reads
-  neither the user's `SYSTEM.md` nor their `APPEND_SYSTEM.md`.
+  neither the user's `SYSTEM.md` nor their `APPEND_SYSTEM.md`. When the
+  Computer tools' managed Pi extension (`extensions/pi-mcp.mjs`) is installed,
+  Pi loads it on every managed run to sort and bound verbose skill descriptions
+  on small-window (`<= 128K`) and local (`localmodels/*`,
+  `localmodels-library/*`, excluding `localmodels-byok`) models, defer MCP
+  server tools behind `tool_search` with static `<mcp_servers>` descriptions
+  for KV prefix stability, and cap compaction reasoning effort and
+  summary/retention budgets on small-window and local models.
 - Antigravity is the exception: its ACP server has no switch that turns off
   the user's own rules, skills and `~/.gemini/config/mcp_config.json`, so an
   Antigravity run sees them next to the Daemon's instructions and servers.
