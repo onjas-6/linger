@@ -15,6 +15,7 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/roboto-slab";
 import "@/app/globals.css";
 import { loadHanFont } from "@/app/han-font";
+import { restoreTheme } from "@/app/theme";
 import { installVitePreloadRecovery } from "@/app/vite-preload-recovery";
 import { DesktopConnectorReturn } from "@/features/apps/desktop-connector-return";
 import { createBrowserTeamHubRuntime } from "@/features/teamhub/browser-teamhub-runtime";
@@ -28,6 +29,9 @@ import { useT } from "@/i18n/use-translation";
 installVitePreloadRecovery({ buildId: import.meta.url });
 markDesktopShell();
 loadHanFont(navigator.languages);
+// The remembered theme is applied before the first paint, so dark mode never
+// flashes by in light first.
+restoreTheme();
 
 const rootElement = document.getElementById("root");
 

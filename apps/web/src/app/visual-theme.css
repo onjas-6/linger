@@ -44,6 +44,67 @@
     0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
 }
 
+/*
+  The dark theme: a night version of the Town palette, selected by
+  data-theme="dark" on the document element. Colors keep their hues and
+  lighten enough to read on dark surfaces; neutrals become low-luminance
+  warm greys that keep Town's paper feel. The voice PiP window mirrors
+  every document attribute, so it follows along on its own.
+*/
+[data-theme="dark"] {
+  color-scheme: dark;
+  --town-background: 60 9% 7%;
+  --town-foreground: 60 14% 92%;
+  --town-card: 60 8% 10%;
+  --town-popover: 60 8% 12%;
+  --town-primary: 60 14% 92%;
+  --town-primary-foreground: 60 9% 9%;
+  --town-secondary: 60 6% 16%;
+  --town-secondary-foreground: 60 10% 80%;
+  --town-muted: 60 6% 14%;
+  --town-muted-foreground: 58 7% 62%;
+  --town-accent: 60 6% 16%;
+  --town-accent-foreground: 60 14% 92%;
+  --town-destructive: 8 86% 60%;
+  --town-destructive-foreground: 0 0% 100%;
+  --town-info: 207 88% 65%;
+  --town-success: 98 45% 55%;
+  --town-warning: 37 95% 58%;
+  --town-border: 60 6% 19%;
+  --town-border-hover: 60 6% 26%;
+  --town-border-heavy: 60 14% 92%;
+  --town-input: 60 6% 19%;
+  --town-input-hover: 60 6% 26%;
+  --town-sidebar: 60 10% 8.5%;
+  --town-sidebar-foreground: 60 14% 92%;
+  --town-sidebar-muted: 60 7% 13%;
+  --town-sidebar-border: 60 6% 16%;
+  --town-highlight: 207 90% 62%;
+  --town-button-accent: 208 60% 60%;
+  --town-comment-amber: 45 90% 60%;
+  --town-send: 221 90% 62%;
+  --town-send-hover: 224 88% 68%;
+  --town-shadow-outline: 0 0 0 1px #00000059;
+  --town-shadow-sm: 0 0 0 1px #00000059, 0 1px 3px #00000073, 0 0 1px #00000073;
+  --town-shadow-md: 0 0 0 1px #00000059, 0 2px 8px #00000080, 0 0 2px #00000073;
+  --town-shadow-lg:
+    0 0 0 1px #00000059, 0 4px 16px #0000008c, 0 2px 6px -2px #00000073;
+  --town-shadow-xl:
+    0 0 0 1px #00000059, 0 8px 32px #00000099, 0 2px 8px -4px #00000080;
+  --town-shadow-button:
+    0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px -1px rgba(0, 0, 0, 0.4);
+}
+
+/* The hard-coded rgba shadow colors that do not derive from --town-* are
+   too faint on dark surfaces, so the dark theme gives them more opacity. */
+[data-theme="dark"] {
+  --app-floating-shadow-color: rgba(0, 0, 0, 0.4);
+  --app-modal-shadow-color: rgba(0, 0, 0, 0.45);
+  --message-hover-shadow-color: rgba(0, 0, 0, 0.3);
+  --composer-shadow-color: rgba(0, 0, 0, 0.4);
+  --composer-shadow-focus-color: rgba(0, 0, 0, 0.45);
+}
+
 :root {
   --app-canvas: hsl(var(--town-background));
   --app-surface: hsl(var(--town-card));
