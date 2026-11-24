@@ -203,6 +203,9 @@ function GatewayTabPanel({
   const canUseDesktopGateway = Boolean(
     isLocalDesktop && localGateway && desktopGatewayInfo?.available,
   );
+  const canOpenDesktopAdmin = Boolean(
+    canUseDesktopGateway && desktopGatewayInfo?.adminUrl,
+  );
 
   function toggleRevealPassword() {
     if (!localGateway) return;
@@ -282,7 +285,7 @@ function GatewayTabPanel({
                       endpoint={effectiveAdminUrl}
                       title={t(m.copyGatewayAdminUrl)}
                     />
-                    {canUseDesktopGateway ? (
+                    {canOpenDesktopAdmin ? (
                       <Button
                         onClick={openDesktopAdmin}
                         size="compact"
@@ -412,7 +415,7 @@ function GatewayTabPanel({
                 <CopyEndpoint
                   ariaLabel={t(m.copyGatewayUsername)}
                   copiedAriaLabel={t(m.copiedGatewayUsername)}
-                  endpoint={desktopGatewayInfo?.username ?? "admin"}
+                  endpoint={desktopGatewayInfo?.username ?? "localmodels"}
                   title={t(m.copyGatewayUsername)}
                 />
               </Fact>
@@ -631,7 +634,7 @@ function DiagnosticsTabPanel({
   const [diagnosticsApi] = useState(desktopDiagnostics);
   const [localGateway] = useState(desktopLocalGateway);
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const host = view.computer.host;
   const loadedServers = loadedEntries.filter((entry) =>
     Boolean(entry.model.endpoint?.base_url),
@@ -642,12 +645,20 @@ function DiagnosticsTabPanel({
 
   function saveDiagnostics() {
     if (!diagnosticsApi) return;
-    setSaveError(false);
+    setActionError(null);
     setSaving(true);
     void diagnosticsApi
       .save()
-      .catch(() => setSaveError(true))
+      .catch(() => setActionError(t(m.saveDiagnosticsFailed)))
       .finally(() => setSaving(false));
+  }
+
+  function openDesktopFolder() {
+    if (!localGateway) return;
+    setActionError(null);
+    void localGateway
+      .openFolder(computerId)
+      .catch(() => setActionError(t(m.gatewayOpenFolderFailed)));
   }
 
   return (
@@ -746,21 +757,15 @@ function DiagnosticsTabPanel({
               </Button>
             ) : null}
             {canOpenFolder && localGateway ? (
-              <Button
-                onClick={() => void localGateway.openFolder(computerId)}
-                size="compact"
-                tone="ghost"
-              >
+              <Button onClick={openDesktopFolder} size="compact" tone="ghost">
                 <Icon icon={Folder01Icon} size={14} />
                 {t(m.gatewayOpenFolder)}
               </Button>
             ) : null}
           </div>
-          {saveError ? (
+          {actionError ? (
             <div className="mt-2">
-              <FormFeedback tone="danger">
-                {t(m.saveDiagnosticsFailed)}
-              </FormFeedback>
+              <FormFeedback tone="danger">{actionError}</FormFeedback>
             </div>
           ) : null}
         </section>

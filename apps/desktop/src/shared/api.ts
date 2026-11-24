@@ -202,8 +202,9 @@ export interface LingerDesktopApi {
     save(): Promise<void>;
   };
   // Local-only access to this computer's managed Bifrost gateway credentials
-  // and folder. Absent in a browser and in older desktop builds, and gated to
-  // the desktop's own enrolled computerId.
+  // and folder. Absent in a browser and in older desktop builds. The
+  // configured serverUrl origin check is the IPC security boundary; matching
+  // computerId only routes the UI to this desktop's enrolled computer.
   readonly localGateway?: {
     getInfo(computerId: string): Promise<DesktopLocalGatewayInfo>;
     revealPassword(computerId: string): Promise<{ readonly password: string }>;

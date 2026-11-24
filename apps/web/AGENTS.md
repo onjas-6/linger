@@ -86,7 +86,8 @@ gateway` readiness and shared `/v1` endpoint (from
   (`local-model-advanced-dialog.tsx`) grouping `Gateway & access` (shared `/v1`
   endpoint, admin console address, loaded Gateway Model IDs with copyable
   `curl` snippets, and Linger Desktop local-only Bifrost admin credentials via
-  `window.lingerDesktop.localGateway` gated to the desktop's own `computerId`),
+  `window.lingerDesktop.localGateway`, where the Desktop `serverUrl` origin is
+  the IPC boundary and `computerId` routes the UI to this computer),
   `Memory & hardware`, and `Diagnostics` (runtime versions, per-model backend
   servers, and Desktop `Save diagnostics`), and top diagnostic callouts with a
   two-column model-card facts
