@@ -42,6 +42,7 @@ describe("LocalGatewayService", () => {
 
   afterEach(async () => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     for (const dir of dirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
     }
@@ -66,6 +67,9 @@ describe("LocalGatewayService", () => {
   it("reads gateway metadata without returning the password, reveals on demand, and auto-clears clipboard after 60s", async () => {
     vi.useFakeTimers();
     const root = await tempDir();
+    const fakeUserHome = path.join(root, "fake-user-home");
+    vi.stubEnv("HOME", fakeUserHome);
+    vi.stubEnv("USERPROFILE", fakeUserHome);
     const home = path.join(root, "linger-home");
     const toolsDir = path.join(home, "runtime", "localmodels", "tools");
     const bifrostDir = path.join(home, "runtime", "localmodels", "bifrost");
@@ -103,18 +107,9 @@ describe("LocalGatewayService", () => {
     const showFile = vi.fn();
     const service = new LocalGatewayService({
       home: () => home,
-      runtimeEnvironment: () => ({
-        LINGER_LOCALMODELS_STATE: path.join(
-          home,
-          "runtime",
-          "localmodels",
-          "state",
-        ),
-      }),
       clipboard,
       openExternal,
       showFile,
-      homedir: () => path.join(root, "fake-user-home"),
     });
 
     const info = await service.getInfo();
@@ -158,6 +153,9 @@ describe("LocalGatewayService", () => {
   it("refuses world-readable or symlinked admin-password files on POSIX", async () => {
     if (process.platform === "win32") return;
     const root = await tempDir();
+    const fakeUserHome = path.join(root, "fake-user-home");
+    vi.stubEnv("HOME", fakeUserHome);
+    vi.stubEnv("USERPROFILE", fakeUserHome);
     const home = path.join(root, "linger-home");
     const bifrostDir = path.join(home, "runtime", "localmodels", "bifrost");
     await mkdir(bifrostDir, { recursive: true });
@@ -168,11 +166,9 @@ describe("LocalGatewayService", () => {
 
     const service = new LocalGatewayService({
       home: () => home,
-      runtimeEnvironment: () => undefined,
       clipboard: fakeClipboard(),
       openExternal: vi.fn(async () => {}),
       showFile: vi.fn(),
-      homedir: () => path.join(root, "fake-user-home"),
     });
 
     expect(await service.getInfo()).toMatchObject({
@@ -196,15 +192,134 @@ describe("LocalGatewayService", () => {
     service.dispose();
   });
 
-  it("returns available: false when no local Bifrost gateway exists", async () => {
+  it("never falls back to another installation's shared legacy gateway when this home is isolated", async () => {
     const root = await tempDir();
+    const fakeUserHome = path.join(root, "fake-user-home");
+    vi.stubEnv("HOME", fakeUserHome);
+    vi.stubEnv("USERPROFILE", fakeUserHome);
+
+    const sharedTools = path.join(
+      fakeUserHome,
+      ".local",
+      "share",
+      "localmodels",
+      "tools",
+    );
+    const sharedBifrost = path.join(
+      fakeUserHome,
+      ".local",
+      "share",
+      "localmodels",
+      "bifrost",
+    );
+    await mkdir(sharedTools, { recursive: true });
+    await mkdir(sharedBifrost, { recursive: true });
+    await writeFile(
+      path.join(sharedTools, "owned.json"),
+      JSON.stringify({
+        schema: "localmodels.owned/v1",
+        gateway: {
+          bifrost: {
+            addr: "127.0.0.1:18499",
+            app_dir: sharedBifrost,
+          },
+        },
+      }),
+    );
+    const foreignPw = path.join(sharedBifrost, "admin-password");
+    await writeFile(foreignPw, "other-install-secret\n", { mode: 0o600 });
+    if (process.platform !== "win32") await chmod(foreignPw, 0o600);
+    await writeFile(path.join(sharedBifrost, "config.json"), "{}");
+
+    const isolatedHome = path.join(root, "fresh-linger-home");
     const service = new LocalGatewayService({
-      home: () => path.join(root, "empty-home"),
-      runtimeEnvironment: () => undefined,
+      home: () => isolatedHome,
       clipboard: fakeClipboard(),
       openExternal: vi.fn(async () => {}),
       showFile: vi.fn(),
-      homedir: () => path.join(root, "fake-user-home"),
+    });
+
+    expect(await service.getInfo()).toEqual({ available: false });
+    await expect(service.revealPassword()).rejects.toThrow(/not configured/);
+    await expect(service.openAdmin()).rejects.toThrow(/not available/);
+    service.dispose();
+  });
+
+  it("reads a legacy home's shared Bifrost gateway when its tools-dir marker points there", async () => {
+    const root = await tempDir();
+    const fakeUserHome = path.join(root, "fake-user-home");
+    vi.stubEnv("HOME", fakeUserHome);
+    vi.stubEnv("USERPROFILE", fakeUserHome);
+
+    const legacyTools = path.join(
+      fakeUserHome,
+      ".local",
+      "share",
+      "localmodels",
+      "tools",
+    );
+    const legacyBifrost = path.join(
+      fakeUserHome,
+      ".local",
+      "share",
+      "localmodels",
+      "bifrost",
+    );
+    await mkdir(legacyTools, { recursive: true });
+    await mkdir(legacyBifrost, { recursive: true });
+    await writeFile(
+      path.join(legacyTools, "owned.json"),
+      JSON.stringify({
+        schema: "localmodels.owned/v1",
+        gateway: {
+          bifrost: {
+            addr: "127.0.0.1:18482",
+            app_dir: legacyBifrost,
+          },
+        },
+      }),
+    );
+    const legacyPw = path.join(legacyBifrost, "admin-password");
+    await writeFile(legacyPw, "legacy-secret\n", { mode: 0o600 });
+    if (process.platform !== "win32") await chmod(legacyPw, 0o600);
+
+    const legacyHome = path.join(root, "legacy-linger-home");
+    const markerDir = path.join(legacyHome, "runtime", "localmodels");
+    await mkdir(markerDir, { recursive: true });
+    const markerFile = path.join(markerDir, "tools-dir");
+    await writeFile(markerFile, `${legacyTools}\n`, { mode: 0o600 });
+    if (process.platform !== "win32") await chmod(markerFile, 0o600);
+
+    const service = new LocalGatewayService({
+      home: () => legacyHome,
+      clipboard: fakeClipboard(),
+      openExternal: vi.fn(async () => {}),
+      showFile: vi.fn(),
+    });
+
+    expect(await service.getInfo()).toEqual({
+      available: true,
+      adminUrl: "http://127.0.0.1:18482",
+      username: "localmodels",
+      hasPassword: true,
+      inferenceAuthDisabled: true,
+    });
+    expect(await service.revealPassword()).toEqual({
+      password: "legacy-secret",
+    });
+    service.dispose();
+  });
+
+  it("returns available: false when no local Bifrost gateway exists", async () => {
+    const root = await tempDir();
+    const fakeUserHome = path.join(root, "fake-user-home");
+    vi.stubEnv("HOME", fakeUserHome);
+    vi.stubEnv("USERPROFILE", fakeUserHome);
+    const service = new LocalGatewayService({
+      home: () => path.join(root, "empty-home"),
+      clipboard: fakeClipboard(),
+      openExternal: vi.fn(async () => {}),
+      showFile: vi.fn(),
     });
     expect(await service.getInfo()).toEqual({ available: false });
     await expect(service.openAdmin()).rejects.toThrow(/not available/);

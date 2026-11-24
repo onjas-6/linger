@@ -265,6 +265,8 @@ export class DesktopIpcModule implements Module {
     handle(IPC.updateCheck, () => updater.check());
 
     const localGateway = this.#localGateway;
+    // Security boundary is `handle()`'s `serverUrl` origin check; `isOwnComputer`
+    // is a UI-routing guard so calls only target this desktop's enrolled computer.
     const isOwnComputer = (computerId: unknown): boolean => {
       const requested = computerIdInput.parse(computerId);
       const enrolled = ctx.config.get().computerId;

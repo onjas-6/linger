@@ -1,38 +1,29 @@
 import { lstat, readFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
 import {
-  localmodelsBifrostDirectory,
-  localmodelsStateDirectory,
+  parseLoopbackBifrostAddress,
+  resolveLocalmodelsBifrostLocation,
 } from "@linger/local-installation/localmodels-tool";
 
 import type { DesktopLocalGatewayInfo } from "../shared/api.js";
-import { CLIPBOARD_CLEAR_MS } from "./setup-account.js";
+import {
+  SecretClipboard,
+  type SecretClipboardTarget,
+} from "./secret-clipboard.js";
 
 const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
-const MAX_OWNED_BYTES = 1024 * 1024;
 const MAX_PASSWORD_BYTES = 4096;
-const MAX_SMALL_FILE_BYTES = 1024;
-const DEFAULT_ADMIN_USER = "admin";
+const DEFAULT_ADMIN_USER = "localmodels";
 
-export interface LocalGatewayClipboard {
-  writeText(text: string): Promise<void>;
-  readText(): Promise<string>;
-  clear(): void;
-}
+export type LocalGatewayClipboard = SecretClipboardTarget;
 
 export interface LocalGatewayOptions {
   /** Returns the current installation's Linger home directory. */
   readonly home: () => string;
-  /** Returns the desktop config's saved runtimeEnvironment (if any). */
-  readonly runtimeEnvironment: () =>
-    | Readonly<Record<string, string>>
-    | undefined;
   readonly clipboard: LocalGatewayClipboard;
   readonly openExternal: (url: string) => Promise<void>;
   readonly showFile: (file: string) => void;
-  readonly homedir?: () => string;
   readonly clearAfterMs?: number;
 }
 
@@ -50,11 +41,8 @@ export function parseLoopbackAdminUrl(raw: unknown): string | undefined {
     .trim()
     .replace(/^http:\/\//, "")
     .replace(/\/+$/, "");
-  const match = /^127\.0\.0\.1:([1-9][0-9]{0,4})$/.exec(trimmed);
-  if (!match) return undefined;
-  const port = Number(match[1]);
-  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return undefined;
-  return `http://127.0.0.1:${port}`;
+  const parsed = parseLoopbackBifrostAddress(trimmed);
+  return parsed ? `http://${parsed.addr}` : undefined;
 }
 
 async function readOwnedRegularFile(
@@ -119,36 +107,21 @@ async function readJsonObject(
   }
 }
 
-async function readOwnedBifrost(
-  toolsDir: string,
-): Promise<{ appDir?: string; adminUrl?: string }> {
-  const owned = await readJsonObject(
-    path.join(toolsDir, "owned.json"),
-    MAX_OWNED_BYTES,
-  );
-  const bifrost = field(field(owned, "gateway"), "bifrost");
-  const rawAppDir = field(bifrost, "app_dir");
-  const appDir =
-    typeof rawAppDir === "string" && path.isAbsolute(rawAppDir)
-      ? path.normalize(rawAppDir)
-      : undefined;
-  return {
-    ...(appDir ? { appDir } : {}),
-    adminUrl: parseLoopbackAdminUrl(field(bifrost, "addr")),
-  };
-}
-
 /**
  * Local-only reader and helper for this computer's managed Bifrost gateway.
- * Passwords are never cached and never cross TeamHub; they are read on demand
- * from the owner-only `admin-password` file in the Electron main process.
+ * Passwords are never cached and never cross TeamHub APIs; they are read on
+ * demand from the owner-only `admin-password` file in the Electron main process.
  */
 export class LocalGatewayService {
   readonly #options: LocalGatewayOptions;
-  #clearTimer: ReturnType<typeof setTimeout> | undefined;
+  readonly #clipboard: SecretClipboard;
 
   constructor(options: LocalGatewayOptions) {
     this.#options = options;
+    this.#clipboard = new SecretClipboard(
+      options.clipboard,
+      options.clearAfterMs,
+    );
   }
 
   async getInfo(): Promise<DesktopLocalGatewayInfo> {
@@ -170,9 +143,8 @@ export class LocalGatewayService {
       typeof rawDisableInferenceAuth === "boolean"
         ? rawDisableInferenceAuth
         : true;
-    const hasPassword = Boolean(
-      (await this.#readPassword(resolved.passwordPath)) !== undefined,
-    );
+    const hasPassword =
+      (await this.#readPassword(resolved.passwordPath)) !== undefined;
 
     return {
       available: true,
@@ -204,20 +176,7 @@ export class LocalGatewayService {
     readonly clearAfterMs: number;
   }> {
     const { password } = await this.revealPassword();
-    const clipboard = this.#options.clipboard;
-    const clearAfterMs = this.#options.clearAfterMs ?? CLIPBOARD_CLEAR_MS;
-    await clipboard.writeText(password);
-    clearTimeout(this.#clearTimer);
-    this.#clearTimer = setTimeout(() => {
-      this.#clearTimer = undefined;
-      void clipboard
-        .readText()
-        .then((current) => {
-          if (current === password) clipboard.clear();
-        })
-        .catch(() => undefined);
-    }, clearAfterMs);
-    this.#clearTimer.unref?.();
+    const clearAfterMs = await this.#clipboard.copy(password);
     return { copied: true, clearAfterMs };
   }
 
@@ -246,8 +205,7 @@ export class LocalGatewayService {
   }
 
   dispose(): void {
-    clearTimeout(this.#clearTimer);
-    this.#clearTimer = undefined;
+    this.#clipboard.dispose();
   }
 
   async #readPassword(passwordPath: string): Promise<string | undefined> {
@@ -259,77 +217,27 @@ export class LocalGatewayService {
   }
 
   async #resolve(): Promise<ResolvedGateway | undefined> {
-    const home = path.resolve(this.#options.home());
-    const env = this.#options.runtimeEnvironment();
-    const envState = env?.LINGER_LOCALMODELS_STATE;
-    const stateDir =
-      typeof envState === "string" && path.isAbsolute(envState)
-        ? path.normalize(envState)
-        : localmodelsStateDirectory(home);
-    const localmodelsRoot = path.dirname(stateDir);
-    const userHome = this.#options.homedir?.() ?? os.homedir();
-
-    // Match localmodels-tool.ts: check tools-dir marker, per-home tools, then legacy shared tools.
-    const toolsCandidates: string[] = [];
-    const markerRaw = await readOwnedRegularFile(
-      path.join(localmodelsRoot, "tools-dir"),
-      MAX_SMALL_FILE_BYTES,
+    const { bifrostDir, addr } = await resolveLocalmodelsBifrostLocation(
+      this.#options.home(),
     );
-    if (markerRaw) {
-      const markerPath = markerRaw.trim();
-      if (markerPath && path.isAbsolute(markerPath)) {
-        toolsCandidates.push(path.normalize(markerPath));
-      }
-    }
-    toolsCandidates.push(path.join(localmodelsRoot, "tools"));
-    toolsCandidates.push(
-      path.join(userHome, ".local", "share", "localmodels", "tools"),
+    const passwordPath = path.join(bifrostDir, "admin-password");
+    const configPath = path.join(bifrostDir, "config.json");
+    const hasPasswordFile = await isRegularOwnedFile(
+      passwordPath,
+      MAX_PASSWORD_BYTES,
     );
+    const hasConfigFile = await isRegularOwnedFile(
+      configPath,
+      MAX_CONFIG_BYTES,
+    );
+    if (!hasPasswordFile && !hasConfigFile) return undefined;
 
-    let ownedAppDir: string | undefined;
-    let adminUrl: string | undefined;
-    for (const dir of new Set(toolsCandidates)) {
-      const found = await readOwnedBifrost(dir);
-      if (found.appDir && !ownedAppDir) ownedAppDir = found.appDir;
-      if (found.adminUrl && !adminUrl) adminUrl = found.adminUrl;
-      if (ownedAppDir && adminUrl) break;
-    }
-
-    if (!adminUrl) {
-      const addrRaw = await readOwnedRegularFile(
-        path.join(localmodelsRoot, "bifrost-addr"),
-        MAX_SMALL_FILE_BYTES,
-      );
-      adminUrl = parseLoopbackAdminUrl(addrRaw);
-    }
-
-    const appDirCandidates = [
-      ownedAppDir,
-      path.join(localmodelsRoot, "bifrost"),
-      localmodelsBifrostDirectory(home),
-      path.join(userHome, ".local", "state", "localmodels", "bifrost"),
-    ].filter((dir): dir is string => Boolean(dir));
-
-    for (const appDir of new Set(appDirCandidates)) {
-      const passwordPath = path.join(appDir, "admin-password");
-      const configPath = path.join(appDir, "config.json");
-      const hasPasswordFile = await isRegularOwnedFile(
-        passwordPath,
-        MAX_PASSWORD_BYTES,
-      );
-      const hasConfigFile = await isRegularOwnedFile(
-        configPath,
-        MAX_CONFIG_BYTES,
-      );
-      if (hasPasswordFile || hasConfigFile) {
-        return {
-          appDir,
-          ...(adminUrl ? { adminUrl } : {}),
-          passwordPath,
-          configPath,
-        };
-      }
-    }
-    return undefined;
+    const adminUrl = parseLoopbackAdminUrl(addr);
+    return {
+      appDir: bifrostDir,
+      ...(adminUrl ? { adminUrl } : {}),
+      passwordPath,
+      configPath,
+    };
   }
 }

@@ -389,7 +389,6 @@ async function main(): Promise<void> {
       defaultDisplayName,
       localGateway: new LocalGatewayService({
         home: () => home,
-        runtimeEnvironment: () => config.get().runtimeEnvironment,
         clipboard: {
           writeText: async (text) => clipboard.writeText(text),
           readText: async () => clipboard.readText(),
