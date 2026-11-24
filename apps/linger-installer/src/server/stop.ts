@@ -5,7 +5,11 @@ import {
   INSTANCE_BUSY,
   loadInstance,
 } from "@linger/local-installation/instance";
-import { withLocalModelsLock } from "@linger/local-installation/local-models";
+import {
+  clearLocalModelsStopPending,
+  markLocalModelsStopPending,
+  withLocalModelsLock,
+} from "@linger/local-installation/local-models";
 import { stopLocalmodels } from "@linger/local-installation/localmodels-tool";
 import { stopNativeSource } from "@linger/local-installation/native-source";
 
@@ -18,6 +22,7 @@ export interface StopOptions {
   home: string;
   instanceName: string;
   signal: AbortSignal;
+  budgetMs?: number;
   log: (message: string) => void;
   onFailure?: (
     stage: "manager" | "services" | "localmodels",
@@ -38,6 +43,7 @@ export interface StopDependencies {
       signal: AbortSignal;
       log: (message: string) => void;
       keepController?: boolean;
+      budgetMs?: number;
     },
   ) => Promise<void>;
   fetch?: typeof fetch;
@@ -64,6 +70,10 @@ export async function stopDesktopInstallation(
     "the installation",
     options.onFailure,
   );
+  const deadline =
+    options.budgetMs !== undefined ? Date.now() + options.budgetMs : undefined;
+  const remainingBudgetMs = () =>
+    deadline !== undefined ? Math.max(1, deadline - Date.now()) : undefined;
   for (const home of await installationHomes(options.home)) {
     // The services stop even when the manager could not: an earlier release's
     // manager has no /api/stop, and a stale session may name another server.
@@ -80,7 +90,15 @@ export async function stopDesktopInstallation(
     );
     await attempt(
       home,
-      () => stopModels(home, { signal: options.signal, log: options.log }),
+      async () => {
+        const budgetMs = remainingBudgetMs();
+        await stopModels(home, {
+          signal: options.signal,
+          log: options.log,
+          ...(budgetMs !== undefined ? { budgetMs } : {}),
+        });
+        await clearLocalModelsStopPending(home).catch(() => undefined);
+      },
       "localmodels",
     );
   }
@@ -94,20 +112,30 @@ export async function stopDesktopInstallation(
  * controller keep running, as the services do after a quit; the next launch
  * brings the approved stack up again. Each home's stop holds that home's
  * local model lock; a home whose lock another operation holds is skipped.
+ * While stopping under the lock, a pending-stop marker is recorded and cleared
+ * only on success so a failed or interrupted quit stop is retried on the next
+ * launch before resume.
  */
 export async function stopDesktopLocalModels(
-  options: Pick<StopOptions, "home" | "signal" | "log">,
+  options: Pick<StopOptions, "home" | "signal" | "log" | "budgetMs">,
   { stopModels = stopLocalmodels }: Pick<StopDependencies, "stopModels"> = {},
 ): Promise<StopOutcome> {
   const { failed, attempt } = attempts(options.log, "the local models");
+  const deadline =
+    options.budgetMs !== undefined ? Date.now() + options.budgetMs : undefined;
+  const remainingBudgetMs = () =>
+    deadline !== undefined ? Math.max(1, deadline - Date.now()) : undefined;
   for (const home of await installationHomes(options.home))
     await attempt(home, async () => {
-      const stop = () =>
-        stopModels(home, {
+      const stop = () => {
+        const budgetMs = remainingBudgetMs();
+        return stopModels(home, {
           signal: options.signal,
           log: options.log,
           keepController: true,
+          ...(budgetMs !== undefined ? { budgetMs } : {}),
         });
+      };
       // Nothing ran localmodels in a home without its folder, and the lock
       // would create one there.
       if (!(await exists(path.join(home, "runtime", "localmodels"))))
@@ -115,7 +143,11 @@ export async function stopDesktopLocalModels(
       // The next launch's restore waits on this lock, so it never checks a
       // stack this stop is about to take down.
       try {
-        await withLocalModelsLock(home, stop);
+        await withLocalModelsLock(home, async () => {
+          await markLocalModelsStopPending(home).catch(() => undefined);
+          await stop();
+          await clearLocalModelsStopPending(home).catch(() => undefined);
+        });
       } catch (error) {
         if ((error as { code?: unknown }).code !== INSTANCE_BUSY) throw error;
         // A deployment holds the stack; stopping it now would break that

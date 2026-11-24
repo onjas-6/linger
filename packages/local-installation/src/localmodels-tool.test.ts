@@ -1685,3 +1685,118 @@ test("isolates a home whose shared deployment localmodels marked removed", async
     stat(localmodelsLegacyToolsMarkerFile(f.home)),
   ).rejects.toMatchObject({ code: "ENOENT" });
 });
+
+test("stopLocalmodels shares one budget across steps above 30 s while reserving time for stack down", async () => {
+  let clock = 1_000;
+  const timeouts: [string, number | undefined][] = [];
+  const run = vi.fn<typeof runLocalmodels>(async (_home, args, options) => {
+    const key = args.slice(0, 2).join(" ");
+    timeouts.push([key, options?.timeoutMs]);
+    if (key === "library status") {
+      clock += 40_000;
+      return libraryStatus([{ id: "qwen3-8b:Q4_K_M", state: "loaded" }]);
+    }
+    if (key === "library unload") {
+      clock += 42_000;
+      return { code: 0, stdout: "{}", stderr: "" };
+    }
+    clock += 35_000;
+    return { code: 0, stdout: "{}", stderr: "" };
+  });
+  await stopLocalmodels(
+    "/home",
+    {
+      signal: AbortSignal.timeout(5000),
+      keepController: true,
+      budgetMs: 135_000,
+    },
+    { run, installed: async () => true, now: () => clock },
+  );
+  expect(timeouts).toEqual([
+    ["library status", 60_000],
+    ["library unload", 50_000],
+    ["stack down", 53_000],
+  ]);
+});
+
+test("stopLocalmodels reserves budget for foundations stop and stack down even when earlier steps time out or share across multiple models", async () => {
+  let clock = 1_000;
+  const timeouts: [string, number | undefined][] = [];
+  const run = vi.fn<typeof runLocalmodels>(async (_home, args, options) => {
+    const key = args.slice(0, 2).join(" ");
+    timeouts.push([key, options?.timeoutMs]);
+    if (key === "library status") {
+      clock += 10_000;
+      return libraryStatus([
+        { id: "qwen3-8b:Q4_K_M", state: "loaded" },
+        { id: "gemma4-4b:Q4_K_M", state: "loaded" },
+      ]);
+    }
+    if (key === "library unload" && args[2] === "qwen3-8b:Q4_K_M") {
+      clock += options?.timeoutMs ?? 0;
+      throw Object.assign(new Error("Command timed out"), {
+        code: "COMMAND_TIMEOUT",
+      });
+    }
+    if (key === "library unload") {
+      clock += 5_000;
+      return { code: 0, stdout: "{}", stderr: "" };
+    }
+    if (key === "foundations stop") {
+      clock += 10_000;
+      return { code: 0, stdout: "{}", stderr: "" };
+    }
+    return { code: 0, stdout: "{}", stderr: "" };
+  });
+  await expect(
+    stopLocalmodels(
+      "/home",
+      { signal: AbortSignal.timeout(5000), budgetMs: 120_000 },
+      { run, installed: async () => true, now: () => clock },
+    ),
+  ).rejects.toThrow(
+    "localmodels library unload qwen3-8b:Q4_K_M: Command timed out",
+  );
+  // Library steps reserve 60 s (45 s for stack down + 15 s for foundations stop).
+  // After 10 s for status, 50 s is shared across 2 loaded models (25 s each);
+  // after model 1 times out at 25 s, model 2 gets 25 s and finishes in 5 s,
+  // leaving 80 s total: 35 s for foundations stop (45 s reserved), then 70 s for stack down.
+  expect(timeouts).toEqual([
+    ["library status", 60_000],
+    ["library unload", 25_000],
+    ["library unload", 25_000],
+    ["foundations stop", 35_000],
+    ["stack down", 70_000],
+  ]);
+});
+
+test("stopLocalmodels gives stack down the full remaining budget when library status times out", async () => {
+  let clock = 0;
+  const timeouts: [string, number | undefined][] = [];
+  const run = vi.fn<typeof runLocalmodels>(async (_home, args, options) => {
+    const key = args.slice(0, 2).join(" ");
+    timeouts.push([key, options?.timeoutMs]);
+    if (key === "library status") {
+      clock += options?.timeoutMs ?? 0;
+      throw Object.assign(new Error("Command timed out"), {
+        code: "COMMAND_TIMEOUT",
+      });
+    }
+    return { code: 0, stdout: "{}", stderr: "" };
+  });
+  await expect(
+    stopLocalmodels(
+      "/home",
+      {
+        signal: AbortSignal.timeout(5000),
+        keepController: true,
+        budgetMs: 135_000,
+      },
+      { run, installed: async () => true, now: () => clock },
+    ),
+  ).rejects.toThrow("localmodels library status: Command timed out");
+  expect(timeouts).toEqual([
+    ["library status", 60_000],
+    ["stack down", 75_000],
+  ]);
+});

@@ -4,7 +4,11 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 
 import { INSTANCE_BUSY } from "@linger/local-installation/instance";
-import { withLocalModelsLock } from "@linger/local-installation/local-models";
+import {
+  hasPendingLocalModelsStop,
+  markLocalModelsStopPending,
+  withLocalModelsLock,
+} from "@linger/local-installation/local-models";
 
 import { parseInstallerArguments } from "../main.js";
 import { launchInstaller } from "./launch.js";
@@ -308,4 +312,48 @@ test("a quit while a deployment holds the lock leaves that home's models running
   expect(stopModels).not.toHaveBeenCalled();
   expect(outcome.failed).toEqual([]);
   expect(log.join("\n")).toContain("another local model operation holds them");
+});
+
+test("a quit records a stop-pending marker while stopping and keeps it when the stop fails", async () => {
+  const value = await home();
+  await mkdir(path.join(value, "runtime/localmodels"), { recursive: true });
+  let pendingDuringStop = false;
+  const okOutcome = await stopDesktopLocalModels(
+    { ...options(value), budgetMs: 135_000 },
+    {
+      stopModels: async (at, opts) => {
+        pendingDuringStop = await hasPendingLocalModelsStop(at);
+        expect(opts.budgetMs).toBeGreaterThan(0);
+        expect(opts.budgetMs).toBeLessThanOrEqual(135_000);
+      },
+    },
+  );
+  expect(okOutcome.failed).toEqual([]);
+  expect(pendingDuringStop).toBe(true);
+  expect(await hasPendingLocalModelsStop(value)).toBe(false);
+
+  const failedOutcome = await stopDesktopLocalModels(options(value), {
+    stopModels: async () => {
+      throw new Error("localmodels stack down: Command timed out");
+    },
+  });
+  expect(failedOutcome.failed).toHaveLength(1);
+  expect(await hasPendingLocalModelsStop(value)).toBe(true);
+});
+
+test("a full uninstall stop clears any lingering stop-pending marker on success", async () => {
+  const value = await home();
+  await markLocalModelsStopPending(value);
+  const outcome = await stopDesktopInstallation(
+    { ...options(value), budgetMs: 120_000 },
+    {
+      load: async () => undefined,
+      stopModels: async (_at, opts) => {
+        expect(opts.budgetMs).toBeGreaterThan(0);
+        expect(opts.budgetMs).toBeLessThanOrEqual(120_000);
+      },
+    },
+  );
+  expect(outcome.failed).toEqual([]);
+  expect(await hasPendingLocalModelsStop(value)).toBe(false);
 });

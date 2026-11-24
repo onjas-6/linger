@@ -10,13 +10,18 @@ import path from "node:path";
 import os from "node:os";
 import { afterEach, expect, test, vi } from "vitest";
 import {
+  clearLocalModelsStopPending,
+  hasPendingLocalModelsStop,
   isLocalRuntimeModel,
   localModelsDegradedFromError,
   localModelsDegradedFromOutcome,
+  localModelsStopPendingFile,
+  markLocalModelsStopPending,
   prepareLocalModels,
   localModelsEnvironment,
   reasonCodeList,
   restoreLocalModels,
+  retryPendingLocalModelsStop,
   stackProgress,
   localModelsLockFile,
   withLocalModelsLock,
@@ -2341,4 +2346,105 @@ test("extracts degraded local model details with valid reason codes only", () =>
     code: "LOCAL_MODELS_RECOVERY_REQUIRED",
     message: "Invalid upstream local model binding.",
   });
+});
+
+test("retryPendingLocalModelsStop is a no-op when no stop-pending marker exists", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "local-models-stop-none-"));
+  roots.push(home);
+  const stopModels = vi.fn(async () => {});
+  let lockCalled = false;
+  const withLock: typeof withLocalModelsLock = (at, callback, timing) => {
+    lockCalled = true;
+    return withLocalModelsLock(at, callback, timing);
+  };
+  expect(
+    await retryPendingLocalModelsStop(
+      home,
+      { signal: AbortSignal.timeout(5000) },
+      { stopModels, withLock },
+    ),
+  ).toEqual({ retried: false });
+  expect(lockCalled).toBe(false);
+  expect(stopModels).not.toHaveBeenCalled();
+});
+
+test("retryPendingLocalModelsStop retries once and clears the marker on success", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "local-models-stop-ok-"));
+  roots.push(home);
+  await markLocalModelsStopPending(home);
+  expect(await hasPendingLocalModelsStop(home)).toBe(true);
+  await expectPrivate(localModelsStopPendingFile(home), "file");
+  const stopModels = vi.fn(async () => {});
+  const logs: string[] = [];
+  expect(
+    await retryPendingLocalModelsStop(
+      home,
+      { signal: AbortSignal.timeout(5000), log: (line) => logs.push(line) },
+      { stopModels },
+    ),
+  ).toEqual({ retried: true });
+  expect(stopModels).toHaveBeenCalledWith(
+    home,
+    expect.objectContaining({ keepController: true }),
+  );
+  expect(await hasPendingLocalModelsStop(home)).toBe(false);
+  expect(logs.join("\n")).toContain("retrying before resume");
+  expect(
+    await retryPendingLocalModelsStop(
+      home,
+      { signal: AbortSignal.timeout(5000) },
+      { stopModels },
+    ),
+  ).toEqual({ retried: false });
+  expect(stopModels).toHaveBeenCalledTimes(1);
+});
+
+test("retryPendingLocalModelsStop waits for an in-flight quit stop and skips retrying when it finishes", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "local-models-stop-race-"));
+  roots.push(home);
+  await mkdir(path.join(home, "runtime/localmodels"), { recursive: true });
+  let release!: () => void;
+  let acquired!: () => void;
+  const locked = new Promise<void>((resolve) => (acquired = resolve));
+  const inFlight = withLocalModelsLock(home, async () => {
+    await markLocalModelsStopPending(home);
+    acquired();
+    await new Promise<void>((resolve) => (release = resolve));
+    await clearLocalModelsStopPending(home);
+  });
+  await locked;
+  const stopModels = vi.fn(async () => {});
+  const retry = retryPendingLocalModelsStop(
+    home,
+    { signal: AbortSignal.timeout(5000) },
+    { stopModels, lockRetryMs: 5 },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(stopModels).not.toHaveBeenCalled();
+  release();
+  await inFlight;
+  expect(await retry).toEqual({ retried: false });
+  expect(stopModels).not.toHaveBeenCalled();
+});
+
+test("retryPendingLocalModelsStop keeps the marker and does not throw when retry fails", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "local-models-stop-fail-"));
+  roots.push(home);
+  await markLocalModelsStopPending(home);
+  const logs: string[] = [];
+  const stopModels = vi.fn(async () => {
+    throw new Error("localmodels stack down: Command timed out");
+  });
+  expect(
+    await retryPendingLocalModelsStop(
+      home,
+      { signal: AbortSignal.timeout(5000), log: (line) => logs.push(line) },
+      { stopModels },
+    ),
+  ).toEqual({
+    retried: true,
+    failed: "localmodels stack down: Command timed out",
+  });
+  expect(await hasPendingLocalModelsStop(home)).toBe(true);
+  expect(logs.join("\n")).toContain("Command timed out");
 });

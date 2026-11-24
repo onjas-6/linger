@@ -1,6 +1,6 @@
 import { revokeFoundationGpuSharing } from "./foundation-services.js";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { lstat, rm } from "node:fs/promises";
 import path from "node:path";
 import { sleep } from "@linger/service-kit";
 import {
@@ -26,9 +26,11 @@ import {
   redactLocalmodelsOutput,
 } from "./localmodels-failure.js";
 import {
+  DEFAULT_STOP_BUDGET_MS,
   isStoppedDownloadErrorCode,
   localmodelsBaseDirectory,
   runLocalmodels,
+  stopLocalmodels,
 } from "./localmodels-tool.js";
 import {
   readSetupChoice,
@@ -762,6 +764,111 @@ async function waitForLocalModelsLock<T>(
       await sleep(dependencies.lockRetryMs ?? 1000, signal);
     }
   }
+}
+
+/**
+ * Marker recording that a quit-time local model stop is in flight or failed to
+ * complete cleanly, so the next launch retries the stop before resuming.
+ */
+export function localModelsStopPendingFile(home: string): string {
+  return path.join(localModelsLockRoot(home), "stop-pending.json");
+}
+
+/** Records that a quit-time local model stop has not yet completed cleanly. */
+export async function markLocalModelsStopPending(home: string): Promise<void> {
+  await privateDirectory(localModelsLockRoot(home));
+  await atomicPrivate(
+    localModelsStopPendingFile(home),
+    `${JSON.stringify({ recordedAt: new Date().toISOString() })}\n`,
+  );
+}
+
+/** Clears the pending local model stop marker once a stop finishes cleanly. */
+export async function clearLocalModelsStopPending(home: string): Promise<void> {
+  await rm(localModelsStopPendingFile(home), { force: true });
+}
+
+/** Reports whether a regular, owner-owned stop-pending marker is present. */
+export async function hasPendingLocalModelsStop(
+  home: string,
+): Promise<boolean> {
+  try {
+    const info = await lstat(localModelsStopPendingFile(home));
+    return (
+      info.isFile() &&
+      !info.isSymbolicLink() &&
+      (process.platform === "win32" || info.uid === process.getuid?.())
+    );
+  } catch {
+    return false;
+  }
+}
+
+export interface PendingStopRetryResult {
+  retried: boolean;
+  failed?: string;
+}
+
+/**
+ * Retries a quit-time local model stop that did not finish cleanly before
+ * resume restores models or mounts a gateway. Normal launches see no marker
+ * and return immediately; launches racing an in-flight quit stop wait for its
+ * lock and observe the cleared marker without stopping twice. Failures are
+ * logged and returned rather than thrown so startup is never blocked.
+ */
+export async function retryPendingLocalModelsStop(
+  home: string,
+  options: {
+    signal: AbortSignal;
+    log?: (message: string) => void;
+    budgetMs?: number;
+  },
+  dependencies: RestoreDependencies & {
+    stopModels?: typeof stopLocalmodels;
+  } = {},
+): Promise<PendingStopRetryResult> {
+  if (!(await hasPendingLocalModelsStop(home))) return { retried: false };
+  const held = await waitForLocalModelsLock(
+    home,
+    async (): Promise<PendingStopRetryResult> => {
+      if (!(await hasPendingLocalModelsStop(home))) return { retried: false };
+      options.log?.(
+        "The last local model stop did not finish; retrying before resume.",
+      );
+      const budgetMs = options.budgetMs ?? DEFAULT_STOP_BUDGET_MS;
+      const retrySignal = AbortSignal.any([
+        options.signal,
+        AbortSignal.timeout(budgetMs),
+      ]);
+      try {
+        await (dependencies.stopModels ?? stopLocalmodels)(home, {
+          signal: retrySignal,
+          log: options.log,
+          keepController: true,
+          budgetMs,
+        });
+      } catch (error) {
+        if (options.signal.aborted) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        options.log?.(
+          `Could not finish the last local model stop in ${home}: ${message}`,
+        );
+        return { retried: true, failed: message };
+      }
+      await clearLocalModelsStopPending(home).catch(() => undefined);
+      return { retried: true };
+    },
+    options.signal,
+    dependencies,
+  );
+  if (!held) {
+    const message = "Another local model operation is still running.";
+    options.log?.(
+      `Could not retry the last local model stop in ${home}: ${message}`,
+    );
+    return { retried: false, failed: message };
+  }
+  return held.value;
 }
 
 /**

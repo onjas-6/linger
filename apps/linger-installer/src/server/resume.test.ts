@@ -433,3 +433,42 @@ test("needs an installed source instance", async () => {
     await resumeSourceInstance(options, { load: async () => undefined }),
   ).toMatchObject({ code: 4 });
 });
+
+test("retries a pending local model stop before warm restore and before cold start", async () => {
+  const warmOrder: string[] = [];
+  await resumeSourceInstance(options, {
+    load: async () => instance,
+    engines: native(vi.fn(), true),
+    pending: async () => false,
+    retryPendingStop: async (home) => {
+      warmOrder.push(`stop:${home}`);
+      return { retried: true };
+    },
+    restore: async () => {
+      warmOrder.push("restore");
+      return undefined;
+    },
+    restoreByok: async () => {
+      warmOrder.push("byok");
+      return undefined;
+    },
+  });
+  expect(warmOrder).toEqual(["stop:/home", "restore", "byok"]);
+
+  const coldOrder: string[] = [];
+  await resumeSourceInstance(options, {
+    load: async () => instance,
+    engines: native(
+      vi.fn<ResumeEngine["run"]>(async () => {
+        coldOrder.push("run");
+        return { code: 0, state: "ready", message: "ok" };
+      }),
+      false,
+    ),
+    retryPendingStop: async (home) => {
+      coldOrder.push(`stop:${home}`);
+      return { retried: true };
+    },
+  });
+  expect(coldOrder).toEqual(["stop:/home", "run"]);
+});

@@ -1003,6 +1003,19 @@ async function runLocalmodelsCommand(
 // cancelling loads, until none is loading.
 const CANCEL_POLL_MS = 500;
 const CANCEL_WAIT_MS = 10_000;
+/** Default wall-clock budget shared across all steps of one stopLocalmodels call. */
+export const DEFAULT_STOP_BUDGET_MS = 120_000;
+/** Overall stop budget for the detached quit helper, inside its 150 s hard exit. */
+export const QUIT_STOP_BUDGET_MS = 135_000;
+// Upper bound on a single `library status` probe so a wedged read cannot consume
+// the entire stop budget before `stack down` runs.
+const STOP_LIBRARY_STATUS_MAX_MS = 60_000;
+// Protected tail of the stop budget kept for `stack down` (and `foundations stop`
+// on full stops) so earlier slow or hung library steps cannot starve them.
+const STOP_STACK_DOWN_RESERVE_MS = 45_000;
+const STOP_FOUNDATIONS_RESERVE_MS = 15_000;
+// Floor for an individual stop step while budget remains (still bounded by signal).
+const STOP_MIN_STEP_TIMEOUT_MS = 15_000;
 /**
  * Stops what the pinned kit runs for a home, through that kit: first every
  * load the model library is running (`library cancel`), reading the library
@@ -1016,6 +1029,9 @@ const CANCEL_WAIT_MS = 10_000;
  * quit keeps the controller, which belongs to the services that keep
  * running. Nothing is downloaded. An absent pinned kit is skipped; a pinned
  * kit that is present but fails verification is reported as a stop failure.
+ * All steps share one stop budget while reserving time for `stack down` (and
+ * `foundations stop` when stopping the controller) so slow commands on a busy
+ * machine finish without starving the final shutdown step.
  * Every stop command runs even when an earlier command fails; the error
  * names each that did not stop.
  */
@@ -1025,6 +1041,7 @@ export async function stopLocalmodels(
     signal: AbortSignal;
     log?: (message: string) => void;
     keepController?: boolean;
+    budgetMs?: number;
   },
   dependencies: {
     run?: typeof runLocalmodels;
@@ -1032,6 +1049,11 @@ export async function stopLocalmodels(
     installed?: (home: string) => Promise<boolean>;
     cancelPollMs?: number;
     cancelWaitMs?: number;
+    stackDownReserveMs?: number;
+    foundationsReserveMs?: number;
+    libraryStatusMaxMs?: number;
+    minStepTimeoutMs?: number;
+    now?: () => number;
   } = {},
 ): Promise<void> {
   let installed: boolean;
@@ -1059,18 +1081,55 @@ export async function stopLocalmodels(
         dependencies.runProcess,
         { allocateBifrostAddr: false },
       ));
+  const now = dependencies.now ?? Date.now;
+  const budgetMs = Math.max(1, options.budgetMs ?? DEFAULT_STOP_BUDGET_MS);
+  const stackDownReserveMs =
+    dependencies.stackDownReserveMs ?? STOP_STACK_DOWN_RESERVE_MS;
+  const foundationsReserveMs = options.keepController
+    ? 0
+    : (dependencies.foundationsReserveMs ?? STOP_FOUNDATIONS_RESERVE_MS);
+  const libraryReserveMs = stackDownReserveMs + foundationsReserveMs;
+  const libraryStatusMaxMs =
+    dependencies.libraryStatusMaxMs ?? STOP_LIBRARY_STATUS_MAX_MS;
+  const minStepTimeoutMs = Math.min(
+    dependencies.minStepTimeoutMs ?? STOP_MIN_STEP_TIMEOUT_MS,
+    budgetMs,
+  );
+  const budgetDeadline = now() + budgetMs;
+  const remainingMs = () => Math.max(0, budgetDeadline - now());
+  const stepTimeoutMs = (
+    reserveMs: number,
+    config: { maxMs?: number; share?: number; authoritative?: boolean } = {},
+  ): number => {
+    const remaining = remainingMs();
+    if (config.authoritative) {
+      return Math.max(1, Math.max(minStepTimeoutMs, remaining));
+    }
+    const available = Math.max(0, remaining - reserveMs);
+    const shared =
+      config.share && config.share > 1
+        ? Math.floor(available / config.share)
+        : available;
+    const bounded =
+      config.maxMs !== undefined ? Math.min(shared, config.maxMs) : shared;
+    return Math.max(
+      1,
+      Math.min(remaining, Math.max(minStepTimeoutMs, bounded)),
+    );
+  };
   const base = localmodelsBaseDirectory(home);
   const failed: string[] = [];
   const step = async (
     args: string[],
     name = args.slice(0, 2).join(" "),
     report = true,
+    timeoutMs = stepTimeoutMs(libraryReserveMs),
   ) => {
     options.signal.throwIfAborted();
     options.log?.(`Stopping the local models (localmodels ${name}).`);
     const result = await run(home, args, {
       signal: options.signal,
-      timeoutMs: 30_000,
+      timeoutMs,
     }).catch((error: unknown) => {
       options.signal.throwIfAborted();
       return {
@@ -1085,19 +1144,22 @@ export async function stopLocalmodels(
       failed.push(`localmodels ${name}: ${stopFailure(result)}`);
     return result;
   };
-  const status = await step([
-    "library",
-    "status",
-    "--base-dir",
-    base,
-    "--json",
-  ]);
+  const status = await step(
+    ["library", "status", "--base-dir", base, "--json"],
+    "library status",
+    true,
+    stepTimeoutMs(libraryReserveMs, { maxMs: libraryStatusMaxMs }),
+  );
   const unloadAll = async (models: string[]) => {
-    for (const model of models)
+    for (let index = 0; index < models.length; index++) {
+      const model = models[index]!;
       await step(
         ["library", "unload", model, "--base-dir", base, "--json"],
         `library unload ${model}`,
+        true,
+        stepTimeoutMs(libraryReserveMs, { share: models.length - index }),
       );
+    }
   };
   if (status.code === 0) {
     let last = status.stdout;
@@ -1108,12 +1170,15 @@ export async function stopLocalmodels(
     // gone. A cancel that fails because the load just finished is not a
     // failure: that model is unloaded below.
     const cancelFailures = new Map<string, string>();
-    for (const model of loading ?? []) {
+    const loadingList = loading ?? [];
+    for (let index = 0; index < loadingList.length; index++) {
+      const model = loadingList[index]!;
       const name = `library cancel ${model}`;
       const result = await step(
         ["library", "cancel", model, "--base-dir", base, "--json"],
         name,
         false,
+        stepTimeoutMs(libraryReserveMs, { share: loadingList.length - index }),
       );
       if (result.code !== 0)
         cancelFailures.set(
@@ -1123,17 +1188,17 @@ export async function stopLocalmodels(
     }
     if (loading?.length) {
       // A cancelled load leaves loading only once its engine stopped.
-      const deadline =
-        Date.now() + (dependencies.cancelWaitMs ?? CANCEL_WAIT_MS);
+      const deadline = now() + (dependencies.cancelWaitMs ?? CANCEL_WAIT_MS);
       for (;;) {
         const again = await step(
           ["library", "status", "--base-dir", base, "--json"],
           "library status",
           false,
+          stepTimeoutMs(libraryReserveMs, { maxMs: libraryStatusMaxMs }),
         );
         if (again.code === 0 && libraryModelsIn(again.stdout, "loading"))
           last = again.stdout;
-        if (!libraryModelsIn(last, "loading")?.length || Date.now() >= deadline)
+        if (!libraryModelsIn(last, "loading")?.length || now() >= deadline)
           break;
         await sleep(
           dependencies.cancelPollMs ?? CANCEL_POLL_MS,
@@ -1149,14 +1214,18 @@ export async function stopLocalmodels(
     await unloadAll(unloadableLibraryModels(last) ?? []);
   }
   if (!options.keepController)
-    await step([
-      "foundations",
-      "stop",
-      "--root",
-      modelServicesRoot(home),
-      "--json",
-    ]);
-  await step(["stack", "down", "--json"]);
+    await step(
+      ["foundations", "stop", "--root", modelServicesRoot(home), "--json"],
+      "foundations stop",
+      true,
+      stepTimeoutMs(stackDownReserveMs),
+    );
+  await step(
+    ["stack", "down", "--json"],
+    "stack down",
+    true,
+    stepTimeoutMs(0, { authoritative: true }),
+  );
   if (failed.length) throw new Error(failed.join("; "));
 }
 const STOPPED_DOWNLOAD_ERROR_CODES = new Set([
