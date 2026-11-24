@@ -3461,6 +3461,140 @@ describe("LocalServerModule install location", () => {
     const other = tempDirectory();
     writeFileSync(path.join(other, "notes.txt"), "");
     expect(await installLocation(other)).toBe(path.join(other, "Linger"));
+    // A Windows drive root always installs into a Linger subfolder even when
+    // empty or unreadable.
+    if (process.platform === "win32")
+      expect(await installLocation("F:\\")).toBe("F:\\Linger");
+  });
+
+  it("pre-checks Windows private-path safety during chooseLocation without modifying the folder", async () => {
+    const checkPrivateLocation = vi.fn(async (directory: string) => {
+      if (directory.endsWith("unsafe-drive"))
+        throw Object.assign(
+          new Error(
+            `Windows private path validation failed: ${directory} is inside a folder other accounts on this computer can rename or replace. Use a current-user owned local directory without links or shared access.`,
+          ),
+          {
+            code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+            reason: "UNSAFE_PARENT_ACCESS",
+            path: directory,
+          },
+        );
+    });
+    const f = fixture({
+      checkout: "/src",
+      platform: "win32",
+      checkPrivateLocation,
+    });
+    const unsafe = path.join(f.root, "unsafe-drive");
+    const safe = path.join(f.root, "safe-drive");
+    mkdirSync(unsafe);
+    mkdirSync(safe);
+    await f.host.start();
+    try {
+      f.module.inspect();
+      await vi.waitFor(() =>
+        expect(f.module.status().localModels.state).toBe("checked"),
+      );
+      await f.module.chooseLocation(unsafe);
+      expect(checkPrivateLocation).toHaveBeenCalledWith(unsafe);
+      expect(readdirSync(unsafe)).toEqual([]);
+      expect(f.module.status().location).toEqual({
+        path: f.home,
+        custom: false,
+        error: expect.stringContaining(
+          "Windows private path validation failed",
+        ),
+        refusal: {
+          code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+          reason: "UNSAFE_PARENT_ACCESS",
+        },
+        rejectedPath: unsafe,
+      });
+      // Picking a valid location clears the refusal and switches to it.
+      await f.module.chooseLocation(safe);
+      expect(f.module.status().location).toEqual({
+        path: safe,
+        custom: true,
+      });
+      // A subsequent refusal keeps the previous valid custom location and
+      // resetting clears the refusal.
+      await f.module.chooseLocation(unsafe);
+      expect(f.module.status().location).toMatchObject({
+        path: safe,
+        custom: true,
+        refusal: {
+          code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+          reason: "UNSAFE_PARENT_ACCESS",
+        },
+        rejectedPath: unsafe,
+      });
+      await f.module.chooseLocation(null);
+      expect(f.module.status().location).toEqual({
+        path: f.home,
+        custom: false,
+      });
+    } finally {
+      await f.host.stop("quit");
+    }
+  });
+
+  it("fails fast with refusal when a chosen Windows folder becomes unsafe before install", async () => {
+    let allow = true;
+    const f = fixture(
+      (home) => ({
+        ...withCheckout(home),
+        platform: "win32",
+        checkPrivateLocation: async (directory: string) => {
+          if (allow) return;
+          throw Object.assign(
+            new Error(
+              `Windows private path validation failed: ${directory} is inside a folder other accounts on this computer can rename or replace. Use a current-user owned local directory without links or shared access.`,
+            ),
+            {
+              code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+              reason: "UNSAFE_PARENT_ACCESS",
+              path: directory,
+            },
+          );
+        },
+      }),
+      {},
+      (home) => {
+        checkout(home);
+        writeFileSync(
+          path.join(path.dirname(home), "installer", "distribution.json"),
+          JSON.stringify({
+            platform: "win32",
+            arch: "x64",
+            nativeSources: [{ target: "win32-x64" }],
+          }),
+        );
+      },
+    );
+    const picked = path.join(f.root, "custom-drive");
+    mkdirSync(picked);
+    await f.host.start();
+    try {
+      await f.module.chooseLocation(picked);
+      expect(f.module.status().location).toEqual({
+        path: picked,
+        custom: true,
+      });
+      allow = false;
+      await expect(f.module.begin()).rejects.toThrow(
+        "Windows private path validation failed",
+      );
+      expect(f.module.status()).toMatchObject({
+        phase: "failed",
+        refusal: {
+          code: "WINDOWS_PRIVATE_PATH_UNSAFE",
+          reason: "UNSAFE_PARENT_ACCESS",
+        },
+      });
+    } finally {
+      await f.host.stop("quit");
+    }
   });
 
   it("asks for free space on the folder's disk", async () => {

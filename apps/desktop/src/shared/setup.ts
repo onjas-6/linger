@@ -57,6 +57,10 @@ export interface SetupLocalServer {
     readonly path: string;
     readonly custom: boolean;
     readonly error?: string;
+    // Set when Windows private-path validation refused a candidate folder while
+    // picking, so the page can show localized guidance for the rejected path.
+    readonly refusal?: WindowsPrivateRefusal;
+    readonly rejectedPath?: string;
   };
   // Which provider keys are saved there; the page never sees them.
   readonly keys: {

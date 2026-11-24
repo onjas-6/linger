@@ -609,6 +609,9 @@ const localServerState = (
     location: {
       ...location,
       path: shown(location.path),
+      ...(location.rejectedPath
+        ? { rejectedPath: shown(location.rejectedPath) }
+        : {}),
     },
     keys,
     ...(signIn ? { signIn } : {}),

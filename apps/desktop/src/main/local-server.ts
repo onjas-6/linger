@@ -255,6 +255,10 @@ export interface LocalServerLocation {
   readonly custom: boolean;
   // Why the folder last chosen cannot be used.
   readonly error?: string;
+  // Windows private-path refusal for the rejected candidate folder.
+  readonly refusal?: WindowsPrivateRefusal;
+  // The candidate folder refused during location selection.
+  readonly rejectedPath?: string;
 }
 
 export type LocalRuntime = "codex" | "claude" | "pi";
@@ -530,6 +534,8 @@ export class LocalServerModule implements Module {
   #home: string;
   #location: string | undefined;
   #locationError: string | undefined;
+  #locationRefusal: WindowsPrivateRefusal | undefined;
+  #locationRejectedPath: string | undefined;
   #refusal: WindowsPrivateRefusal | undefined;
   #failure: LocalServerFailure | undefined;
   #waiting: LocalServerWaiting | undefined;
@@ -784,6 +790,10 @@ export class LocalServerModule implements Module {
         path: this.#location ?? this.#home,
         custom: this.#location !== undefined,
         ...(this.#locationError ? { error: this.#locationError } : {}),
+        ...(this.#locationRefusal ? { refusal: this.#locationRefusal } : {}),
+        ...(this.#locationRejectedPath
+          ? { rejectedPath: this.#locationRejectedPath }
+          : {}),
       },
       keys: {
         composio: !!keys.composio,
@@ -818,15 +828,44 @@ export class LocalServerModule implements Module {
     if (picked === null) {
       this.#location = undefined;
       this.#locationError = undefined;
+      this.#locationRefusal = undefined;
+      this.#locationRejectedPath = undefined;
     } else {
       const home = await installLocation(picked);
-      this.#locationError = await checkLocation(home, this.#freeBytes());
-      if (!this.#locationError)
-        this.#location = home === this.#home ? undefined : home;
+      const problem = await this.#checkLocation(home, this.#freeBytes());
+      this.#locationError = problem?.error;
+      this.#locationRefusal = problem?.refusal;
+      this.#locationRejectedPath = problem?.refusal ? home : undefined;
+      if (!problem) this.#location = home === this.#home ? undefined : home;
     }
     if (previous !== this.#location && this.#check.state !== "unchecked")
       this.recheck();
     this.#ctx?.bus.emit("local-server.changed");
+  }
+
+  async #checkLocation(
+    directory: string,
+    neededBytes: number,
+  ): Promise<
+    | { readonly error: string; readonly refusal?: WindowsPrivateRefusal }
+    | undefined
+  > {
+    const error = await checkLocation(directory, neededBytes);
+    if (error) return { error };
+    if ((this.#options.platform ?? process.platform) !== "win32")
+      return undefined;
+    try {
+      await (this.#options.checkPrivateLocation ?? windowsPrivateLocation)(
+        directory,
+      );
+      return undefined;
+    } catch (failure) {
+      const refusal = windowsPrivateRefusal(failure);
+      return {
+        error: failure instanceof Error ? failure.message : String(failure),
+        ...(refusal ? { refusal } : {}),
+      };
+    }
   }
 
   // Asks the installer whether this computer can serve a local model; the
@@ -4459,14 +4498,16 @@ export const followHttps =
   };
 
 // The folder a picked one installs into: the folder itself when it is empty
-// or already holds Linger, else a Linger folder inside it.
+// or already holds Linger, else a Linger folder inside it. A drive or
+// filesystem root always installs into a Linger subfolder unless it already
+// holds an installation.
 export const installLocation = async (picked: string): Promise<string> => {
   const entries = await readdir(picked).catch(() => [] as string[]);
-  return entries.every((entry) => entry.startsWith(".")) ||
-    entries.includes("instances") ||
-    entries.includes("installer")
-    ? picked
-    : path.join(picked, "Linger");
+  if (entries.includes("instances") || entries.includes("installer"))
+    return picked;
+  const isRoot = path.dirname(picked) === picked;
+  if (!isRoot && entries.every((entry) => entry.startsWith("."))) return picked;
+  return path.join(picked, "Linger");
 };
 
 // Why Linger cannot install into `directory`, or undefined when it can: the
