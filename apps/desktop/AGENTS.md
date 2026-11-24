@@ -521,7 +521,13 @@ Gateway and runs Agents. The daemon exits with the app.
   `localServer.owned()` reports whether the window points at this app's own
   local installation regardless of startup/resume readiness, so the SPA can hide
   CLI daemon download entry points even during hot start or install-time
-  preload.
+  preload; and `localGateway`
+  (`src/main/local-gateway.ts`) gives Settings › Models Advanced local-only
+  metadata (`username`, loopback `adminUrl`, `hasPassword`, `inferenceAuthDisabled`)
+  and explicit-action password reveal, 60 s auto-clearing clipboard copy,
+  loopback admin console launch, and gateway folder reveal for this desktop's
+  own enrolled `computerId` only (passwords never cross TeamHub and are read
+  fresh from the private `0600` `admin-password` file in the main process).
 - `src/shared/api.ts`, `src/shared/shell.ts`: preload contract types and IPC
   channel names.
 - `src/main/computer-daemon.ts`: ComputerDaemon. While the computer is
