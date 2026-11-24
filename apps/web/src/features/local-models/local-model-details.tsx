@@ -51,6 +51,7 @@ import {
   poolOtherBytes,
   poolUnaccountedBytes,
   safeModelSourceUrl,
+  sharedGatewayEndpoint,
   speedLabel,
   type ModelEntry,
 } from "./local-models-rules";
@@ -89,7 +90,17 @@ function Fact({
   );
 }
 
-function CopyEndpoint({ endpoint, name }: { endpoint: string; name: string }) {
+function CopyEndpoint({
+  ariaLabel,
+  copiedAriaLabel,
+  endpoint,
+  title,
+}: {
+  ariaLabel: string;
+  copiedAriaLabel: string;
+  endpoint: string;
+  title: string;
+}) {
   const t = useT();
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<number | undefined>(undefined);
@@ -121,7 +132,7 @@ function CopyEndpoint({ endpoint, name }: { endpoint: string; name: string }) {
   }
 
   return (
-    <span className="flex items-center gap-1.5">
+    <span className="flex min-w-0 max-w-full items-center gap-1.5">
       <code
         className="min-w-0 truncate rounded-sm bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground"
         ref={codeRef}
@@ -129,11 +140,11 @@ function CopyEndpoint({ endpoint, name }: { endpoint: string; name: string }) {
         {endpoint}
       </code>
       <Button
-        aria-label={t(copied ? m.copiedEndpointOf : m.copyEndpointOf, { name })}
+        aria-label={copied ? copiedAriaLabel : ariaLabel}
         className={copied ? "text-app-success" : undefined}
         onClick={copy}
         size="compactIcon"
-        title={t(copied ? commonMessages.copied : m.copyEndpoint)}
+        title={copied ? t(commonMessages.copied) : title}
         tone="ghost"
       >
         <Icon icon={copied ? Tick02Icon : Copy01Icon} size={14} />
@@ -205,6 +216,7 @@ export function ModelFacts({
   computer,
   disabled = false,
   entry,
+  gatewayUrl,
   hasPrimaryAssignAction = false,
   hasReadyAlternatives = false,
   onAssignAgent,
@@ -218,6 +230,7 @@ export function ModelFacts({
   computer?: TeamHubLocalComputerPage["items"][number];
   disabled?: boolean;
   entry: ModelEntry;
+  gatewayUrl?: string;
   hasPrimaryAssignAction?: boolean;
   hasReadyAlternatives?: boolean;
   onAssignAgent?: (agent: AssignableLocalModelAgent) => void;
@@ -228,6 +241,7 @@ export function ModelFacts({
 }) {
   const t = useT();
   const { model, status } = entry;
+  const gatewayEndpoint = sharedGatewayEndpoint(gatewayUrl);
   // A stopped download holds only a partial file, so it reads like a model
   // not yet on the Computer.
   const stopped = downloadStopped(model);
@@ -515,15 +529,33 @@ export function ModelFacts({
           </Fact>
         ) : null}
         {status === "loaded" && model.endpoint ? (
-          <Fact className="@xl:col-span-2" label={t(m.factGateway)}>
-            {gatewayFactValue(entry, view, computer, t)}
+          <Fact
+            className="@xl:col-span-2 flex-col items-start gap-1 py-2 @md:flex-row @md:items-center @md:gap-3 @md:py-1.5"
+            label={t(m.factGateway)}
+          >
+            <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              {gatewayFactValue(entry, view, computer, t)}
+              {gatewayEndpoint ? (
+                <CopyEndpoint
+                  ariaLabel={t(m.copyGatewayEndpoint)}
+                  copiedAriaLabel={t(m.copiedGatewayEndpoint)}
+                  endpoint={gatewayEndpoint}
+                  title={t(m.copyGatewayEndpoint)}
+                />
+              ) : null}
+            </span>
           </Fact>
         ) : null}
         {model.endpoint ? (
-          <Fact className="@xl:col-span-2" label={t(m.factEndpoint)}>
+          <Fact
+            className="@xl:col-span-2 flex-col items-start gap-1 py-2 @md:flex-row @md:items-center @md:gap-3 @md:py-1.5"
+            label={t(m.factEndpoint)}
+          >
             <CopyEndpoint
+              ariaLabel={t(m.copyEndpointOf, { name: model.name })}
+              copiedAriaLabel={t(m.copiedEndpointOf, { name: model.name })}
               endpoint={model.endpoint.base_url}
-              name={model.name}
+              title={t(m.copyEndpoint)}
             />
           </Fact>
         ) : null}
@@ -604,16 +636,19 @@ function PoolBar({
   );
 }
 
-/** Memory and hardware of one Computer, for people who want the numbers. */
+/** Memory, hardware, and shared gateway of one Computer, for people who want the numbers. */
 export function AdvancedDialog({
+  gatewayUrl,
   onClose,
   view,
 }: {
+  gatewayUrl?: string;
   onClose: () => void;
   view: LocalModelsView;
 }) {
   const t = useT();
   const host = view.computer.host;
+  const gatewayEndpoint = sharedGatewayEndpoint(gatewayUrl);
   type PoolHolder = LocalModelPool["holders"][number];
   const seenHolderIds = new Set<string>();
   const models: PoolHolder[] = [];
@@ -722,6 +757,30 @@ export function AdvancedDialog({
                 {formatGigabytes(host.disk_free_bytes, t)}
               </Fact>
             </div>
+          </section>
+        ) : null}
+        {gatewayEndpoint ? (
+          <section>
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground">
+              {t(m.gatewaySection)}
+            </h3>
+            <div className="rounded-xl border border-border bg-app-canvas/40 px-3.5">
+              <Fact
+                bordered={false}
+                className="flex-col items-start gap-1 py-2 sm:flex-row sm:items-center sm:gap-3 sm:py-1.5"
+                label={t(m.factGateway)}
+              >
+                <CopyEndpoint
+                  ariaLabel={t(m.copyGatewayEndpoint)}
+                  copiedAriaLabel={t(m.copiedGatewayEndpoint)}
+                  endpoint={gatewayEndpoint}
+                  title={t(m.copyGatewayEndpoint)}
+                />
+              </Fact>
+            </div>
+            <p className="mt-2 px-0.5 text-xs text-muted-foreground">
+              {t(m.gatewaySharedNote)}
+            </p>
           </section>
         ) : null}
       </div>
