@@ -67,23 +67,21 @@ func TestIdleSweeperUnloadsIdleModelAfterTTL(t *testing.T) {
 		t.Fatalf("initial state = %+v", row)
 	}
 
-	// Just before TTL: must remain loaded.
+	// Just before TTL: synchronous sweep must keep the model loaded.
 	clock.Advance(14*time.Minute + 59*time.Second)
-	time.Sleep(50 * time.Millisecond)
+	library.sweepIdleModels()
 	if calls := callsWithPrefix(fake, "unload "); len(calls) != 0 {
 		t.Fatalf("unloaded before TTL: %v", calls)
 	}
 
-	// Past TTL: sweeper unloads via library unload (keeping Bifrost alive) and notifies runtimeChanged.
+	// Past TTL: sweeper ticker unloads via library unload (keeping Bifrost alive) and notifies runtimeChanged.
 	clock.Advance(2 * time.Second)
 	waitFor(t, "idle unload", func() bool {
 		return len(callsWithPrefix(fake, "unload ")) == 1 &&
+			record.changes() > 0 &&
 			modelState(record.last(), testModel) != nil &&
 			modelState(record.last(), testModel).State == "idle"
 	})
-	if record.changes() == 0 {
-		t.Fatal("runtimeChanged was not called after idle unload")
-	}
 	if calls := callsWithPrefix(fake, "stack "); len(calls) != 0 {
 		t.Fatalf("idle unload must keep Bifrost warm, but ran stack commands: %v", calls)
 	}
@@ -98,13 +96,16 @@ func TestIdleSweeperRespectsActiveLeaseAndUpdatesLastUsedOnRelease(t *testing.T)
 		StatusAfter: idleAfter,
 	})
 	record := &recorder{}
-	clock := newTestClock(time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC))
-	library := newIdleTestLibrary(t, fake, record, clock, 15*time.Minute, 10*time.Millisecond)
+	clock := newTestClock(time.Now())
+	library := newIdleTestLibrary(t, fake, record, clock, 15*time.Minute, time.Hour)
 	library.Refresh(context.Background())
+	if err := library.awaitSettled(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	release := library.AcquireUse(testPiModel)
 	clock.Advance(30 * time.Minute)
-	time.Sleep(50 * time.Millisecond)
+	library.sweepIdleModels()
 	if calls := callsWithPrefix(fake, "unload "); len(calls) != 0 {
 		t.Fatalf("unloaded while active lease held: %v", calls)
 	}
@@ -114,15 +115,16 @@ func TestIdleSweeperRespectsActiveLeaseAndUpdatesLastUsedOnRelease(t *testing.T)
 	// Calling release a second time is a safe no-op.
 	release()
 	clock.Advance(14 * time.Minute)
-	time.Sleep(50 * time.Millisecond)
+	library.sweepIdleModels()
 	if calls := callsWithPrefix(fake, "unload "); len(calls) != 0 {
 		t.Fatalf("unloaded before fresh TTL elapsed after lease release: %v", calls)
 	}
 
 	clock.Advance(2 * time.Minute)
-	waitFor(t, "idle unload after lease release", func() bool {
-		return len(callsWithPrefix(fake, "unload ")) == 1
-	})
+	library.sweepIdleModels()
+	if calls := callsWithPrefix(fake, "unload "); len(calls) != 1 {
+		t.Fatalf("expected 1 unload after lease release + TTL, got %v", calls)
+	}
 }
 
 func TestIdleSweeperDisabledWhenTTLIsZero(t *testing.T) {
@@ -130,14 +132,77 @@ func TestIdleSweeperDisabledWhenTTLIsZero(t *testing.T) {
 	fake.write("status.json", status(model(testModel, "loaded")))
 	record := &recorder{}
 	clock := newTestClock(time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC))
-	library := newIdleTestLibrary(t, fake, record, clock, 0, 10*time.Millisecond)
+	library := newIdleTestLibrary(t, fake, record, clock, 0, time.Hour)
 	library.Refresh(context.Background())
 
 	clock.Advance(2 * time.Hour)
 	library.sweepIdleModels()
-	time.Sleep(40 * time.Millisecond)
 	if calls := callsWithPrefix(fake, "unload "); len(calls) != 0 {
 		t.Fatalf("disabled sweeper unloaded model: %v", calls)
+	}
+}
+
+func TestIdleUnloadRaceEnsureLoadedWaitsAndReloads(t *testing.T) {
+	fake := newFakeTool(t)
+	fake.write("status.json", status(model(testModel, "loaded")))
+	idleAfter, _ := json.Marshal(status(model(testModel, "idle")))
+	loadedAfter, _ := json.Marshal(status(model(testModel, "loaded")))
+	unloadGate := filepath.Join(fake.state, "release-unload")
+	fake.script("unload", fakeScript{
+		Lines:       []fakeLine{{WaitFile: unloadGate, Line: resultLine(testModel)}},
+		StatusAfter: idleAfter,
+	})
+	fake.script("load", fakeScript{
+		Lines:       []fakeLine{{Line: resultLine(testModel)}},
+		StatusAfter: loadedAfter,
+	})
+	record := &recorder{}
+	clock := newTestClock(time.Now())
+	library := newIdleTestLibrary(t, fake, record, clock, 15*time.Minute, time.Hour)
+	library.Refresh(context.Background())
+	if err := library.awaitSettled(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start an idle unload that blocks on unloadGate while l.current still shows "loaded".
+	clock.Advance(20 * time.Minute)
+	sweepDone := make(chan struct{})
+	go func() {
+		library.sweepIdleModels()
+		close(sweepDone)
+	}()
+	waitFor(t, "unload in flight", func() bool {
+		return len(callsWithPrefix(fake, "unload ")) == 1
+	})
+
+	// Mid-unload: IsLoadedHealthy must be false and IsStandbyModel must be true.
+	if library.IsLoadedHealthy(context.Background(), testPiModel) {
+		t.Fatal("IsLoadedHealthy returned true while idle unload was in flight")
+	}
+	if !library.IsStandbyModel(testPiModel) {
+		t.Fatal("IsStandbyModel returned false while idle unload was in flight")
+	}
+
+	// EnsureLoaded must NOT take the cached-loaded fast path; it must wait for the unload and reload.
+	ensureDone := make(chan error, 1)
+	go func() {
+		ensureDone <- library.EnsureLoaded(context.Background(), testPiModel)
+	}()
+	select {
+	case err := <-ensureDone:
+		t.Fatalf("EnsureLoaded returned early while unload was still running: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	if err := os.WriteFile(unloadGate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	<-sweepDone
+	if err := <-ensureDone; err != nil {
+		t.Fatalf("EnsureLoaded failed after unload finished: %v", err)
+	}
+	if calls := callsWithPrefix(fake, "load "); len(calls) != 1 {
+		t.Fatalf("expected 1 reload after mid-unload EnsureLoaded, got %v", calls)
 	}
 }
 
@@ -178,9 +243,12 @@ func TestStandbyAndLoadedHealthyChecksNeverWakeModel(t *testing.T) {
 	fake := newFakeTool(t)
 	fake.write("status.json", status(model(testModel, "idle")))
 	record := &recorder{}
-	clock := newTestClock(time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC))
+	clock := newTestClock(time.Now())
 	library := newIdleTestLibrary(t, fake, record, clock, 15*time.Minute, time.Hour)
 	library.Refresh(context.Background())
+	if err := library.awaitSettled(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	if !library.IsStandbyModel(testPiModel) {
 		t.Fatal("idle model must be reported as standby")

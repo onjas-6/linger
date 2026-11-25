@@ -189,6 +189,10 @@ type Library struct {
 	// activity tracks active use leases and last-used timestamps by model ID
 	// for idle auto-unload.
 	activity map[string]*modelActivity
+	// unloading tracks model IDs currently being unloaded by the idle sweeper
+	// so EnsureLoaded and IsLoadedHealthy never take the cached-loaded fast path
+	// against a model server that is shutting down.
+	unloading map[string]struct{}
 	// settleOnce starts the one installer lock probe; settledCh closes when
 	// it ends.
 	settleOnce         sync.Once
@@ -233,11 +237,11 @@ func New(options Options) *Library {
 		ensurePiTimeout: options.EnsurePiTimeout, ensurePiRetryInterval: options.EnsurePiRetryInterval,
 		ensureLoadTimeout: options.EnsureLoadTimeout,
 		idleUnloadTTL:     idleUnloadTTL, idleSweepInterval: idleSweepInterval,
-		now:               nowFunc, healthCheck: gatewayAnswers, ctx: ctx, stop: stop, jobs: make(map[string]*job), probes: make(map[string]*activeProbe), probeUnknown: make(map[string]probeFingerprint),
+		now: nowFunc, healthCheck: gatewayAnswers, ctx: ctx, stop: stop, jobs: make(map[string]*job), probes: make(map[string]*activeProbe), probeUnknown: make(map[string]probeFingerprint),
 		causes:            make(map[string]*wire.LocalModelError),
 		installerLockWait: defaultInstallerLockWait, installerLockRetry: defaultInstallerLockRetry, settledCh: make(chan struct{}),
 		changed: make(chan struct{}), jobEnded: make(map[string]uint64), ensures: make(map[string]*ensureLoad),
-		activity: make(map[string]*modelActivity),
+		activity: make(map[string]*modelActivity), unloading: make(map[string]struct{}),
 	}
 	probeCacheDir := options.ProbeCacheDirectory
 	if probeCacheDir == "" && options.JobDirectory != "" {
@@ -1176,6 +1180,7 @@ func (l *Library) EnsureLoaded(ctx context.Context, piModel string) error {
 	read := l.current != nil
 	known := read && l.current.Available
 	cached := l.rowLocked(func(model wire.LocalModel) bool { return model.PiModel == piModel })
+	unloading := cached != nil && l.isUnloadingLocked(cached.ID)
 	l.mu.Unlock()
 	if known && cached == nil {
 		// pi_model is present while the model is on the Computer, and the
@@ -1183,7 +1188,7 @@ func (l *Library) EnsureLoaded(ctx context.Context, piModel string) error {
 		return nil
 	}
 	if l.settled() {
-		if known && cached.State == "loaded" && l.cachedLoadedHealthy(ctx, *cached) {
+		if known && !unloading && cached.State == "loaded" && l.cachedLoadedHealthy(ctx, *cached) {
 			l.touchActivity(cached.ID)
 			return nil
 		}
@@ -1540,7 +1545,12 @@ func (l *Library) IsStandbyModel(piModel string) bool {
 		return false
 	}
 	row := l.rowLocked(func(model wire.LocalModel) bool { return model.PiModel == piModel })
-	return row != nil && row.State != "loaded"
+	return row != nil && (row.State != "loaded" || l.isUnloadingLocked(row.ID))
+}
+
+func (l *Library) isUnloadingLocked(id string) bool {
+	_, ok := l.unloading[id]
+	return ok
 }
 
 // IsLoadedHealthy reports whether piModel can answer without loading a standby
@@ -1565,11 +1575,12 @@ func (l *Library) IsLoadedHealthy(ctx context.Context, piModel string) bool {
 		return true
 	}
 	row := l.rowLocked(func(model wire.LocalModel) bool { return model.PiModel == piModel })
+	unloading := row != nil && l.isUnloadingLocked(row.ID)
 	l.mu.Unlock()
 	if row == nil {
 		return true
 	}
-	if row.State != "loaded" {
+	if unloading || row.State != "loaded" {
 		return false
 	}
 	return l.cachedLoadedHealthy(ctx, *row)
@@ -1700,7 +1711,13 @@ func (l *Library) idleUnloadOne(id string, ensure *ensureLoad) {
 		l.mu.Unlock()
 		return
 	}
+	l.unloading[id] = struct{}{}
 	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		delete(l.unloading, id)
+		l.mu.Unlock()
+	}()
 
 	unloadCtx, cancel := context.WithTimeout(l.ctx, l.actionTimeout)
 	stdout, exitCode, err := l.runOnce(unloadCtx, Action{Name: ActionUnload, Model: id})
