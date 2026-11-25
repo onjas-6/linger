@@ -1,3 +1,5 @@
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -176,5 +178,58 @@ describe.skipIf(process.platform === "win32")("withLoginShell", () => {
       HTTPS_PROXY: "http://proxy:1",
       PATH: runtimeSearchPath(app.PATH, login.PATH, "/Users/me"),
     });
+  });
+
+  it("appends nvm (newest-first), fnm default and pnpm bins matching local-daemon", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "shell-env-nvm-"));
+    try {
+      const nvmOld = path.join(home, ".nvm", "versions", "node", "v20.12.0", "bin");
+      const nvmNew = path.join(home, ".nvm", "versions", "node", "v22.15.0", "bin");
+      const fnm = path.join(home, ".local", "share", "fnm", "aliases", "default", "bin");
+      const pnpm = path.join(home, "Library", "pnpm");
+      await Promise.all([
+        mkdir(nvmOld, { recursive: true }),
+        mkdir(nvmNew, { recursive: true }),
+        mkdir(fnm, { recursive: true }),
+        mkdir(pnpm, { recursive: true }),
+      ]);
+      const entries = runtimeSearchPath("/usr/bin:/bin", undefined, home).split(
+        path.delimiter,
+      );
+      expect(entries.slice(-4)).toEqual([nvmNew, nvmOld, fnm, pnpm]);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the last captured login shell environment when a later lookup fails", async () => {
+    const cache = new Map<string, Record<string, string>>();
+    const working: RunShell = async (_shell, args) =>
+      args[0] === "-ilc"
+        ? {
+            code: 0,
+            stdout: framed({
+              PATH: "/Users/me/.nvm/versions/node/v22.15.0/bin:/usr/bin",
+              ANTHROPIC_BASE_URL: "https://cached.example",
+            }),
+          }
+        : { code: -1, stdout: "" };
+    const failing: RunShell = async () => ({ code: -1, stdout: "" });
+
+    const first = await loginShellEnvironment(
+      { SHELL: "/bin/zsh", HOME: "/Users/me" },
+      working,
+      { reuseLast: true, cache },
+    );
+    expect(first).toEqual({
+      PATH: "/Users/me/.nvm/versions/node/v22.15.0/bin:/usr/bin",
+      ANTHROPIC_BASE_URL: "https://cached.example",
+    });
+    const second = await loginShellEnvironment(
+      { SHELL: "/bin/zsh", HOME: "/Users/me" },
+      failing,
+      { reuseLast: true, cache },
+    );
+    expect(second).toEqual(first);
   });
 });

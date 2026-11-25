@@ -152,6 +152,14 @@ if (args.includes("--inspect")) {
   const target = args.includes("--inspect-target") ? args[args.indexOf("--inspect-target") + 1] : home;
   fs.mkdirSync(path.join(home, "runtime", "localmodels", "state"), { recursive: true });
   fs.writeFileSync(path.join(home, "runtime", "inspect-args.json"), JSON.stringify(args));
+  fs.writeFileSync(
+    path.join(home, "runtime", "inspect-env.json"),
+    JSON.stringify({
+      PATH: process.env.PATH,
+      ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+      LINGER_COMPUTER_DAEMON: process.env.LINGER_COMPUTER_DAEMON,
+    }),
+  );
   const hardware = { totalMemoryBytes: 64 * 1024 ** 3, diskFreeBytes: 200 * 1024 ** 3, gpus: [{ name: "RTX 4090" }] };
   const eligible = !fs.existsSync(path.join(target, "small-computer"));
   const modelFile = path.join(target, "inspect-model");
@@ -1907,6 +1915,38 @@ describe("LocalServerModule", () => {
       }),
     );
     info.mockRestore();
+  });
+
+  it("passes the resolved login-shell environment and daemon binary path to setup inspection", async () => {
+    const f = fixture({
+      checkout: "/src",
+      daemonExecutable: "/app/resources/computer/linger-computer-daemon",
+      env: Promise.resolve({
+        ...(process.env as Record<string, string>),
+        PATH: `/custom/nvm/bin${path.delimiter}/usr/bin${path.delimiter}/bin`,
+        ANTHROPIC_BASE_URL: "https://shell-profile.example",
+      }),
+    });
+    await f.host.start();
+    f.module.inspect();
+    await waitForInstaller(() =>
+      expect(f.module.status().localModels).toMatchObject({
+        state: "checked",
+        eligible: true,
+      }),
+    );
+    const seen = JSON.parse(
+      readFileSync(path.join(f.home, "runtime", "inspect-env.json"), "utf8"),
+    ) as {
+      PATH?: string;
+      ANTHROPIC_BASE_URL?: string;
+      LINGER_COMPUTER_DAEMON?: string;
+    };
+    expect(seen.PATH).toContain("/custom/nvm/bin");
+    expect(seen.ANTHROPIC_BASE_URL).toBe("https://shell-profile.example");
+    expect(seen.LINGER_COMPUTER_DAEMON).toBe(
+      "/app/resources/computer/linger-computer-daemon",
+    );
   });
 
   it("marks checked Inkling 2 Mini models with featuredInkling using the shared matcher", async () => {

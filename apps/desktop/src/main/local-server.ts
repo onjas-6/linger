@@ -364,6 +364,14 @@ export interface LocalServerOptions {
   readonly home: string;
   // This app's version, recorded with the source package it unpacks.
   readonly version: string;
+  // The resolved user terminal environment passed to installer subprocesses
+  // (--inspect, setup server, --resume, BYOK checks), matching ComputerDaemonModule.
+  readonly env?:
+    | Readonly<Record<string, string>>
+    | Promise<Readonly<Record<string, string>>>;
+  // Bundled linger-computer-daemon executable used as the single source of
+  // truth for AI Runtime discovery and authentication probing during setup.
+  readonly daemonExecutable?: string;
   // The bundled installer (installer.js, web/, native-process-worker.mjs).
   readonly installerDirectory: string;
   readonly sourceArchive?: SourceArchive;
@@ -967,6 +975,17 @@ export class LocalServerModule implements Module {
           };
   }
 
+  async #baseEnv(): Promise<NodeJS.ProcessEnv> {
+    const resolved = await this.#options.env;
+    const base: NodeJS.ProcessEnv = resolved
+      ? { ...resolved }
+      : { ...process.env };
+    if (this.#options.daemonExecutable) {
+      base.LINGER_COMPUTER_DAEMON = this.#options.daemonExecutable;
+    }
+    return base;
+  }
+
   // Runs the installer's headless BYOK command: the endpoint and key go on
   // stdin, never in argv, and its last stdout line is the JSON answer. A
   // failure to run it comes back as { ok: false, message }.
@@ -977,6 +996,7 @@ export class LocalServerModule implements Module {
   ): Promise<Record<string, unknown>> {
     const home = this.#location ?? this.#home;
     try {
+      const baseEnv = await this.#baseEnv();
       const output = await new Promise<string>((resolve, reject) => {
         const child = spawn(
           process.execPath,
@@ -991,7 +1011,7 @@ export class LocalServerModule implements Module {
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
             env: {
-              ...process.env,
+              ...baseEnv,
               ELECTRON_RUN_AS_NODE: "1",
               LINGER_HOME: home,
             },
@@ -1027,6 +1047,7 @@ export class LocalServerModule implements Module {
     // The tool's codes with its words, for the log only.
     reasonLog: string[];
   }> {
+    const baseEnv = await this.#baseEnv();
     // The app's own Node runs the check, so it needs no download of its own;
     // installing still uses the pinned Node runtime.
     const output = await new Promise<string>((resolve, reject) => {
@@ -1045,7 +1066,7 @@ export class LocalServerModule implements Module {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
           env: {
-            ...process.env,
+            ...baseEnv,
             ELECTRON_RUN_AS_NODE: "1",
             LINGER_HOME: this.#options.home,
           },
@@ -2557,7 +2578,10 @@ export class LocalServerModule implements Module {
     repo: string,
     signal: AbortSignal,
   ): Promise<InstallerApi> {
-    const proxyEnv = await this.#systemProxyEnv();
+    const [baseEnv, proxyEnv] = await Promise.all([
+      this.#baseEnv(),
+      this.#systemProxyEnv(),
+    ]);
     const child = spawn(
       node,
       [
@@ -2577,7 +2601,7 @@ export class LocalServerModule implements Module {
         // A detached Windows process otherwise opens its own console window.
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, ...proxyEnv, LINGER_HOME: home },
+        env: { ...baseEnv, ...proxyEnv, LINGER_HOME: home },
       },
     );
     const log = this.#ctx?.log;
@@ -3037,7 +3061,7 @@ export class LocalServerModule implements Module {
       ms: Date.now() - nodeStartedAt,
     });
     const env = {
-      ...process.env,
+      ...(await this.#baseEnv()),
       ...(await proxyEnv),
       LINGER_HOME: record.home,
     };
