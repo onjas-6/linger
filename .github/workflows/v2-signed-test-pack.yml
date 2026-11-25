@@ -171,10 +171,35 @@ jobs:
           cd "$RELEASE_OUT/assets"
           sha256sum Linger-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - uses: actions/upload-artifact@v7
+      - name: Upload macOS arm64 DMG artifact
+        if: matrix.target == 'darwin-arm64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2-test-installer-macos-arm64-dmg
+          path: |
+            ${{ env.RELEASE_OUT }}/assets/Linger-*.dmg
+            ${{ env.RELEASE_OUT }}/assets/SHA256SUMS.txt
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload macOS arm64 tarball artifact
+        if: matrix.target == 'darwin-arm64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2-test-installer-macos-arm64-tarball
+          path: |
+            ${{ env.RELEASE_OUT }}/assets/Linger-*.app.tar.gz
+            ${{ env.RELEASE_OUT }}/assets/SHA256SUMS.txt
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Linux x64 installer artifact
+        if: matrix.target != 'darwin-arm64'
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ env.RELEASE_OUT }}/assets
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
@@ -517,10 +542,11 @@ jobs:
               `- **Manifest URL Mode**: \`${idx.baseUrl}\``,
               "",
               "### Artifacts to Download",
-              "1. \`v2-test-installer-macos-arm64\` (signed + notarized DMG & .app.tar.gz)",
-              "2. \`v2-test-installer-windows-x64\` (Authenticode signed Setup EXE & portable ZIP)",
-              "3. \`v2-test-installer-linux-x64\` (Linux x64 tar.gz)",
-              "4. \`v2-test-service-upgrade-packs\` (4-step 2+1 upgrade kit + \`serve-test-feed.mjs\` + \`REAL-DEVICE-TEST-GUIDE.md\`)",
+              "1. \`v2-test-installer-macos-arm64-dmg\` (signed + notarized DMG only + \`SHA256SUMS.txt\`, recommended for macOS real-device testing)",
+              "2. \`v2-test-installer-macos-arm64-tarball\` (signed + notarized \`.app.tar.gz\` + \`SHA256SUMS.txt\`, optional)",
+              "3. \`v2-test-installer-windows-x64\` (Authenticode signed Setup EXE & portable ZIP)",
+              "4. \`v2-test-installer-linux-x64\` (Linux x64 tar.gz)",
+              "5. \`v2-test-service-upgrade-packs\` (4-step 2+1 upgrade kit + \`serve-test-feed.mjs\` + \`REAL-DEVICE-TEST-GUIDE.md\`)",
               "",
               "### 4-Step 2+1 Upgrade Matrix",
               "| Step | Version | Changed Module(s) | Inherited | Rollback Safe | Signed |",
