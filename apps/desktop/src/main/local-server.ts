@@ -376,10 +376,6 @@ export interface LocalServerOptions {
   readonly daemonExecutable?:
     | string
     | (() => string | undefined | Promise<string | undefined>);
-  // Per-session loopback control token forwarded to static-host.mjs so V2
-  // web-only incremental updates can hot-swap static roots via
-  // POST /__internal/reload-static.
-  readonly webControlToken?: string;
   // The bundled installer (installer.js, web/, native-process-worker.mjs).
   readonly installerDirectory: string;
   readonly sourceArchive?: SourceArchive;
@@ -993,9 +989,6 @@ export class LocalServerModule implements Module {
       typeof configured === "function" ? await configured() : configured;
     if (daemon) {
       base.LINGER_COMPUTER_DAEMON = daemon;
-    }
-    if (this.#options.webControlToken) {
-      base.LINGER_WEB_CONTROL_TOKEN = this.#options.webControlToken;
     }
     return base;
   }
@@ -1685,15 +1678,28 @@ export class LocalServerModule implements Module {
   }
 
   /**
-   * Delegates a V2 backend release switch (`teamhub` + `node-services`) to the
-   * bundled `installer.js --instance desktop --switch-release <appVersion>` so
-   * `installer.js` remains the single lifecycle & PID owner (preventing orphan
-   * processes on Windows/macOS uninstall or shell upgrades).
+   * Delegates a V2 service release switch (`teamhub`, `node-services`, and/or
+   * `web`) to the bundled `installer.js --instance desktop --switch-release <appVersion>`
+   * so `installer.js` remains the single lifecycle & PID owner while keeping
+   * PostgreSQL and LiveKit running.
    */
   async switchRelease(
     appVersion: string,
-    signal: AbortSignal = this.#abort.signal,
+    optionsOrSignal:
+      | AbortSignal
+      | {
+          readonly services?: readonly ("teamhub" | "node-services" | "web")[];
+          readonly signal?: AbortSignal;
+        } = this.#abort.signal,
   ): Promise<void> {
+    const signal =
+      optionsOrSignal instanceof AbortSignal
+        ? optionsOrSignal
+        : (optionsOrSignal.signal ?? this.#abort.signal);
+    const services =
+      optionsOrSignal instanceof AbortSignal
+        ? undefined
+        : optionsOrSignal.services;
     const record = await this.#readRecord();
     if (!record) {
       throw new Error("Cannot switch release: no local Linger installation.");
@@ -1724,6 +1730,9 @@ export class LocalServerModule implements Module {
             LOCAL_INSTANCE,
             "--switch-release",
             appVersion,
+            ...(services && services.length > 0
+              ? ["--services", services.join(",")]
+              : []),
           ],
           {
             stdio: ["ignore", "pipe", "pipe"],

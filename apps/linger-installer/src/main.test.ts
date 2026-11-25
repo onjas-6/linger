@@ -283,7 +283,7 @@ it("tells the desktop client by code why a refused folder kept the keys unsaved"
   }
 });
 
-it("parses --switch-release without --source-repo and requires --instance", async () => {
+it("parses --switch-release with optional --services and requires --instance", async () => {
   const { parseInstallerArguments } = await import("./main.js");
   expect(
     parseInstallerArguments([
@@ -293,13 +293,34 @@ it("parses --switch-release without --source-repo and requires --instance", asyn
       "desktop",
       "--switch-release",
       "0.1.10-v2test.2",
+      "--services",
+      "web,teamhub",
     ]),
   ).toMatchObject({
     home: path.resolve("/tmp/linger-home"),
     instanceName: "desktop",
     switchRelease: "0.1.10-v2test.2",
+    switchServices: ["web", "teamhub"],
   });
   expect(() =>
     parseInstallerArguments(["--switch-release", "0.1.10-v2test.2"]),
   ).toThrow(/instance/i);
+  expect(() =>
+    parseInstallerArguments([
+      "--instance",
+      "desktop",
+      "--switch-release",
+      "0.1.10-v2test.2",
+      "--services",
+      "postgres",
+    ]),
+  ).toThrow(/services/i);
+  expect(() =>
+    parseInstallerArguments([
+      "--source-repo",
+      "/tmp/repo",
+      "--services",
+      "web",
+    ]),
+  ).toThrow(/--switch-release/i);
 });

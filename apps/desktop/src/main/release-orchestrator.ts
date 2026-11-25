@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+
 import type {
   BundleModuleId,
   LocalReleaseDescriptor,
@@ -24,10 +26,26 @@ export interface RollbackNotice {
   readonly dbBackupFile?: string;
 }
 
+export type ReleaseProgressStage =
+  | "preparing"
+  | "stopping"
+  | "switching"
+  | "verifying"
+  | "complete"
+  | "rolling_back"
+  | "rolled_back";
+
+export interface ReleaseProgressUpdate {
+  readonly stage: ReleaseProgressStage;
+  readonly percent: number;
+  readonly tone: "normal" | "rollback";
+  readonly version: string;
+  readonly targetVersion?: string;
+}
+
 export interface ReleaseOrchestratorHooks {
   readonly activeOperations: () => number;
   readonly isVoiceIdle?: () => Promise<boolean>;
-  readonly hotReloadWeb?: (release: LocalReleaseDescriptor) => Promise<void>;
   readonly backupDatabase?: (appVersion: string) => Promise<string>;
   readonly restoreDatabase?: (backupFile: string) => Promise<void>;
   readonly restartServices: (
@@ -38,6 +56,11 @@ export interface ReleaseOrchestratorHooks {
     release: LocalReleaseDescriptor,
     changed: readonly BundleModuleId[],
   ) => readonly HealthProbe[];
+  readonly onProgress?: (progress: ReleaseProgressUpdate) => void;
+  readonly onComplete?: (release: LocalReleaseDescriptor) => Promise<void> | void;
+  readonly onRollbackComplete?: (notice: RollbackNotice) => Promise<void> | void;
+  readonly completePauseMs?: number;
+  readonly rollbackPauseMs?: number;
   readonly healthGateTimeoutMs?: number;
   readonly healthGateIntervalMs?: number;
   readonly observationWindowMs?: number;
@@ -210,6 +233,12 @@ export class ReleaseOrchestratorModule implements Module {
 
     this.#setState({ kind: "applying", version, diff });
     ctx.bus.emit("release.switching", version);
+    this.#hooks.onProgress?.({
+      stage: "preparing",
+      percent: 10,
+      tone: "normal",
+      version,
+    });
 
     let dbBackupFile: string | undefined;
     try {
@@ -228,17 +257,26 @@ export class ReleaseOrchestratorModule implements Module {
         ...(dbBackupFile ? { dbBackupFile } : {}),
       });
 
-      if (diff.scope === "web" && this.#hooks.hotReloadWeb) {
-        await this.#hooks.hotReloadWeb(next);
-        ctx.bus.emit("web.reload_ready", version);
-      } else {
-        await this.#hooks.restartServices(next, diff.changedModules);
-        if (diff.changedModules.includes("web") && this.#hooks.hotReloadWeb) {
-          await this.#hooks.hotReloadWeb(next);
-          ctx.bus.emit("web.reload_ready", version);
-        }
-      }
+      this.#hooks.onProgress?.({
+        stage: "stopping",
+        percent: 25,
+        tone: "normal",
+        version,
+      });
+      this.#hooks.onProgress?.({
+        stage: "switching",
+        percent: 45,
+        tone: "normal",
+        version,
+      });
+      await this.#hooks.restartServices(next, diff.changedModules);
 
+      this.#hooks.onProgress?.({
+        stage: "verifying",
+        percent: 75,
+        tone: "normal",
+        version,
+      });
       const probes = this.#hooks.buildHealthProbes(next, diff.changedModules);
       const health = await watchdog.waitForHealthy(probes, {
         timeoutMs: this.#hooks.healthGateTimeoutMs,
@@ -258,6 +296,16 @@ export class ReleaseOrchestratorModule implements Module {
         changedModules: diff.changedModules,
       });
       ctx.bus.emit("release.committed", version);
+
+      this.#hooks.onProgress?.({
+        stage: "complete",
+        percent: 100,
+        tone: "normal",
+        version,
+      });
+      const completePauseMs = this.#hooks.completePauseMs ?? 350;
+      if (completePauseMs > 0) await delay(completePauseMs);
+      await this.#hooks.onComplete?.(next);
 
       // Post-commit 2-minute crash observation window for backend restarts.
       if (diff.requiresDrain && current) {
@@ -355,6 +403,13 @@ export class ReleaseOrchestratorModule implements Module {
       stage,
       reason,
     });
+    this.#hooks.onProgress?.({
+      stage: "rolling_back",
+      percent: 55,
+      tone: "rollback",
+      version: failedVersion,
+      targetVersion: previousRelease?.appVersion,
+    });
     if (isPreCommit && dbBackupFile && this.#hooks.restoreDatabase) {
       await this.#hooks.restoreDatabase(dbBackupFile).catch((err) => {
         ctx.log.warn("release_orchestrator.db_restore_failed", {
@@ -371,6 +426,19 @@ export class ReleaseOrchestratorModule implements Module {
       await this.#hooks
         .restartServices(previousRelease, changedModules)
         .catch(() => undefined);
+      const watchdog = ctx.get<HealthWatchdogModule>("HealthWatchdog");
+      const restoreProbes = this.#hooks.buildHealthProbes(
+        previousRelease,
+        changedModules,
+      );
+      if (restoreProbes.length > 0) {
+        await watchdog
+          .waitForHealthy(restoreProbes, {
+            timeoutMs: this.#hooks.healthGateTimeoutMs,
+            intervalMs: this.#hooks.healthGateIntervalMs,
+          })
+          .catch(() => undefined);
+      }
     }
     this.#stagedVersion = undefined;
     const notice: RollbackNotice = {
@@ -381,6 +449,16 @@ export class ReleaseOrchestratorModule implements Module {
     this.#rollbackNotice = notice;
     this.#setState({ kind: "rolled_back", notice });
     ctx.bus.emit("release.rolled_back", notice.fromVersion, notice.toVersion, notice.reason);
+    this.#hooks.onProgress?.({
+      stage: "rolled_back",
+      percent: 100,
+      tone: "rollback",
+      version: failedVersion,
+      targetVersion: notice.toVersion,
+    });
+    const rollbackPauseMs = this.#hooks.rollbackPauseMs ?? 900;
+    if (rollbackPauseMs > 0) await delay(rollbackPauseMs);
+    await this.#hooks.onRollbackComplete?.(notice);
   }
 
   #setState(state: OrchestratorState): void {

@@ -1,15 +1,28 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+  composeProject,
+  instanceRoot,
+  type Instance,
+} from "./instance.js";
+import {
+  inspectNativeProcess,
+  startNativeProcess,
+  stopNativeProcess,
+} from "./native-process.js";
 import {
   BUNDLE_RUNTIME_SCHEMA,
   parseNativeRuntime,
   resolveBundleRuntimeEnv,
 } from "./native-runtime.js";
-import { planBundleNativeCommand } from "./native-source.js";
+import {
+  planBundleNativeCommand,
+  switchNativeRelease,
+} from "./native-source.js";
 import {
   parseLocalReleaseDescriptor,
   parseReleasePointer,
@@ -153,5 +166,143 @@ describe("V2 local-installation release descriptors & decoupled bundles", () => 
     expect(nsCmd.env.LINGER_PROMPTS_DIR).toBe(
       path.join(home, "store/backend/backend-111111111111/node-services/prompts"),
     );
+  });
+
+  it("switchNativeRelease restarts web onto the new bundle LINGER_WEB_ROOT while keeping postgres untouched", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "linger-switch-web-"));
+    tempDirs.push(home);
+    const root = instanceRoot({ name: "desktop", home });
+    const repo = path.join(home, "repo");
+    const offlineWebDir = path.join(repo, ".simplexai-runtime", "offline", "web");
+    await mkdir(root, { recursive: true });
+    await mkdir(offlineWebDir, { recursive: true });
+
+    const observedFile = path.join(home, "web-observed.json");
+    // Simulate esbuild-bundled offline static-host.mjs that stays alive and logs LINGER_WEB_ROOT.
+    await writeFile(
+      path.join(offlineWebDir, "static-host.mjs"),
+      `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(observedFile)}, JSON.stringify({ webRoot: process.env.LINGER_WEB_ROOT, pid: process.pid }));
+setInterval(() => {}, 60_000);
+`,
+      "utf8",
+    );
+
+    // Stage V2 web bundle whose static-host.mjs imports unbundled "sirv" (no local node_modules).
+    const webDir = path.join(home, "store", "web", "web-222222222222");
+    const webDistDir = path.join(webDir, "dist");
+    await mkdir(webDistDir, { recursive: true });
+    await writeFile(path.join(webDistDir, "index.html"), "<html>v2</html>", "utf8");
+    await writeFile(
+      path.join(webDir, "static-host.mjs"),
+      'import sirv from "sirv";\nconsole.log(sirv);\n',
+      "utf8",
+    );
+
+    const descriptor: LocalReleaseDescriptor = {
+      schema: 1,
+      appVersion: "0.1.10-v2test.1",
+      channel: "stable",
+      installedAt: "2026-11-25T10:00:00Z",
+      source: "incremental-update",
+      compat: {
+        minShellVersion: "0.1.10",
+        minNativeDepsHash: `sha256:${"a".repeat(64)}`,
+        runnerGatewayProtocol: 1,
+        dbSchemaEpoch: 892,
+        rollbackSafe: true,
+      },
+      infra: {
+        node: "infra/node/v26",
+        postgres: "infra/postgres/pg17",
+        voiceTools: "infra/voice-tools/lk1",
+        nodeDeps: "infra/node-deps/nd-aaaaaaaaaaaaaaaa",
+      },
+      modules: {
+        web: {
+          artifactId: "web-222222222222",
+          originAppVersion: "0.1.10-v2test.1",
+          sha256: "2".repeat(64),
+          path: "store/web/web-222222222222",
+        },
+        backend: {
+          artifactId: "backend-111111111111",
+          originAppVersion: "0.1.10-v2test.0",
+          sha256: "1".repeat(64),
+          path: "store/backend/backend-111111111111",
+        },
+      },
+    };
+    await writeJsonAtomic(
+      path.join(home, "releases", "0.1.10-v2test.1", "release.json"),
+      descriptor,
+    );
+
+    const instance: Instance = {
+      schemaVersion: 1,
+      name: "desktop",
+      mode: "source-native",
+      root,
+      project: composeProject(root, "desktop"),
+      origin: "http://localhost:3100",
+      port: 3100,
+      releaseDir: repo,
+      computerConfig: path.join(root, "computer.json"),
+      computerExecutable: "/bin/true",
+      source: {
+        repo,
+        ports: {
+          web: 3100,
+          teamhub: 3101,
+          nodeServices: 3102,
+          document: 3103,
+          postgres: 3104,
+        },
+      },
+    };
+
+    try {
+      // Start a live dummy postgres process to prove switchNativeRelease never restarts it.
+      await startNativeProcess({
+        root,
+        name: "postgres",
+        executable: process.execPath,
+        args: ["-e", "setInterval(() => {}, 60000)"],
+        cwd: home,
+        env: process.env,
+        settings: "pg-v1",
+      });
+      const pgBefore = await inspectNativeProcess(root, "postgres");
+      expect(pgBefore.running).toBe(true);
+      expect(pgBefore.pid).toBeDefined();
+
+      const result = await switchNativeRelease(instance, {
+        home,
+        appVersion: "0.1.10-v2test.1",
+        services: ["web"],
+      });
+
+      expect(result.restarted).toEqual(["web"]);
+      expect(result.webArtifactId).toBe("web-222222222222");
+
+      // Postgres PID stayed 100% untouched!
+      const pgAfter = await inspectNativeProcess(root, "postgres");
+      expect(pgAfter.running).toBe(true);
+      expect(pgAfter.pid).toBe(pgBefore.pid);
+
+      // Web started cleanly with LINGER_WEB_ROOT pointing at the new bundle dist!
+      await vi.waitFor(
+        async () => {
+          const observed = JSON.parse(await readFile(observedFile, "utf8")) as {
+            webRoot: string;
+          };
+          expect(observed.webRoot).toBe(webDistDir);
+        },
+        { timeout: 3_000 },
+      );
+    } finally {
+      await stopNativeProcess(root, "web").catch(() => undefined);
+      await stopNativeProcess(root, "postgres").catch(() => undefined);
+    }
   });
 });

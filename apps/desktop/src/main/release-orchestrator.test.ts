@@ -12,6 +12,7 @@ import { EventBus, ModuleHost } from "./modules.js";
 import {
   ReleaseOrchestratorModule,
   diffReleaseModules,
+  type ReleaseProgressUpdate,
 } from "./release-orchestrator.js";
 
 const tempDirs: string[] = [];
@@ -122,6 +123,8 @@ describe("ReleaseOrchestratorModule & HealthWatchdogModule", () => {
       buildHealthProbes: () => [
         { name: "teamhub-healthz", check: async () => probeHealthy },
       ],
+      completePauseMs: 0,
+      rollbackPauseMs: 0,
       healthGateTimeoutMs: 60,
       healthGateIntervalMs: 15,
       observationWindowMs: 5_000,
@@ -210,5 +213,118 @@ describe("ReleaseOrchestratorModule & HealthWatchdogModule", () => {
     });
 
     await host.stop("quit");
+  });
+
+  it("runs unified stop-and-swap with progress updates for web-only, backend-only, and rollback paths", async () => {
+    const home = await makeTempDir("linger-orch-progress-");
+    const store = new BundleStoreModule({ home, target: "darwin-arm64" });
+    const watchdog = new HealthWatchdogModule();
+    const config = new ConfigStore(path.join(home, "config.json"));
+    const bus = new EventBus();
+
+    const progressEvents: ReleaseProgressUpdate[] = [];
+    const switchedCalls: Array<{ version: string; changed: readonly string[] }> = [];
+    const completedVersions: string[] = [];
+    const rolledBackComplete: string[] = [];
+    let probeHealthy = true;
+
+    const orch = new ReleaseOrchestratorModule({
+      activeOperations: () => 0,
+      restartServices: async (release, changed) => {
+        switchedCalls.push({ version: release.appVersion, changed });
+      },
+      buildHealthProbes: () => [
+        { name: "service-healthz", check: async () => probeHealthy },
+      ],
+      onProgress: (p) => progressEvents.push(p),
+      onComplete: (rel) => {
+        completedVersions.push(rel.appVersion);
+      },
+      onRollbackComplete: (notice) => {
+        rolledBackComplete.push(`${notice.fromVersion}->${notice.toVersion}`);
+      },
+      completePauseMs: 0,
+      rollbackPauseMs: 0,
+      healthGateTimeoutMs: 60,
+      healthGateIntervalMs: 15,
+    });
+
+    const host = new ModuleHost(
+      [
+        { name: "Config", dependsOn: [], start: async () => {}, stop: async () => {} },
+        store,
+        watchdog,
+        orch,
+      ],
+      { config, log: noopLog, bus },
+    );
+    await host.start();
+    try {
+      // Seed baseline 0.1.10-v2test.0
+      await store.writeReleaseDescriptor(makeRelease("0.1.10-v2test.0"));
+      await store.beginPending({
+        appVersion: "0.1.10-v2test.0",
+        releaseFile: "releases/0.1.10-v2test.0/release.json",
+        updatedAt: new Date().toISOString(),
+      });
+      await store.commitPending();
+
+      // 1. Web-only update goes through unified stop-and-swap + full progress sequence
+      await store.writeReleaseDescriptor(makeRelease("0.1.10-v2test.1", { web: "2" }));
+      await orch.onBundleStaged("0.1.10-v2test.1");
+      expect(await orch.applyStaged()).toBe(true);
+      expect(switchedCalls).toEqual([
+        { version: "0.1.10-v2test.1", changed: ["web"] },
+      ]);
+      expect(progressEvents.map((e) => [e.stage, e.percent, e.tone])).toEqual([
+        ["preparing", 10, "normal"],
+        ["stopping", 25, "normal"],
+        ["switching", 45, "normal"],
+        ["verifying", 75, "normal"],
+        ["complete", 100, "normal"],
+      ]);
+      expect(completedVersions).toEqual(["0.1.10-v2test.1"]);
+
+      // 2. Backend-only update succeeds with identical progress pipeline
+      progressEvents.length = 0;
+      await store.writeReleaseDescriptor(
+        makeRelease("0.1.10-v2test.2", { web: "2", backend: "2" }),
+      );
+      await orch.onBundleStaged("0.1.10-v2test.2");
+      expect(await orch.applyStaged()).toBe(true);
+      expect(switchedCalls.at(-1)).toEqual({
+        version: "0.1.10-v2test.2",
+        changed: ["backend"],
+      });
+      expect(progressEvents.map((e) => [e.stage, e.percent, e.tone])).toEqual([
+        ["preparing", 10, "normal"],
+        ["stopping", 25, "normal"],
+        ["switching", 45, "normal"],
+        ["verifying", 75, "normal"],
+        ["complete", 100, "normal"],
+      ]);
+
+      // 3. Faulty backend update fails health gate -> emits rollback tone progress, restores 0.1.10-v2test.2, denylists .3
+      progressEvents.length = 0;
+      probeHealthy = false;
+      await store.writeReleaseDescriptor(
+        makeRelease("0.1.10-v2test.3", { web: "2", backend: "3" }),
+      );
+      await orch.onBundleStaged("0.1.10-v2test.3");
+      expect(await orch.applyStaged()).toBe(false);
+      expect(progressEvents.map((e) => [e.stage, e.tone])).toEqual([
+        ["preparing", "normal"],
+        ["stopping", "normal"],
+        ["switching", "normal"],
+        ["verifying", "normal"],
+        ["rolling_back", "rollback"],
+        ["rolled_back", "rollback"],
+      ]);
+      expect((await store.readCurrent())?.appVersion).toBe("0.1.10-v2test.2");
+      expect(await store.isDenylisted("0.1.10-v2test.3")).toBe(true);
+      expect(rolledBackComplete).toEqual(["0.1.10-v2test.3->0.1.10-v2test.2"]);
+    } finally {
+      await host.stop("quit");
+    }
   });
 });

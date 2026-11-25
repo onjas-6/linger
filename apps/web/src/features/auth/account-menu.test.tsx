@@ -181,4 +181,40 @@ describe("AccountMenu desktop update", () => {
       expect(menu).toHaveTextContent("Version 0.1.10-v2test.1"),
     );
   });
+
+  it("distinguishes service updates (web/backend) from client major updates (shell)", async () => {
+    const { update, push } = installDesktop({
+      kind: "downloading",
+      version: "0.1.10-v2test.1",
+      scope: "web",
+    });
+    renderMenu();
+    const menu = await openMenu();
+
+    await vi.waitFor(() =>
+      expect(menu).toHaveTextContent("Downloading service update…"),
+    );
+
+    push({ kind: "ready", version: "0.1.10-v2test.1", scope: "web" });
+    expect(menu).toHaveTextContent("Service update available");
+    expect(screen.getByTestId("account-update-dot")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Update Services" }));
+    expect(update.install).toHaveBeenCalledOnce();
+
+    const reopened = await openMenu();
+    push({ kind: "waiting", version: "0.1.10-v2test.2", scope: "backend" });
+    expect(reopened).toHaveTextContent(
+      "Will update services when tasks finish",
+    );
+
+    push({ kind: "installing", version: "0.1.10-v2test.2", scope: "backend" });
+    expect(reopened).toHaveTextContent("Updating services…");
+
+    // Client major update (scope: "shell") keeps Restart to Update wording.
+    push({ kind: "ready", version: "0.2.0", scope: "shell" });
+    expect(reopened).toHaveTextContent("Linger 0.2.0 is ready to install");
+    expect(
+      screen.getByRole("menuitem", { name: "Restart to Update" }),
+    ).toBeInTheDocument();
+  });
 });

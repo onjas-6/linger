@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 
 // The desktop app's updater (`window.lingerDesktop.update`), in the states
 // its tray shows.
+export type DesktopUpdateScope = "web" | "backend" | "shell";
+
 export type DesktopUpdateState =
   | { readonly kind: "idle" }
   | { readonly kind: "checking" }
@@ -13,6 +15,7 @@ export type DesktopUpdateState =
         | "installing"
         | "available";
       readonly version: string;
+      readonly scope?: DesktopUpdateScope;
     }
   | { readonly kind: "failed"; readonly error: string };
 

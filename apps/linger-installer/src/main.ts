@@ -28,6 +28,7 @@ export function parseInstallerArguments(args: string[]) {
     stop?: boolean;
     stopLocalModels?: boolean;
     switchRelease?: string;
+    switchServices?: ("teamhub" | "node-services" | "web")[];
   } = {
     home: lingerHome(),
   };
@@ -77,6 +78,7 @@ export function parseInstallerArguments(args: string[]) {
         "--instance",
         "--inspect-target",
         "--switch-release",
+        "--services",
       ].includes(flag ?? "")
     )
       throw new Error("Invalid installer option.");
@@ -91,6 +93,15 @@ export function parseInstallerArguments(args: string[]) {
       if (!/^[A-Za-z0-9._+-]{1,64}$/.test(value))
         throw new Error("Invalid release version.");
       options.switchRelease = value;
+    } else if (flag === "--services") {
+      const valid = new Set(["teamhub", "node-services", "web"]);
+      const parsed = value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (parsed.length === 0 || parsed.some((item) => !valid.has(item)))
+        throw new Error("Invalid switch-release services.");
+      options.switchServices = parsed as ("teamhub" | "node-services" | "web")[];
     } else if (flag === "--instance") {
       if (!/^[a-z][a-z0-9-]{0,39}$/.test(value))
         throw new Error("Invalid instance name.");
@@ -123,6 +134,8 @@ export function parseInstallerArguments(args: string[]) {
     throw new Error("Stop needs an instance.");
   if (options.switchRelease && !options.instanceName)
     throw new Error("Switch release needs an instance.");
+  if (options.switchServices && !options.switchRelease)
+    throw new Error("Services option requires --switch-release.");
   return options;
 }
 // The desktop client shows this line, so it carries the real cause; only an
@@ -432,6 +445,7 @@ async function switchReleaseCommand(
     const result = await switchNativeRelease(instance, {
       home: options.home,
       appVersion: options.switchRelease!,
+      ...(options.switchServices ? { services: options.switchServices } : {}),
       signal: controller.signal,
       log: (message) => process.stderr.write(message.replace(/\n?$/, "\n")),
     });

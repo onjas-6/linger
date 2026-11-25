@@ -2,7 +2,7 @@ import { prepareFoundationServices } from "./foundation-services.js";
 import { portFree } from "./ports.js";
 import { prepareModelGateway, stopModelGateway } from "./model-gateway.js";
 import { createHash } from "node:crypto";
-import { constants, existsSync } from "node:fs";
+import { constants, existsSync, readFileSync } from "node:fs";
 import { lstat, open, realpath, statfs } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -242,6 +242,47 @@ export async function resolveBundleReleaseDescriptor(
   );
 }
 
+function resolveWebHostScript(
+  webDir: string,
+  repoDir?: string,
+): { readonly script: string; readonly cwd: string } | undefined {
+  const bundleHost = path.join(webDir, "static-host.mjs");
+  const offlineHost = repoDir
+    ? path.join(
+        repoDir,
+        ".simplexai-runtime",
+        "offline",
+        "web",
+        "static-host.mjs",
+      )
+    : undefined;
+  if (existsSync(bundleHost)) {
+    // An unbundled static-host.mjs imports "negotiator"/"sirv" which are absent
+    // from `<home>/store/web/<id>/`; prefer the esbuild-bundled offline host
+    // when available while always serving `LINGER_WEB_ROOT=<webDir>/dist`.
+    let needsExternalDeps = false;
+    if (!existsSync(path.join(webDir, "node_modules", "sirv"))) {
+      try {
+        const head = readFileSync(bundleHost, "utf8").slice(0, 1024);
+        needsExternalDeps = /\bfrom\s+["'](?:sirv|negotiator)["']/.test(head);
+      } catch {
+        needsExternalDeps = false;
+      }
+    }
+    if (!needsExternalDeps) {
+      return { script: bundleHost, cwd: webDir };
+    }
+    if (offlineHost && existsSync(offlineHost)) {
+      return { script: offlineHost, cwd: path.dirname(offlineHost) };
+    }
+    return { script: bundleHost, cwd: webDir };
+  }
+  if (offlineHost && existsSync(offlineHost)) {
+    return { script: offlineHost, cwd: path.dirname(offlineHost) };
+  }
+  return undefined;
+}
+
 function hasBundleServiceArtifacts(
   home: string,
   release: LocalReleaseDescriptor,
@@ -251,7 +292,10 @@ function hasBundleServiceArtifacts(
   const exe = (name: string) => (platform === "win32" ? `${name}.exe` : name);
   if (service === "web") {
     const webDir = resolveSafeHomePath(home, release.modules.web.path);
-    return existsSync(path.join(webDir, "static-host.mjs"));
+    return (
+      existsSync(path.join(webDir, "static-host.mjs")) ||
+      existsSync(path.join(webDir, "dist", "index.html"))
+    );
   }
   const backendDir = resolveSafeHomePath(home, release.modules.backend.path);
   if (service === "teamhub") {
@@ -1331,12 +1375,25 @@ async function runNativeSource(
                   : existsSync(planned.command)
                     ? planned.command
                     : process.execPath;
+              const webHost =
+                name === "web"
+                  ? resolveWebHostScript(
+                      resolveSafeHomePath(
+                        home,
+                        activeBundleRelease.modules.web.path,
+                      ),
+                      current.source?.repo,
+                    )
+                  : undefined;
+              const args =
+                name === "web" && webHost ? [webHost.script] : [...planned.args];
+              const cwd = name === "web" && webHost ? webHost.cwd : planned.cwd;
               return {
                 root: current.root,
                 name,
                 executable,
-                args: [...planned.args],
-                cwd: planned.cwd,
+                args,
+                cwd,
                 env: { ...baseServiceEnv, ...planned.env },
                 signal,
                 redactions: secrets,
@@ -1870,9 +1927,17 @@ export async function stopNativeSource(
   });
 }
 
+export type SwitchableReleaseService = "teamhub" | "node-services" | "web";
+
 export interface SwitchNativeReleaseOptions {
   readonly home: string;
   readonly appVersion: string;
+  /**
+   * Application services to stop and restart on the target release. Defaults to
+   * all switchable services (`teamhub`, `node-services`, `web`). PostgreSQL and
+   * LiveKit are never restarted by release switching.
+   */
+  readonly services?: readonly SwitchableReleaseService[];
   readonly signal?: AbortSignal;
   readonly log?: (message: string) => void;
 }
@@ -1880,15 +1945,16 @@ export interface SwitchNativeReleaseOptions {
 export interface SwitchNativeReleaseResult {
   readonly appVersion: string;
   readonly backendArtifactId: string;
-  readonly restarted: readonly ("teamhub" | "node-services")[];
+  readonly webArtifactId: string;
+  readonly restarted: readonly SwitchableReleaseService[];
 }
 
 /**
- * Atomically switches the instance's backend services (`teamhub` and
- * `node-services`) to a staged V2 LocalReleaseDescriptor while keeping
- * `postgres`, `livekit`, and `web` running. Reuses `withInstanceLock` and
+ * Atomically switches the instance's selected application services (`teamhub`,
+ * `node-services`, and/or `web`) to a staged V2 LocalReleaseDescriptor while
+ * keeping `postgres` and `livekit` running. Reuses `withInstanceLock` and
  * `native/state` process tracking so `installer.js --stop` on uninstall or
- * upgrade terminates every backend process with zero orphans.
+ * upgrade terminates every managed process with zero orphans.
  */
 export async function switchNativeRelease(
   instance: Instance,
@@ -1896,6 +1962,11 @@ export async function switchNativeRelease(
 ): Promise<SwitchNativeReleaseResult> {
   requireNative(instance);
   const { home, appVersion, signal, log } = options;
+  const targetServices = new Set<SwitchableReleaseService>(
+    options.services && options.services.length > 0
+      ? options.services
+      : ["teamhub", "node-services", "web"],
+  );
   return withInstanceLock(instance, async () => {
     const release = await resolveBundleReleaseDescriptor(home, appVersion);
     if (!release) {
@@ -1926,100 +1997,158 @@ export async function switchNativeRelease(
     delete baseEnv.TEAMHUB_LOCAL_IDENTITY_KEY;
     const proxyEnv = systemProxyEnvironment(baseEnv);
 
-    // Stop node-services first so in-flight runs requeue cleanly while TeamHub
-    // is still up, then stop TeamHub. PostgreSQL, LiveKit, and Web remain up.
-    log?.(`Stopping node-services and teamhub for release ${appVersion}.`);
-    await stopNativeProcess(instance.root, "node-services");
-    await stopNativeProcess(instance.root, "teamhub");
+    const switchTeamhub = targetServices.has("teamhub");
+    const switchNodeServices = targetServices.has("node-services");
+    const switchBackend = switchTeamhub || switchNodeServices;
+    const switchWeb = targetServices.has("web");
 
-    // Run database migration from the target backend bundle before starting
-    // the new TeamHub process.
-    const migrateCmd = planBundleNativeCommand("migrate", home, release, {
-      baseEnv,
-    });
-    if (existsSync(migrateCmd.command)) {
-      log?.(`Running migrate for release ${appVersion}.`);
-      const { code, stderr } = await runProcess(
-        migrateCmd.command,
-        [...migrateCmd.args],
-        {
-          cwd: migrateCmd.cwd,
-          env: { ...baseEnv, ...migrateCmd.env },
-          signal,
-          timeoutMs: 10 * 60_000,
-        },
-      );
-      if (code !== 0) {
-        throw new Error(
-          `Release ${appVersion} database migration failed (exit ${code}): ${stderr.trim().slice(-500)}`,
+    const restarted: SwitchableReleaseService[] = [];
+
+    if (switchBackend) {
+      // Stop node-services first so in-flight runs requeue cleanly while TeamHub
+      // is still up, then stop TeamHub. PostgreSQL and LiveKit remain running.
+      log?.(`Stopping backend services for release ${appVersion}.`);
+      if (switchNodeServices) {
+        await stopNativeProcess(instance.root, "node-services");
+      }
+      if (switchTeamhub) {
+        await stopNativeProcess(instance.root, "teamhub");
+      }
+
+      // Run database migration from the target backend bundle before starting
+      // the new TeamHub process.
+      const migrateCmd = planBundleNativeCommand("migrate", home, release, {
+        baseEnv,
+      });
+      if (switchTeamhub && existsSync(migrateCmd.command)) {
+        log?.(`Running migrate for release ${appVersion}.`);
+        const { code, stderr } = await runProcess(
+          migrateCmd.command,
+          [...migrateCmd.args],
+          {
+            cwd: migrateCmd.cwd,
+            env: { ...baseEnv, ...migrateCmd.env },
+            signal,
+            timeoutMs: 10 * 60_000,
+          },
         );
+        if (code !== 0) {
+          throw new Error(
+            `Release ${appVersion} database migration failed (exit ${code}): ${stderr.trim().slice(-500)}`,
+          );
+        }
+      }
+
+      if (switchTeamhub) {
+        const teamhubCmd = planBundleNativeCommand("teamhub", home, release, {
+          baseEnv,
+        });
+        if (existsSync(teamhubCmd.command)) {
+          log?.(`Starting teamhub (${release.modules.backend.artifactId}).`);
+          await startNativeProcess({
+            root: instance.root,
+            name: "teamhub",
+            executable: teamhubCmd.command,
+            args: [...teamhubCmd.args],
+            cwd: teamhubCmd.cwd,
+            env: {
+              ...baseEnv,
+              ...proxyEnv,
+              ...teamhubCmd.env,
+              ...(identityKey
+                ? { TEAMHUB_LOCAL_IDENTITY_KEY: identityKey }
+                : {}),
+            },
+            signal,
+            settings: JSON.stringify({
+              release: release.appVersion,
+              artifactId: release.modules.backend.artifactId,
+              proxy: proxyEnv.HTTPS_PROXY ?? "",
+            }),
+            restartOnConfigurationChange: true,
+            restartOnExit: SERVICE_RESTART_POLICY,
+          });
+          restarted.push("teamhub");
+        }
+      }
+
+      if (switchNodeServices) {
+        const nsCmd = planBundleNativeCommand("node-services", home, release, {
+          baseEnv,
+        });
+        const nsEntry = nsCmd.args.find((arg) => arg.endsWith("supervisor.js"));
+        if (nsEntry && existsSync(nsEntry)) {
+          const nodeExecutable = existsSync(nsCmd.command)
+            ? nsCmd.command
+            : process.execPath;
+          log?.(
+            `Starting node-services (${release.modules.backend.artifactId}).`,
+          );
+          await startNativeProcess({
+            root: instance.root,
+            name: "node-services",
+            executable: nodeExecutable,
+            args: [...nsCmd.args],
+            cwd: nsCmd.cwd,
+            env: {
+              ...baseEnv,
+              ...proxyEnv,
+              ...nsCmd.env,
+            },
+            signal,
+            settings: JSON.stringify({
+              release: release.appVersion,
+              artifactId: release.modules.backend.artifactId,
+              nodeDeps: release.infra.nodeDeps,
+              proxy: proxyEnv.HTTPS_PROXY ?? "",
+            }),
+            restartOnConfigurationChange: true,
+            restartOnExit: SERVICE_RESTART_POLICY,
+          });
+          restarted.push("node-services");
+        }
       }
     }
 
-    const restarted: ("teamhub" | "node-services")[] = [];
-    const teamhubCmd = planBundleNativeCommand("teamhub", home, release, {
-      baseEnv,
-    });
-    if (existsSync(teamhubCmd.command)) {
-      log?.(`Starting teamhub (${release.modules.backend.artifactId}).`);
-      await startNativeProcess({
-        root: instance.root,
-        name: "teamhub",
-        executable: teamhubCmd.command,
-        args: [...teamhubCmd.args],
-        cwd: teamhubCmd.cwd,
-        env: {
-          ...baseEnv,
-          ...proxyEnv,
-          ...teamhubCmd.env,
-          ...(identityKey ? { TEAMHUB_LOCAL_IDENTITY_KEY: identityKey } : {}),
-        },
-        signal,
-        settings: JSON.stringify({
-          release: release.appVersion,
-          artifactId: release.modules.backend.artifactId,
-          proxy: proxyEnv.HTTPS_PROXY ?? "",
-        }),
-        restartOnConfigurationChange: true,
-      });
-      restarted.push("teamhub");
-    }
-
-    const nsCmd = planBundleNativeCommand("node-services", home, release, {
-      baseEnv,
-    });
-    const nsEntry = nsCmd.args.find((arg) => arg.endsWith("supervisor.js"));
-    if (nsEntry && existsSync(nsEntry)) {
-      const nodeExecutable = existsSync(nsCmd.command)
-        ? nsCmd.command
-        : process.execPath;
-      log?.(`Starting node-services (${release.modules.backend.artifactId}).`);
-      await startNativeProcess({
-        root: instance.root,
-        name: "node-services",
-        executable: nodeExecutable,
-        args: [...nsCmd.args],
-        cwd: nsCmd.cwd,
-        env: {
-          ...baseEnv,
-          ...proxyEnv,
-          ...nsCmd.env,
-        },
-        signal,
-        settings: JSON.stringify({
-          release: release.appVersion,
-          artifactId: release.modules.backend.artifactId,
-          nodeDeps: release.infra.nodeDeps,
-          proxy: proxyEnv.HTTPS_PROXY ?? "",
-        }),
-        restartOnConfigurationChange: true,
-      });
-      restarted.push("node-services");
+    if (switchWeb) {
+      const webDir = resolveSafeHomePath(home, release.modules.web.path);
+      const webHost = resolveWebHostScript(webDir, instance.source?.repo);
+      if (webHost) {
+        log?.(`Stopping web for release ${appVersion}.`);
+        await stopNativeProcess(instance.root, "web");
+        const webCmd = planBundleNativeCommand("web", home, release, {
+          baseEnv,
+        });
+        const nodeExecutable = existsSync(webCmd.command)
+          ? webCmd.command
+          : process.execPath;
+        log?.(`Starting web (${release.modules.web.artifactId}).`);
+        await startNativeProcess({
+          root: instance.root,
+          name: "web",
+          executable: nodeExecutable,
+          args: [webHost.script],
+          cwd: webHost.cwd,
+          env: {
+            ...baseEnv,
+            ...webCmd.env,
+          },
+          signal,
+          settings: JSON.stringify({
+            release: release.appVersion,
+            artifactId: release.modules.web.artifactId,
+          }),
+          restartOnConfigurationChange: true,
+          restartOnExit: SERVICE_RESTART_POLICY,
+        });
+        restarted.push("web");
+      }
     }
 
     return {
       appVersion: release.appVersion,
       backendArtifactId: release.modules.backend.artifactId,
+      webArtifactId: release.modules.web.artifactId,
       restarted,
     };
   });

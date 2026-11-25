@@ -24,9 +24,14 @@ import type { ReleaseOrchestratorModule } from "./release-orchestrator.js";
 import type { SetupWindowModule } from "./setup-window.js";
 import type { StatusModule, StatusTone } from "./status.js";
 import { renderTrayIcon, type TrayArtwork } from "./tray-icon.js";
-import { trayMenu, type TrayAction, type TrayMenuItem } from "./tray-menu.js";
+import {
+  trayMenu,
+  type TrayAction,
+  type TrayMenuItem,
+  type TrayUpdateState,
+} from "./tray-menu.js";
 import { trayMessages } from "./tray.messages.js";
-import type { UpdaterModule, UpdateState } from "./updater.js";
+import type { UpdaterModule } from "./updater.js";
 import type { WindowManagerModule } from "./window-manager.js";
 
 export interface TrayOptions {
@@ -166,7 +171,7 @@ export class TrayModule implements Module {
     }
   }
 
-  #mergedUpdateState(): UpdateState {
+  #mergedUpdateState(): TrayUpdateState {
     const shellUpdate = this.#ctx!.get<UpdaterModule>("Updater").state();
     if (
       shellUpdate.kind === "available" ||
@@ -175,15 +180,34 @@ export class TrayModule implements Module {
       shellUpdate.kind === "waiting" ||
       shellUpdate.kind === "installing"
     ) {
-      return shellUpdate;
+      return { ...shellUpdate, scope: "shell" };
     }
     const orch = this.#optional<ReleaseOrchestratorModule>("ReleaseOrchestrator")?.state();
-    if (orch?.kind === "ready") return { kind: "ready", version: orch.version };
-    if (orch?.kind === "waiting") return { kind: "waiting", version: orch.version };
-    if (orch?.kind === "applying") return { kind: "installing", version: orch.version };
+    if (orch?.kind === "ready") {
+      return { kind: "ready", version: orch.version, scope: orch.diff.scope };
+    }
+    if (orch?.kind === "waiting") {
+      return { kind: "waiting", version: orch.version, scope: orch.diff.scope };
+    }
+    if (orch?.kind === "applying") {
+      return {
+        kind: "installing",
+        version: orch.version,
+        scope: orch.diff.scope,
+      };
+    }
     const bundleUpdater = this.#optional<BundleUpdaterModule>("BundleUpdater");
     const bundle = bundleUpdater?.state();
-    if (bundle?.kind === "downloading") return { kind: "downloading", version: bundle.version };
+    if (bundle?.kind === "downloading") {
+      const onlyWeb =
+        bundle.changedModules.length > 0 &&
+        bundle.changedModules.every((m) => m === "web");
+      return {
+        kind: "downloading",
+        version: bundle.version,
+        scope: onlyWeb ? "web" : "backend",
+      };
+    }
     if (bundle?.kind === "checking" || shellUpdate.kind === "checking") {
       return { kind: "checking" };
     }

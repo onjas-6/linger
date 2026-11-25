@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -47,6 +46,7 @@ import {
 import { EnrollmentModule } from "./enrollment.js";
 import { HealthWatchdogModule } from "./health-watchdog.js";
 import { LanguageModule } from "./language.js";
+import { offlineMessages } from "../shell/offline.messages.js";
 import {
   buildV2HealthProbes,
   resolveToolsNodePath,
@@ -196,9 +196,6 @@ async function main(): Promise<void> {
       : undefined;
   };
   const loginShell = resolveLoginShell(log);
-  const webControlToken =
-    process.env.LINGER_WEB_CONTROL_TOKEN?.trim() ||
-    randomBytes(24).toString("hex");
   const shellDaemonPath = daemonExecutable();
   const bundleStoreRef: { current?: BundleStoreModule } = {};
   const activeDaemonExecutable = async (): Promise<string> => {
@@ -212,7 +209,6 @@ async function main(): Promise<void> {
     home,
     daemonDirectory,
     daemonExecutable: activeDaemonExecutable,
-    webControlToken,
     version: VERSION,
     env: installerEnv(loginShell),
     macosVersion: () => process.getSystemVersion(),
@@ -499,43 +495,47 @@ async function main(): Promise<void> {
           log.info("release_orchestrator.db_restored", { file: relFile });
         }
       : undefined,
-    hotReloadWeb: async (release) => {
-      const origin = config.get().serverUrl;
-      if (!origin || !webControlToken) return;
-      // Thin Client guard (P1-2): never POST internal reload-static to a remote server.
-      if (!(await localServer.servesWindow()) && !isLoopbackOrigin(origin)) {
-        return;
-      }
-      const nextRoot = path.join(home, release.modules.web.path, "dist");
-      const res = await fetch(new URL("/__internal/reload-static", origin), {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-linger-control-token": webControlToken,
-        },
-        body: JSON.stringify({
-          root: nextRoot,
-          artifactId: release.modules.web.artifactId,
-        }),
+    onProgress: (progress) => {
+      const detailByStage = {
+        preparing: offlineMessages.updatingPrepare,
+        stopping: offlineMessages.updatingStopping,
+        switching: offlineMessages.updatingSwitching,
+        verifying: offlineMessages.updatingVerifying,
+        complete: offlineMessages.updatingComplete,
+        rolling_back: offlineMessages.updatingRollback,
+        rolled_back: offlineMessages.updatingRolledBack,
+      } as const;
+      windows.showUpdatingProgress({
+        title: language.t(offlineMessages.updatingServicesTitle),
+        detail: language.t(detailByStage[progress.stage]),
+        percent: progress.percent,
+        tone: progress.tone,
       });
-      if (!res.ok) {
-        throw new Error(`Web static hot-reload failed: HTTP ${res.status}`);
-      }
-      // Defer page reload slightly so an in-flight renderer IPC invoke (update.install)
-      // resolves cleanly before the WebContentsView reloads its JS context.
-      setTimeout(() => {
-        const wc = windows.webContents();
-        if (wc && !wc.isDestroyed()) wc.reloadIgnoringCache();
-      }, 60);
+    },
+    onComplete: () => {
+      windows.loadServer("retry");
+    },
+    onRollbackComplete: () => {
+      windows.loadServer("retry");
     },
     restartServices: async (release, changed) => {
+      const servicesToSwitch: ("teamhub" | "node-services" | "web")[] = [];
       if (changed.includes("backend")) {
-        // P0-4: Delegate backend release switching (teamhub + node-services)
-        // exclusively through installer.js so PID tracking & uninstall --stop
-        // remain under a single lifecycle owner with zero orphan processes.
-        if (await localServer.hasLocalInstance()) {
-          await localServer.switchRelease(release.appVersion);
-        }
+        servicesToSwitch.push("teamhub", "node-services");
+      }
+      if (changed.includes("web")) {
+        servicesToSwitch.push("web");
+      }
+      if (servicesToSwitch.length > 0 && (await localServer.hasLocalInstance())) {
+        // P0-4: Delegate service release switching (`teamhub`, `node-services`,
+        // and/or `web`) exclusively through installer.js so PID tracking &
+        // uninstall --stop stay under a single lifecycle owner while PostgreSQL
+        // and LiveKit remain running.
+        await localServer.switchRelease(release.appVersion, {
+          services: servicesToSwitch,
+        });
+      }
+      if (changed.includes("backend")) {
         const daemonDir = path.join(
           home,
           release.modules.backend.path,
