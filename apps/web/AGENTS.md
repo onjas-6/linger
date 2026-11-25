@@ -194,8 +194,10 @@ build:assets` to check the initial JS budget.
   opening again (its height), and the window keeps one width either way. Only
   the open conversation resizes by its edges. A floated Voice Mode window
   also opens as the island alone (96px, the desktop app's minimum) and grows
-  to show the conversation or shrinks back inside the arrow's click, keeping
-  its width and the open height the Human gave it. A minimized
+  to show the conversation or shrinks back inside the arrow's click, frame
+  by frame with the same timing and easing, the island staying at its top and
+  the conversation going once the window has shut over it. It keeps its
+  width and the open height the Human gave it. A minimized
   recording resizes in width only. A floated window has no handles: the
   browser or the desktop app resizes it.
 - The compact primary rail reveals labels on hover and keyboard focus without

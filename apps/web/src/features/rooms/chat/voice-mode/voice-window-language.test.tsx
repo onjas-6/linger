@@ -118,6 +118,7 @@ function installFakeVoicePip() {
   const document = frame.contentDocument!;
   const pipWindow = {
     addEventListener: () => undefined,
+    removeEventListener: () => undefined,
     close: vi.fn(),
     document,
   };

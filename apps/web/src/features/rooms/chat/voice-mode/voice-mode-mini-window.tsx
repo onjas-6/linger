@@ -227,15 +227,35 @@ function MiniWindow({
   const [resized, setResized] = useState<{ height: number; width: number }>();
   const showConversation = open;
   const floatedOpenSize = useRef<{ height: number; width: number }>(undefined);
+  // A floated window's conversation is as tall as the window leaves it.
+  const [floatedBody, setFloatedBody] = useState<number>();
   const openConversation = (next: boolean) => {
-    setOpen(next);
-    if (pip)
-      floatedOpenSize.current = resizeFloated(
-        pip,
-        next,
-        floatedOpenSize.current,
-      );
+    if (!pip) return setOpen(next);
+    const target = floatedTarget(pip, next, floatedOpenSize.current);
+    floatedOpenSize.current = target.openSize;
+    if (next) {
+      setFloatedBody(target.body);
+      setOpen(true);
+      animateFloated(pip, target.height);
+    }
+    // The window shuts over the conversation, which goes once it is hidden.
+    else animateFloated(pip, target.height, () => setOpen(false));
   };
+  // A floated window the Human resizes gives its conversation the new height;
+  // the window's own open and close animation already sets it.
+  const openRef = useRef(open);
+  useLayoutEffect(() => {
+    openRef.current = open;
+  });
+  useEffect(() => {
+    if (!pip) return;
+    const fit = () => {
+      if (!floatedFrame && openRef.current)
+        setFloatedBody(pip.innerHeight - islandHeight);
+    };
+    pip.addEventListener("resize", fit);
+    return () => pip.removeEventListener("resize", fit);
+  }, [pip]);
   const frameRef = useRef<HTMLElement>(null);
   const { consumeDrag, dragHandlers, moveTo, place, position, remember } =
     useDraggablePosition(
@@ -314,28 +334,111 @@ function MiniWindow({
       { muted, waking: session.live?.waking },
     ),
   );
-  // The island alone is a pill; anything under it rounds the window instead.
-  const pill = !showConversation && !notice && !pendingMaterials;
   // The conversation is as tall as its words up to a preset; a dragged or
   // floated window gives it whatever its own height leaves below the island.
   const footerHeight =
     (notice ? statusRowHeight : 0) + (pendingMaterials ? statusRowHeight : 0);
   const conversationSize: CSSProperties = pip
-    ? { height: `calc(100dvh - ${islandHeight + footerHeight}px)` }
+    ? {
+        height:
+          (floatedBody ?? floatedConversationHeight - islandHeight) -
+          footerHeight,
+      }
     : resized
       ? { height: resized.height - islandHeight - footerHeight }
       : { maxHeight: `calc(${conversationHeight})` };
   if (leavingPip) return null;
+  const conversationLog = (
+    <div
+      aria-label={t(m.conversation)}
+      aria-live="polite"
+      className="workspace-scrollbar min-h-24 overflow-y-auto border-t border-app-border px-3 py-3"
+      onScroll={(event) => {
+        const element = event.currentTarget;
+        const top = element.scrollTop;
+        const atBottom = element.scrollHeight - top - element.clientHeight < 24;
+        // A follow glide passes through positions short of the bottom
+        // on its way down; only moving up leaves the newest words.
+        if (atBottom) {
+          followRef.current = true;
+          glidingRef.current = false;
+        } else if (!glidingRef.current || top < lastTopRef.current) {
+          followRef.current = false;
+          glidingRef.current = false;
+        }
+        lastTopRef.current = top;
+      }}
+      ref={scrollRef}
+      role="log"
+      style={conversationSize}
+    >
+      <div className="space-y-2" ref={contentRef}>
+        {(transcript ? transcript.length : turns.length || replying.length) ||
+        live ? null : (
+          <p className="py-4 text-center text-xs text-app-muted">
+            {t(m.empty)}
+          </p>
+        )}
+        {transcript ? (
+          transcript.map((line) => (
+            <Bubble
+              agent={line.speaker !== "you"}
+              author={
+                line.speaker === "you"
+                  ? t(commonMessages.you)
+                  : session.target.recipient?.display_name || t(m.reply)
+              }
+              key={line.id}
+              own={line.speaker === "you"}
+              pending={line.pending}
+              text={line.text}
+            />
+          ))
+        ) : (
+          <>
+            {turns.map((message) => (
+              <Bubble
+                agent={message.author.kind === "agent"}
+                author={message.author.display_name}
+                key={message.id}
+                own={
+                  currentActorId
+                    ? message.author.id === currentActorId
+                    : message.author.kind === "human"
+                }
+                text={message.raw_message}
+              />
+            ))}
+            {replying.map((run) => (
+              <Bubble
+                agent
+                author={run.agent.display_name}
+                key={run.id}
+                own={false}
+                pending
+                text={t(m.working)}
+              />
+            ))}
+            {heard ? (
+              <Bubble author={t(commonMessages.you)} own pending text={heard} />
+            ) : null}
+          </>
+        )}
+        {saying ? (
+          <Bubble author={t(commonMessages.you)} own pending text={saying} />
+        ) : null}
+      </div>
+    </div>
+  );
   return createPortal(
     <section
       aria-label={t(m.window)}
       className={
         pip
           ? cn(
+              // The island stays at the top, so the window can grow and
+              // shrink under it without the island moving.
               "flex h-dvh w-full flex-col bg-app-voice-island",
-              // A floated window cannot be shorter than its minimum, so the
-              // island alone sits in its middle.
-              pill && "justify-center",
             )
           : // One width open or not, so nothing on the island moves; the
             // island alone is 48px tall, so 24px corners make it a pill.
@@ -460,102 +563,19 @@ function MiniWindow({
             </button>
           </span>
         </header>
-        {/* The conversation slides open and shut under the island with the
-            chat's own resize timing. */}
-        <AutoHeight className="bg-app-canvas" open={showConversation}>
-          <div
-            aria-label={t(m.conversation)}
-            aria-live="polite"
-            className="workspace-scrollbar min-h-24 overflow-y-auto border-t border-app-border px-3 py-3"
-            onScroll={(event) => {
-              const element = event.currentTarget;
-              const top = element.scrollTop;
-              const atBottom =
-                element.scrollHeight - top - element.clientHeight < 24;
-              // A follow glide passes through positions short of the bottom
-              // on its way down; only moving up leaves the newest words.
-              if (atBottom) {
-                followRef.current = true;
-                glidingRef.current = false;
-              } else if (!glidingRef.current || top < lastTopRef.current) {
-                followRef.current = false;
-                glidingRef.current = false;
-              }
-              lastTopRef.current = top;
-            }}
-            ref={scrollRef}
-            role="log"
-            style={conversationSize}
-          >
-            <div className="space-y-2" ref={contentRef}>
-              {(transcript
-                ? transcript.length
-                : turns.length || replying.length) || live ? null : (
-                <p className="py-4 text-center text-xs text-app-muted">
-                  {t(m.empty)}
-                </p>
-              )}
-              {transcript ? (
-                transcript.map((line) => (
-                  <Bubble
-                    agent={line.speaker !== "you"}
-                    author={
-                      line.speaker === "you"
-                        ? t(commonMessages.you)
-                        : session.target.recipient?.display_name || t(m.reply)
-                    }
-                    key={line.id}
-                    own={line.speaker === "you"}
-                    pending={line.pending}
-                    text={line.text}
-                  />
-                ))
-              ) : (
-                <>
-                  {turns.map((message) => (
-                    <Bubble
-                      agent={message.author.kind === "agent"}
-                      author={message.author.display_name}
-                      key={message.id}
-                      own={
-                        currentActorId
-                          ? message.author.id === currentActorId
-                          : message.author.kind === "human"
-                      }
-                      text={message.raw_message}
-                    />
-                  ))}
-                  {replying.map((run) => (
-                    <Bubble
-                      agent
-                      author={run.agent.display_name}
-                      key={run.id}
-                      own={false}
-                      pending
-                      text={t(m.working)}
-                    />
-                  ))}
-                  {heard ? (
-                    <Bubble
-                      author={t(commonMessages.you)}
-                      own
-                      pending
-                      text={heard}
-                    />
-                  ) : null}
-                </>
-              )}
-              {saying ? (
-                <Bubble
-                  author={t(commonMessages.you)}
-                  own
-                  pending
-                  text={saying}
-                />
-              ) : null}
-            </div>
-          </div>
-        </AutoHeight>
+        {/* In the page the conversation slides open and shut under the
+            island with the chat's own resize timing; a floated window moves
+            itself, with the same timing, over a conversation that holds
+            still. */}
+        {pip ? (
+          showConversation ? (
+            <div className="bg-app-canvas">{conversationLog}</div>
+          ) : null
+        ) : (
+          <AutoHeight className="bg-app-canvas" open={showConversation}>
+            {conversationLog}
+          </AutoHeight>
+        )}
         {notice ? (
           <p
             className="h-[29px] shrink-0 truncate border-t border-app-border bg-app-canvas px-3 py-1.5 text-[12px] leading-4 text-app-muted"
@@ -792,35 +812,83 @@ function writePosition(position: Position) {
 }
 
 /**
- * Fits a floated window to the island, or to the open conversation, and
- * returns the open size to come back to. Browsers resize a floated window
- * only inside a click, so this runs in the click that asked.
+ * The height a floated window takes for the island alone or the open
+ * conversation, the open size to come back to, and the conversation's own
+ * height in it. The width stays the Human's.
  */
-function resizeFloated(
+function floatedTarget(
   view: Window,
   open: boolean,
   openSize: { height: number; width: number } | undefined,
 ) {
   const chromeHeight = view.outerHeight - view.innerHeight;
-  const kept = open
-    ? openSize
-    : { height: view.outerHeight, width: view.outerWidth };
-  // The width stays the Human's; only the height follows the conversation.
-  const next = open
-    ? {
-        height: openSize?.height ?? floatedConversationHeight + chromeHeight,
-        width: view.outerWidth,
-      }
-    : { height: islandHeight + chromeHeight, width: view.outerWidth };
-  try {
-    view.resizeTo(
-      Math.min(next.width, view.screen.availWidth || next.width),
-      Math.min(next.height, view.screen.availHeight || next.height),
-    );
-  } catch {
-    // The Human can still drag the window to size.
+  const opened = openSize?.height ?? floatedConversationHeight + chromeHeight;
+  return {
+    body: opened - chromeHeight - islandHeight,
+    height: open ? opened : islandHeight + chromeHeight,
+    openSize: open
+      ? openSize
+      : { height: view.outerHeight, width: view.outerWidth },
+  };
+}
+
+let floatedFrame: { view: Window; id: number } | undefined;
+
+/**
+ * Moves a floated window's height with the in-page conversation's timing
+ * (`--chat-resize-duration`, `--app-out-quint`), one frame at a time, so
+ * opening and closing read the same in the page and floated.
+ */
+function animateFloated(view: Window, height: number, done?: () => void) {
+  if (floatedFrame) floatedFrame.view.cancelAnimationFrame(floatedFrame.id);
+  floatedFrame = undefined;
+  const to = Math.min(height, view.screen.availHeight || height);
+  const width = view.outerWidth;
+  const resize = (next: number) => {
+    try {
+      view.resizeTo(width, Math.round(next));
+    } catch {
+      // The Human can still drag the window to size.
+    }
+  };
+  const duration =
+    Number.parseFloat(
+      view
+        .getComputedStyle?.(view.document.documentElement)
+        .getPropertyValue("--chat-resize-duration") ?? "",
+    ) * 1000 || 280;
+  const still =
+    !view.requestAnimationFrame ||
+    view.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  if (still) {
+    resize(to);
+    return done?.();
   }
-  return kept;
+  const from = view.outerHeight;
+  const start = view.performance.now();
+  const step = (now: number) => {
+    const progress = Math.min(1, (now - start) / duration);
+    resize(from + (to - from) * outQuint(progress));
+    if (progress < 1)
+      floatedFrame = { view, id: view.requestAnimationFrame(step) };
+    else {
+      floatedFrame = undefined;
+      done?.();
+    }
+  };
+  floatedFrame = { view, id: view.requestAnimationFrame(step) };
+}
+
+/** `--app-out-quint`, cubic-bezier(0, 0, 0.2, 1), at `progress` in [0, 1]. */
+function outQuint(progress: number) {
+  let s = progress;
+  for (let i = 0; i < 8; i++) {
+    const x = 0.6 * (1 - s) * s * s + s * s * s;
+    const slope = 0.6 * (2 * s - 3 * s * s) + 3 * s * s;
+    if (Math.abs(slope) < 1e-6) break;
+    s = Math.min(1, Math.max(0, s - (x - progress) / slope));
+  }
+  return 3 * (1 - s) * s * s + s * s * s;
 }
 
 /** Only the avatar follows the microphone level, so the window stays still. */

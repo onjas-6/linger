@@ -135,6 +135,7 @@ function installFakeVoicePip() {
     addEventListener: (type: string, listener: () => void) => {
       if (type === "pagehide") listeners.push(listener);
     },
+    removeEventListener: () => undefined,
     // A closed window is gone; the next request opens a fresh one.
     close: vi.fn(() => listeners.splice(0).forEach((listener) => listener())),
   };
@@ -522,6 +523,61 @@ describe("Voice Mode mini window", () => {
       expect(
         screen.queryByRole("region", { name: "Voice Mode window" }),
       ).not.toBeInTheDocument();
+    } finally {
+      fake.remove();
+    }
+  });
+
+  it("moves a floated window's height frame by frame, shutting over the conversation", async () => {
+    const fake = installFakeVoicePip();
+    try {
+      renderWindow({ conversation: false });
+      await act(() => openVoicePip("voice-mode"));
+      const floating = within(fake.document.body);
+      await floating.findByRole("region", { name: "Voice Mode window" });
+      const frames: FrameRequestCallback[] = [];
+      const heights: number[] = [];
+      const size = { innerHeight: 96, outerHeight: 124 };
+      Object.assign(fake.pipWindow, {
+        cancelAnimationFrame: () => undefined,
+        get innerHeight() {
+          return size.innerHeight;
+        },
+        innerWidth: 360,
+        get outerHeight() {
+          return size.outerHeight;
+        },
+        outerWidth: 360,
+        performance: { now: () => 0 },
+        requestAnimationFrame: (callback: FrameRequestCallback) =>
+          frames.push(callback),
+        resizeTo: (_width: number, height: number) => {
+          heights.push(height);
+          size.outerHeight = height;
+          size.innerHeight = height - 28;
+        },
+        screen: { availHeight: 900, availWidth: 1400 },
+      });
+      const run = (now: number) => act(() => frames.shift()?.(now));
+      fireEvent.click(
+        floating.getByRole("button", { name: "Show Voice Mode conversation" }),
+      );
+      expect(floating.getByRole("log")).toBeInTheDocument();
+      run(140);
+      run(280);
+      // Eased toward the open height (fast first), landing on it.
+      expect(heights[0]).toBeGreaterThan(124 + (508 - 124) / 2);
+      expect(heights.at(-1)).toBe(508);
+      fireEvent.click(
+        floating.getByRole("button", { name: "Hide Voice Mode conversation" }),
+      );
+      run(140);
+      // The conversation stays while the window shuts over it.
+      expect(floating.getByRole("log")).toBeInTheDocument();
+      run(280);
+      expect(heights.at(-1)).toBe(76);
+      expect(floating.queryByRole("log")).toBeNull();
+      act(() => fake.pipWindow.close());
     } finally {
       fake.remove();
     }
