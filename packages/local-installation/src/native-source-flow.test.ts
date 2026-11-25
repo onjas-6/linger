@@ -40,7 +40,12 @@ import {
   prepareNativeDependencies,
   prepareNativeVoiceTools,
 } from "./native-dependencies.js";
-import { readLiveKitSettings, startNativeLiveKit } from "./native-livekit.js";
+import {
+  prepareLiveKitSettings,
+  readLiveKitSettings,
+  startNativeLiveKit,
+} from "./native-livekit.js";
+import { PortAllocationError } from "./ports.js";
 import { updateUserKeys } from "./user-environment.js";
 import {
   NATIVE_RUNTIME_DIRECTORY,
@@ -63,6 +68,7 @@ import {
   inspectNativeListeners,
   inspectNativeProcess,
   nativeConfigurationChanged,
+  SERVICE_RESTART_POLICY,
   startNativeProcess,
   stopNativeProcess,
 } from "./native-process.js";
@@ -79,11 +85,15 @@ vi.mock("./native-dependencies.js", () => ({
   prepareNativeDependencies: vi.fn(),
   prepareNativeVoiceTools: vi.fn(),
 }));
-vi.mock("./native-livekit.js", async (original) => ({
-  ...(await original<typeof import("./native-livekit.js")>()),
-  readLiveKitSettings: vi.fn(),
-  startNativeLiveKit: vi.fn(),
-}));
+vi.mock("./native-livekit.js", async (original) => {
+  const actual = await original<typeof import("./native-livekit.js")>();
+  return {
+    ...actual,
+    prepareLiveKitSettings: vi.fn(actual.prepareLiveKitSettings),
+    readLiveKitSettings: vi.fn(),
+    startNativeLiveKit: vi.fn(),
+  };
+});
 // Setting the model source runs the localmodels tool, which these tests never
 // install.
 vi.mock("./byok-source.js", async (original) => ({
@@ -130,6 +140,12 @@ vi.mock("./native-process.js", () => {
     nativeConfigurationChanged: vi.fn(),
     startNativeProcess: vi.fn(),
     stopNativeProcess: vi.fn(),
+    SERVICE_RESTART_POLICY: {
+      delaysMs: [1_000],
+      windowMs: 60_000,
+      limit: 5,
+      armAfterMs: 10_000,
+    },
   };
 });
 vi.mock("./native-database.js", () => ({ prepareNativeDatabase: vi.fn() }));
@@ -880,6 +896,9 @@ test("only TeamHub's process gets the server identity key", async () => {
   );
   for (const options of others)
     expect(options.env).not.toHaveProperty("TEAMHUB_LOCAL_IDENTITY_KEY");
+  // Each of them is restarted by its supervisor when it exits unasked.
+  for (const options of services)
+    expect(options.restartOnExit).toEqual(SERVICE_RESTART_POLICY);
   const commands = vi.mocked(runProcess).mock.calls;
   expect(commands.some((row) => row[1].includes("migrate"))).toBe(true);
   for (const [, , options] of commands)
@@ -2252,6 +2271,87 @@ for (const tools of ["absent", "failed"] as const)
     expect(events).not.toContain("soniox-1");
   });
 
+test("voice stays off and the install continues when LiveKit UDP port allocation fails", async () => {
+  vi.mocked(prepareLiveKitSettings).mockRejectedValueOnce(
+    new PortAllocationError("udp", "127.0.0.1 bind: EADDRINUSE", 54_321),
+  );
+  const { events, services, env } = await installVoice("bundled", {
+    SONIOX_API_KEY: "soniox-1",
+  });
+  for (const options of services)
+    expect(JSON.parse(options.settings!).voice).toBe("off");
+  expect(startNativeLiveKit).not.toHaveBeenCalled();
+  expect(env("teamhub").TEAMHUB_VOICE_MEDIA).toBe("off");
+  expect(env("teamhub").LIVEKIT_URL).toBeUndefined();
+  expect(events).toContain(
+    "Voice stays off: LiveKit could not reserve a local port",
+  );
+  expect(events).toContain("UDP: 127.0.0.1 bind: EADDRINUSE (port 54321)");
+});
+
+test("voice still stays off on LiveKit port exhaustion even when checkout .env defines LIVEKIT_URL", async () => {
+  const f = await fixture();
+  await writeFile(
+    path.join(f.repo, ".env"),
+    "LIVEKIT_URL=ws://127.0.0.1:17880\n",
+  );
+  const bin = path.join(f.home, "voice");
+  vi.mocked(prepareNativeVoiceTools).mockResolvedValue({
+    bin,
+    livekit: path.join(bin, "livekit-server"),
+  });
+  vi.mocked(readLiveKitSettings).mockResolvedValue({
+    httpPort: 30000,
+    rtcPort: 30001,
+    apiKey: "APIabcdef123456",
+    apiSecret: "s".repeat(64),
+  });
+  vi.mocked(prepareLiveKitSettings).mockRejectedValueOnce(
+    new PortAllocationError("udp", "127.0.0.1 bind: EADDRINUSE", 54_322),
+  );
+  const events: string[] = [];
+  const outcome = await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-voice-checkout-env",
+    setupChoice: "pi",
+    externalComputer: false,
+    signal: new AbortController().signal,
+    onEvent: (event) => events.push(event.message),
+  });
+  expect(outcome.code, outcome.message).toBe(0);
+  const services = vi
+    .mocked(startNativeProcess)
+    .mock.calls.map(([options]) => options)
+    .filter((options) => options.name !== "postgres");
+  for (const options of services)
+    expect(JSON.parse(options.settings!).voice).toBe("off");
+  expect(startNativeLiveKit).not.toHaveBeenCalled();
+  const teamhub = services.find((options) => options.name === "teamhub")!;
+  expect(teamhub.env.TEAMHUB_VOICE_MEDIA).toBe("off");
+  expect(events.join("")).toContain(
+    "Voice stays off: LiveKit could not reserve a local port",
+  );
+});
+
+test("non-port LiveKit configuration errors still fail preflight", async () => {
+  const f = await fixture();
+  vi.mocked(prepareLiveKitSettings).mockRejectedValueOnce(
+    new Error("disk permission denied"),
+  );
+  const outcome = await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-voice-error",
+    setupChoice: "pi",
+    externalComputer: true,
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(outcome.code).toBe(1);
+  expect(outcome.message).toContain("disk permission denied");
+});
+
 test("a changed voice key leaves the voice setting alone", async () => {
   const first = await installVoice("bundled", { XAI_API_KEY: "xai-1" });
   vi.mocked(startNativeProcess).mockClear();
@@ -2939,6 +3039,72 @@ test("a cold resume degrades gracefully instead of blocking when local models ca
     },
   });
   expect(logs.join("")).toContain("Linger is starting without local models");
+});
+
+test("an app update degrades a local model stack an earlier release stopped instead of failing the start", async () => {
+  // A 0.1.6 home that was quit before the update: its deployment is marked
+  // removed in the shared tools directory, so the saved plan cannot come back
+  // and the new kit reports it changed.
+  const f = await fixture();
+  const name = "native-flow-local-models-degraded-update";
+  vi.mocked(prepareLocalModels).mockResolvedValueOnce(undefined);
+  const installed = await installNativeSource({
+    ...f,
+    name,
+    setupChoice: "local-models",
+    externalComputer: true,
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(installed.code).toBe(0);
+  const saved = await loadInstance({ name, home: f.home });
+  await stopNativeSource(saved!, new AbortController().signal);
+
+  const changed = {
+    code: 4,
+    state: "action_required" as const,
+    message:
+      "This computer's state or local model runtime changed since the plan was approved (llm, harness).",
+    details: {
+      code: "LOCAL_MODELS_RECOVERY_REQUIRED",
+      causeCode: "STACK_PLAN_CHANGED",
+      reasons: ["deployment-unavailable"],
+    },
+  };
+  vi.mocked(prepareLocalModels).mockResolvedValueOnce(changed);
+  vi.mocked(prepareModelGateway).mockRejectedValueOnce(
+    new Error("local model gateway unavailable"),
+  );
+  const updated = await installNativeSource({
+    ...f,
+    name,
+    externalComputer: true,
+    degradeLocalModels: true,
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(updated).toMatchObject({
+    code: 0,
+    state: "ready",
+    details: {
+      localModelsDegraded: {
+        code: "LOCAL_MODELS_RECOVERY_REQUIRED",
+        reasons: ["deployment-unavailable"],
+      },
+    },
+  });
+
+  // Choosing local models again in setup still fails on the same refusal.
+  vi.mocked(prepareLocalModels).mockResolvedValueOnce(changed);
+  const chosen = await installNativeSource({
+    ...f,
+    name,
+    setupChoice: "local-models",
+    externalComputer: true,
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(chosen.code).toBe(4);
 });
 
 test("a cold resume degrades gracefully when local model preparation throws", async () => {

@@ -427,6 +427,31 @@ export class BundleStoreModule implements Module {
     );
   }
 
+  /**
+   * Returns the `linger-computer-daemon` executable inside the active V2
+   * `backend` bundle when present on disk, or `undefined` to fall back to the
+   * Shell-bundled daemon binary.
+   */
+  async currentDaemonExecutable(
+    platform: NodeJS.Platform = process.platform,
+  ): Promise<string | undefined> {
+    const release = await this.currentRelease().catch(() => undefined);
+    if (!release) return undefined;
+    const binaryName =
+      platform === "win32"
+        ? "linger-computer-daemon.exe"
+        : "linger-computer-daemon";
+    try {
+      const candidate = resolveSafeHomePath(
+        this.home,
+        path.join(release.modules.backend.path, "computer-daemon", binaryName),
+      );
+      return existsSync(candidate) ? candidate : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   async beginPending(pointer: ReleasePointer): Promise<void> {
     const validated = parseReleasePointer(pointer);
     await writeJsonAtomic(this.#pointerPath("pending"), validated);

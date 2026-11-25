@@ -3,6 +3,8 @@ import { contextBridge, ipcRenderer } from "electron";
 import {
   IPC,
   type ComputerStatus,
+  type DesktopDriverInstallState,
+  type DesktopSettings,
   type DesktopUpdateState,
   type LingerDesktopApi,
   type PreviewViewState,
@@ -35,10 +37,21 @@ const api: LingerDesktopApi = {
   settings: {
     get: () => ipcRenderer.invoke(IPC.settingsGet),
     set: (patch) => ipcRenderer.invoke(IPC.settingsSet, patch),
+    onChange: (callback) => {
+      const listener = (_event: unknown, settings: DesktopSettings): void =>
+        callback(settings);
+      ipcRenderer.on(IPC.settingsEvent, listener);
+      return () => {
+        ipcRenderer.off(IPC.settingsEvent, listener);
+      };
+    },
   },
   localAccount: {
     available: () => ipcRenderer.invoke(IPC.localAccountAvailable),
     signIn: () => ipcRenderer.invoke(IPC.localAccountSignIn),
+  },
+  localServer: {
+    owned: () => ipcRenderer.invoke(IPC.localServerOwned),
   },
   update: {
     getState: () => ipcRenderer.invoke(IPC.updateState),
@@ -99,6 +112,27 @@ const api: LingerDesktopApi = {
   },
   diagnostics: {
     save: () => ipcRenderer.invoke(IPC.diagnosticsSave),
+  },
+  driverUpdate: {
+    getCapabilities: () => ipcRenderer.invoke(IPC.driverUpdateCapabilities),
+    openNvidiaApp: () => ipcRenderer.invoke(IPC.driverUpdateOpenNvidiaApp),
+    openOfficialDownload: () =>
+      ipcRenderer.invoke(IPC.driverUpdateOpenDownload),
+    openGuide: () => ipcRenderer.invoke(IPC.driverUpdateOpenGuide),
+    getInstallState: () => ipcRenderer.invoke(IPC.driverUpdateInstallState),
+    onInstallState: (callback) => {
+      const listener = (
+        _event: unknown,
+        state: DesktopDriverInstallState,
+      ): void => callback(state);
+      ipcRenderer.on(IPC.driverUpdateInstallStateEvent, listener);
+      return () => {
+        ipcRenderer.off(IPC.driverUpdateInstallStateEvent, listener);
+      };
+    },
+    startInstall: (request) =>
+      ipcRenderer.invoke(IPC.driverUpdateStartInstall, request),
+    clearInstallState: () => ipcRenderer.invoke(IPC.driverUpdateClearState),
   },
   ...(process.platform === "darwin"
     ? {

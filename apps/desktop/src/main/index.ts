@@ -38,6 +38,12 @@ import { ConfigStore } from "./config.js";
 import { DesktopIpcModule } from "./desktop-ipc.js";
 import { dialogMessages } from "./dialogs.messages.js";
 import { DiagnosticsModule } from "./diagnostics.js";
+import { DriverUpdater } from "./driver-updater.js";
+import {
+  detectWindowsNvidiaGpuName,
+  runWindowsDriverInstaller,
+  verifyWindowsAuthenticode,
+} from "./windows-driver-platform.js";
 import { EnrollmentModule } from "./enrollment.js";
 import { HealthWatchdogModule } from "./health-watchdog.js";
 import { LanguageModule } from "./language.js";
@@ -185,9 +191,22 @@ async function main(): Promise<void> {
       ? cookies.map((c) => `${c.name}=${c.value}`).join("; ")
       : undefined;
   };
+  const loginShell = resolveLoginShell(log);
+  const shellDaemonPath = daemonExecutable();
+  let bundleStoreRef: BundleStoreModule | undefined;
+  const activeDaemonExecutable = async (): Promise<string> => {
+    if (process.env.LINGER_COMPUTER_DAEMON) {
+      return path.resolve(process.env.LINGER_COMPUTER_DAEMON);
+    }
+    const bundled = await bundleStoreRef?.currentDaemonExecutable();
+    return bundled ?? shellDaemonPath;
+  };
   const localServer = new LocalServerModule({
     home,
+    daemonDirectory,
+    daemonExecutable: activeDaemonExecutable,
     version: VERSION,
+    env: installerEnv(loginShell),
     macosVersion: () => process.getSystemVersion(),
     installerDirectory: path.join(here, "../installer"),
     ...(__SOURCE_ARCHIVE__ ? { sourceArchive: __SOURCE_ARCHIVE__ } : {}),
@@ -218,6 +237,37 @@ async function main(): Promise<void> {
     background: background || needsSetup,
     localServerResumable: (url) => localServer.isStarting(url),
   });
+  const openExternal = (url: string): Promise<void> =>
+    process.platform === "linux" ? openWithXdg(url) : shell.openExternal(url);
+  const bus = new EventBus();
+  const driverUpdater = new DriverUpdater({
+    platform: process.platform as "darwin" | "win32" | "linux",
+    arch: process.arch,
+    existsSync,
+    env: process.env,
+    launchExecutable: async (executablePath) => {
+      const error = await shell.openPath(executablePath);
+      if (error) throw new Error(error);
+    },
+    openExternal,
+    onStateChange: () => bus.emit("driver-update.changed"),
+    onBusyChange: (busy) => bus.emit("driver-update.busy", busy),
+    ...(process.platform === "win32" && process.arch === "x64"
+      ? {
+          directInstall: {
+            downloadDirectory: path.join(userData, "driver-updates"),
+            detectGpuName: detectWindowsNvidiaGpuName,
+            verifyAuthenticode: verifyWindowsAuthenticode,
+            runInstaller: runWindowsDriverInstaller,
+            readPendingUpdate: () => config.get().pendingDriverUpdate,
+            writePendingUpdate: (record) => {
+              config.update({ pendingDriverUpdate: record });
+            },
+            systemUptimeSeconds: () => os.uptime(),
+          },
+        }
+      : {}),
+  });
   const setup = new SetupWindowModule({
     preload: path.join(here, "../preload/setup.cjs"),
     version: VERSION,
@@ -228,6 +278,7 @@ async function main(): Promise<void> {
       set: (on) =>
         app.setLoginItemSettings({ openAtLogin: on, args: ["--background"] }),
     },
+    driverUpdater,
     ...(process.platform === "darwin"
       ? {
           permissions: new MacPermissions({
@@ -301,7 +352,7 @@ async function main(): Promise<void> {
       : undefined;
   const computerDaemon = new ComputerDaemonModule({
     spawn: spawnDaemon(
-      daemonExecutable(),
+      shellDaemonPath,
       path.join(userData, "logs", "computer-daemon.log"),
     ),
     credentials,
@@ -310,9 +361,9 @@ async function main(): Promise<void> {
     // with a matching version and the computer needs no Node.
     teamhubCliDirectory: path.join(here, "../teamhub-cli"),
     defaultDisplayName,
-    env: daemonEnv(log),
+    env: daemonEnv(loginShell),
     ...(process.platform === "win32"
-      ? { protect: protectWithDaemon(daemonExecutable()) }
+      ? { protect: protectWithDaemon(shellDaemonPath) }
       : {}),
     ...desktopPermissions,
   });
@@ -361,6 +412,7 @@ async function main(): Promise<void> {
     target: bundleTarget,
     shouldImportSeed: isLocalServerMode,
   });
+  bundleStoreRef = bundleStore;
   const bundleUpdater = new BundleUpdaterModule({
     shellVersion,
     target: bundleTarget,
@@ -618,9 +670,10 @@ async function main(): Promise<void> {
       defaultDisplayName,
       shellVersion,
       ...(desktopPermissions ? { permissions: desktopPermissions } : {}),
+      driverUpdater,
     }),
   ];
-  const host = new ModuleHost(modules, { config, log, bus: new EventBus() });
+  const host = new ModuleHost(modules, { config, log, bus });
 
   const showApp = (): void => setup.showApp();
   // The uninstaller, or setup replacing this release, asked to quit.
@@ -756,16 +809,41 @@ function electronPower(): PowerApi {
   };
 }
 
-// The user's terminal environment, which runtimes inherit, without the app's
-// own control variables. The runtime paths stay for the daemon config; the
-// daemon keeps LINGER_* from runtimes.
-async function daemonEnv(log: Logger): Promise<Record<string, string>> {
+async function resolveLoginShell(
+  log: Logger,
+): Promise<Record<string, string> | undefined> {
   const started = Date.now();
   const login = await loginShellEnvironment();
   log.info("computer_daemon.login_shell", {
     resolved: login !== undefined,
     duration_ms: Date.now() - started,
   });
+  return login;
+}
+
+// The user's terminal environment for the installer and setup inspection,
+// keeping LINGER_* controls while adding the login shell's PATH and profile.
+async function installerEnv(
+  loginShell: Promise<Record<string, string> | undefined>,
+): Promise<Record<string, string>> {
+  const login = await loginShell;
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(
+    withLoginShell(process.env as Record<string, string>, login),
+  )) {
+    if (value === undefined) continue;
+    env[name] = value;
+  }
+  return env;
+}
+
+// The user's terminal environment, which runtimes inherit, without the app's
+// own control variables. The runtime paths stay for the daemon config; the
+// daemon keeps LINGER_* from runtimes.
+async function daemonEnv(
+  loginShell: Promise<Record<string, string> | undefined>,
+): Promise<Record<string, string>> {
+  const login = await loginShell;
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(
     withLoginShell(process.env as Record<string, string>, login),

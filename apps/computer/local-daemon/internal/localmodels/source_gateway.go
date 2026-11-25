@@ -5,8 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 )
 
@@ -75,6 +73,7 @@ func (m *ModelSource) EnsureGateway(ctx context.Context, runtimeType string) err
 
 // remount mounts the saved BYOK source on Bifrost again. The caller holds mu.
 func (m *ModelSource) remount(ctx context.Context, runtime string) error {
+	previousPaths := m.readExecutableRuntimePaths()
 	runCtx, cancel := context.WithTimeout(ctx, m.applyTimeout)
 	defer cancel()
 	stdout, exitCode, err := m.runTool(runCtx, "source_remount", m.applyArgs("byok", runtime, "", false), nil)
@@ -95,7 +94,7 @@ func (m *ModelSource) remount(ctx context.Context, runtime string) error {
 		return parseToolFailure(stdout, "BYOK_GATEWAY_FAILED", "The BYOK gateway could not be started on this Computer.", "")
 	}
 	// The tool rewrites model-source.json without the Runtime paths.
-	m.persistRuntimePaths(stdout)
+	m.persistRuntimePaths(stdout, previousPaths)
 	return nil
 }
 
@@ -108,17 +107,11 @@ func byokGateway(stateDir, runtimeType string) (runtime, healthURL string) {
 	if overlay == nil || overlay.Mode != "byok" || !GatewayRuntime(overlay.Environment, stateDir, runtimeType) {
 		return "", ""
 	}
-	gateway, err := url.Parse(overlay.GatewayURL)
-	if err != nil || gateway.Scheme != "http" || gateway.Port() == "" || gateway.User != nil ||
-		gateway.RawQuery != "" || gateway.Fragment != "" {
+	healthURL = loopbackHealthURL(overlay.GatewayURL, false)
+	if healthURL == "" {
 		return "", ""
 	}
-	switch gateway.Hostname() {
-	case "127.0.0.1", "localhost", "::1":
-	default:
-		return "", ""
-	}
-	return overlay.Runtime, gateway.Scheme + "://" + gateway.Host + strings.TrimRight(gateway.Path, "/") + "/health"
+	return overlay.Runtime, healthURL
 }
 
 func gatewayAnswers(ctx context.Context, healthURL string) bool {

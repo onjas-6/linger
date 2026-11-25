@@ -19,15 +19,26 @@ ancestor counts as well, because its holder can rename that folder, except on
 a volume root, which can be neither renamed nor removed. A folder directly on
 a data drive with the stock root ACL therefore passes, and a folder nested in
 one that inherits Modify for Authenticated Users does not. The Daemon's
-`privatefs` treats the volume root the same way. A refusal leaves the
-installer as its code and reason (`windowsPrivateRefusal`), never as its
-words: in the `startFailure` line on stdout when the installer manager cannot
-start, and in the `--user-keys` outcome. The Desktop setup page branches on
-`UNSAFE_PARENT_ACCESS` to say where to install instead. Repair skips propagation when the protected
-DACL already grants inheritable FullControl to the owner and SYSTEM on a
-directory, or FullControl to both on a file. Private paths with partial rights
-still receive the full repair. Rewriting a directory DACL propagates to its
-existing children and can time out on a large cache tree.
+`privatefs` treats the volume root and trusted ancestor principals the same
+way: ancestors trust the current user, `SYSTEM`, `BUILTIN\Administrators`,
+`TrustedInstaller`, built-in Administrator/Domain/Enterprise Admin SIDs
+(`S-1-5-21-*-*-*-500|512|519`), direct individual/domain/Entra members of local
+`BUILTIN\Administrators` (never broad groups such as `Everyone`, `Users`, or
+`Authenticated Users`), and Codex Windows sandbox principals on access rules.
+Private targets themselves remain strictly owner-only. `windowsPrivateLocation`
+runs the same check non-destructively without creating folders or changing
+ACLs. The PowerShell script checks `$ExecutionContext.SessionState.LanguageMode`
+first, emits Win32 P/Invoke stubs in memory via `Reflection.Emit` instead of
+compiling C# through `Add-Type`, and reports the offending ancestor path and SID
+or sanitized exception/worker diagnostics (never raw stderr prose). A refusal leaves the installer as its code and reason
+(`windowsPrivateRefusal`), never as its words: in the `startFailure` line on
+stdout when the installer manager cannot start, and in the `--user-keys`
+outcome. The Desktop setup page branches on `UNSAFE_PARENT_ACCESS` to say where
+to install instead. Repair skips propagation when the protected DACL already
+grants inheritable FullControl to the owner and SYSTEM on a directory, or
+FullControl to both on a file. Private paths with partial rights still receive
+the full repair. Rewriting a directory DACL propagates to its existing children
+and can time out on a large cache tree.
 
 Launch the fixed private-path scripts with PowerShell `-Command`. Encoding
 the whole script lengthens the Windows command line and can stall startup.
@@ -57,8 +68,9 @@ package's `.env` is not read. Voice keys are normally saved in the app
 (TeamHub); a key in `user.env` overrides it. Whenever the distribution has
 voice tools for this computer, Native prepares them and runs LiveKit with
 the key pair and ports in the instance's `livekit.env`, with or without a
-voice key; without them, or when they fail to prepare, TeamHub gets
-`TEAMHUB_VOICE_MEDIA=off` and the install continues. The services' `voice`
+voice key; without them, or when they fail to prepare or LiveKit cannot
+reserve a local port, TeamHub gets `TEAMHUB_VOICE_MEDIA=off` and the install
+continues. The services' `voice`
 setting tracks only the tools, so a key change never restarts them through
 it. A native process restarts when its generated environment changes.
 The desktop passes the system proxy it resolved for Soniox as
@@ -86,7 +98,10 @@ the environment file.
 Every port the installer chooses (`ports.ts`) must be free on both
 127.0.0.1 and ::1 with nothing answering there: `localhost` resolves to ::1
 first on macOS, and a program on ::1 alone would answer for a service that
-bound 127.0.0.1 without an error. The web static host listens on both.
+bound 127.0.0.1 without an error. UDP allocation holds the bound IPv4 socket
+while checking ::1 instead of closing and rebinding 127.0.0.1, and falls back
+to unprivileged non-ephemeral ports when OS ephemeral UDP ports fail or
+collide. The web static host listens on both.
 Creating an instance also reserves other instances' saved LiveKit HTTP and RTC
 ports, even while their voice services are stopped. Each
 start re-checks a stopped service's ports and moves one another program took
@@ -143,7 +158,11 @@ never served a connection, holds no data, and is initialized again.
 A running PostgreSQL whose configuration changed restarts like LiveKit and
 TeamHub: a release that repins the PostgreSQL archive unpacks it into a new
 component folder, so the server an earlier release left running differs in
-its executable path and must not stop the install.
+its executable path and must not stop the install. Startup readiness waits up
+to 120 seconds (logging elapsed progress every 15 seconds) while `postgres`
+stays alive so slow disks and Windows antivirus scanning do not time out during
+initial data-directory fsync, while still failing immediately if `postgres`
+exits.
 
 On Windows `postgres.exe` refuses a token with Administrators enabled. When
 the installer runs elevated (Run as administrator, the built-in
@@ -244,13 +263,23 @@ running (and on cold resume when `model-source.json` says `local`), such as
 after the desktop's quit stopped them, whenever the active model source is
 `local` (or not saved yet on a `local-models` setup): when a saved
 `runtime_model` is recorded, a ready binding checks `library status` so a
-quit-time `library unload` reloads that saved model and re-applies the local
-source under the same lock (never guessing an arbitrary idle model when no
-`runtime_model` is saved), while a stopped plan gets the same restore (`stack up`,
-falling back to `stack apply`), verifies whether a saved local model
-(`localmodels/` or `localmodels-library/`) is loaded, and sets the local source again. Library-model reload failures return a failure outcome that warm
+quit-time `library unload` or a `failed` server (`HEALTH_CHECK_FAILED` or other
+non-stopped-download failure, reset with `library unload` first) reloads that
+saved model and re-applies the local source under the same lock (never guessing
+an arbitrary idle model when no `runtime_model` is saved; stopped downloads
+return a degraded outcome without loading), while a stopped plan gets the same
+restore (`stack up`, falling back to `stack apply`), verifies whether a saved
+local model (`localmodels/` or `localmodels-library/`) is loaded, and sets the
+local source again. Quit-time `stopLocalmodels` (`localmodels-tool.ts`) unloads
+both `loaded` models and non-stopped-download `failed` models so a dead server
+resets to `idle` before `stack down`. Library-model reload failures return a
+failure outcome that warm
 and cold resume surface in `details.localModelsDegraded` so startup stays usable
-and the person can still reach the Models page. On cold resume, a saved `local`
+and the person can still reach the Models page. The first start after an app
+update onto a new checkout passes `degradeLocalModels` without `resume` (it
+installs newer runtimes in full) and degrades the same way, so a stack an
+earlier release left stopped, which the new kit cannot bring back as saved,
+never locks the person out. On cold resume, a saved `local`
 source preserves local mode and prepares its runtime instead of letting an older
 `setup-choice.json` overwrite `model-source.json` back to `subscription`.
 Deployments, that check and the quit-time stop share one lock per home
@@ -312,7 +341,11 @@ parallel with the process listing; process-only inspections need no port lookup.
 On POSIX, a start that finds the recorded supervisor gone but processes
 still carrying its lease (the app was killed with it) ends them as a stop
 does and starts the service again. A live recorded PID or process group
-without the lease proves nothing and is refused, never signalled.
+without the lease proves nothing and is refused, never signalled; on Linux, a
+stale PID whose `kill(pid, 0)` returns `EPERM` and whose `/proc/<pid>` UID
+differs from the current user is treated as foreign and cleared without
+signalling it, and `EPERM` while signalling a leased process revalidates the
+lease before raising `NATIVE_PROCESS_SIGNAL_DENIED` with the service and PID.
 On macOS every identity check reads `ps` start times in the C locale.
 Linger 0.1.2 recorded them in the locale it ran in; such a record is
 converted once to the C-locale birth when `ps` in the installer's own
@@ -326,6 +359,24 @@ whose command line names a job file in this instance's process directory
 under a lease no record holds, once its environment proves that lease; an
 attempt that failed or was killed before keeping a record would otherwise
 leave PostgreSQL holding `postmaster.pid` against every retry.
+
+The supervisor writes one `[linger-supervisor] <name>` line to the service's
+log when it starts the service and for every exit (code, signal, uptime and
+whether it restarts). A start with `restartOnExit` (TeamHub, node-services and
+web, at `SERVICE_RESTART_POLICY`) makes the supervisor itself start the service
+again when it exits unasked, after 1, 2 and then 5 seconds, ending first what
+the exited service left under the lease. The supervisor owns the service and
+outlives the app, so this also covers a headless install and a closed window.
+An exit within the first 10 seconds of the first run is a startup failure the
+installer reports, never restarted; five exits within a minute end
+supervision with a `gave up restarting` line, the supervisor exits, and the
+next resume starts the service as one that is not running. Every intended
+stop (`stopNativeProcess`, a configuration restart, quit, uninstall,
+`reclaimNativeOrphans`) first writes `<name>.<lease>.stop` beside the record;
+the supervisor reads it before deciding and again right before restarting,
+and the POSIX stop also kills what holds the lease after the supervisor, so a
+restart racing the stop cannot outlive it. PostgreSQL and LiveKit are not
+restarted; their exits are logged with `reason=not_supervised`.
 
 Native runtime and localmodels kit verification (`native-runtime.ts` and
 `localmodels-tool.ts`) stop assigning files on the first mismatch and wait

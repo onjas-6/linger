@@ -269,4 +269,59 @@ describe("BundleStoreModule", () => {
       store.stageModuleArchive("web", "web-evil00000000", archivePath, sha),
     ).rejects.toThrow("Unsafe tar archive entry rejected");
   });
+
+  it("resolves the active V2 backend daemon binary when present and tracks release transitions", async () => {
+    const home = await makeTempDir("linger-daemon-home-");
+    const { store } = await startStore(home);
+
+    // No active V2 release yet -> fall back to Shell-bundled daemon.
+    expect(await store.currentDaemonExecutable("darwin")).toBeUndefined();
+
+    // Active release without a computer-daemon binary -> still falls back.
+    const v1 = makeDescriptor("0.2.14", "111111111111");
+    await store.writeReleaseDescriptor(v1);
+    await store.beginPending({
+      appVersion: v1.appVersion,
+      releaseFile: `releases/${v1.appVersion}/release.json`,
+      updatedAt: new Date().toISOString(),
+    });
+    await store.commitPending();
+    expect(await store.currentDaemonExecutable("darwin")).toBeUndefined();
+
+    // Once the backend bundle carries computer-daemon/linger-computer-daemon, it wins.
+    const v1Daemon = path.join(
+      home,
+      v1.modules.backend.path,
+      "computer-daemon",
+      "linger-computer-daemon",
+    );
+    await mkdir(path.dirname(v1Daemon), { recursive: true });
+    await writeFile(v1Daemon, "#!/bin/sh\n", "utf8");
+    expect(await store.currentDaemonExecutable("darwin")).toBe(v1Daemon);
+    expect(await store.currentDaemonExecutable("win32")).toBeUndefined();
+
+    // Upgrading to v2 immediately points probes to the v2 backend daemon.
+    const v2 = makeDescriptor("0.2.15", "222222222222");
+    const v2DaemonWin = path.join(
+      home,
+      v2.modules.backend.path,
+      "computer-daemon",
+      "linger-computer-daemon.exe",
+    );
+    await mkdir(path.dirname(v2DaemonWin), { recursive: true });
+    await writeFile(v2DaemonWin, "MZ", "utf8");
+    await store.writeReleaseDescriptor(v2);
+    await store.beginPending({
+      appVersion: v2.appVersion,
+      releaseFile: `releases/${v2.appVersion}/release.json`,
+      updatedAt: new Date().toISOString(),
+    });
+    await store.commitPending();
+    expect(await store.currentDaemonExecutable("win32")).toBe(v2DaemonWin);
+    expect(await store.currentDaemonExecutable("darwin")).toBeUndefined();
+
+    // Rolling back restores v1's daemon path.
+    await store.rollbackToPrevious("0.2.15", "healthcheck", "failed");
+    expect(await store.currentDaemonExecutable("darwin")).toBe(v1Daemon);
+  });
 });

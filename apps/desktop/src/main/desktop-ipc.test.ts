@@ -28,12 +28,14 @@ const PASSWORD = "a-private-password";
 
 const fixture = async (
   localServer: {
+    ownsWindow?: () => Promise<boolean>;
     servesWindow?: () => Promise<boolean>;
     signInWithAccount?: () => Promise<void>;
   } = {},
 ) => {
   const local = {
     ...stubModule("LocalServer"),
+    ownsWindow: vi.fn(localServer.ownsWindow ?? (async () => true)),
     servesWindow: vi.fn(localServer.servesWindow ?? (async () => true)),
     signInWithAccount: vi.fn(localServer.signInWithAccount ?? (async () => {})),
   };
@@ -48,6 +50,38 @@ const fixture = async (
     ...stubModule("Diagnostics"),
     save: vi.fn(async () => "/Users/me/Downloads/linger-diagnostics.zip"),
   };
+  let alwaysOn = false;
+  const power = {
+    ...stubModule("PowerGuard"),
+    alwaysOn: () => alwaysOn,
+    active: () => alwaysOn,
+    setAlwaysOn: vi.fn((on: boolean) => {
+      alwaysOn = on;
+      bus.emit("power.changed");
+    }),
+  };
+  const daemon = {
+    ...stubModule("ComputerDaemon"),
+    connection: () => "online",
+    state: () => "ready",
+    running: () => 0,
+  };
+  const driverUpdater = {
+    capabilities: vi.fn(() => ({
+      platform: "win32" as const,
+      nvidiaApp: "nvidia_app" as const,
+      directInstallSupported: false,
+    })),
+    openNvidiaApp: vi.fn(async () => ({ ok: true as const })),
+    openOfficialDownload: vi.fn(async () => ({ ok: true as const })),
+    openGuide: vi.fn(async () => ({ ok: true as const })),
+    installState: vi.fn(() => ({ phase: "idle" as const })),
+    startInstall: vi.fn(async () => ({
+      ok: false as const,
+      reason: "unsupported" as const,
+    })),
+    clearInstallState: vi.fn(),
+  };
   const send = vi.fn();
   const windows = {
     ...stubModule("WindowManager"),
@@ -61,14 +95,14 @@ const fixture = async (
       stubModule("Config"),
       language,
       stubModule("Enrollment"),
-      stubModule("PowerGuard"),
-      stubModule("ComputerDaemon"),
+      power as never,
+      daemon as never,
       diagnostics as never,
       windows as never,
       stubModule("WorkspaceGrants"),
       updater as never,
       local as never,
-      new DesktopIpcModule({ defaultDisplayName: "Desk" }),
+      new DesktopIpcModule({ defaultDisplayName: "Desk", driverUpdater }),
     ],
     { serverUrl: SERVER },
     bus,
@@ -84,8 +118,10 @@ const fixture = async (
     host,
     bus,
     diagnostics,
+    driverUpdater,
     language,
     local,
+    power,
     updater,
     send,
     setUpdate,
@@ -102,6 +138,17 @@ describe("DesktopIpcModule local account", () => {
     expect(await f.invoke(IPC.localAccountAvailable)).toBe(false);
     f.local.servesWindow.mockResolvedValue(true);
     expect(await f.invoke(IPC.localAccountAvailable)).toBe(true);
+    await f.host.stop("quit");
+  });
+
+  it("reports whether the window points at the installed local server", async () => {
+    const f = await fixture({ ownsWindow: async () => false });
+    expect(await f.invoke(IPC.localServerOwned)).toBe(false);
+    f.local.ownsWindow.mockResolvedValue(true);
+    expect(await f.invoke(IPC.localServerOwned)).toBe(true);
+    expect(() =>
+      f.invoke(IPC.localServerOwned, "https://evil.example.com"),
+    ).toThrow("Not allowed");
     await f.host.stop("quit");
   });
 
@@ -261,6 +308,124 @@ describe("DesktopIpcModule language", () => {
       f.invoke(IPC.languageSet, "https://evil.example.com", "zh-CN"),
     ).toThrow("Not allowed");
     expect(f.language.current()).toBe("en");
+    await f.host.stop("quit");
+  });
+});
+
+describe("DesktopIpcModule settings", () => {
+  it("reads, updates, and pushes preventSleep in sync with PowerGuard", async () => {
+    const f = await fixture();
+    expect(await f.invoke(IPC.settingsGet)).toEqual({
+      serverUrl: SERVER,
+      displayName: "Desk",
+      preventSleep: false,
+    });
+
+    expect(
+      await f.invoke(IPC.settingsSet, SERVER, { preventSleep: true }),
+    ).toEqual({
+      serverUrl: SERVER,
+      displayName: "Desk",
+      preventSleep: true,
+    });
+    expect(f.power.setAlwaysOn).toHaveBeenCalledWith(true);
+    expect(f.send).toHaveBeenCalledWith(IPC.settingsEvent, {
+      serverUrl: SERVER,
+      displayName: "Desk",
+      preventSleep: true,
+    });
+
+    // Changes triggered from the tray push updated settings back to the page.
+    f.power.setAlwaysOn(false);
+    expect(f.send).toHaveBeenLastCalledWith(IPC.settingsEvent, {
+      serverUrl: SERVER,
+      displayName: "Desk",
+      preventSleep: false,
+    });
+    await f.host.stop("quit");
+  });
+
+  it("rejects cross-origin or invalid settings updates", async () => {
+    const f = await fixture();
+    expect(() =>
+      f.invoke(IPC.settingsSet, "https://evil.example.com", {
+        preventSleep: true,
+      }),
+    ).toThrow("Not allowed");
+    expect(() =>
+      f.invoke(IPC.settingsSet, SERVER, { serverUrl: "https://evil.example" }),
+    ).toThrow();
+    expect(f.power.setAlwaysOn).not.toHaveBeenCalled();
+    await f.host.stop("quit");
+  });
+});
+
+describe("DesktopIpcModule driverUpdate", () => {
+  it("forwards driver update queries and actions from the server origin", async () => {
+    const f = await fixture();
+    expect(await f.invoke(IPC.driverUpdateCapabilities)).toEqual({
+      platform: "win32",
+      nvidiaApp: "nvidia_app",
+      directInstallSupported: false,
+    });
+    expect(await f.invoke(IPC.driverUpdateOpenNvidiaApp)).toEqual({ ok: true });
+    expect(await f.invoke(IPC.driverUpdateOpenDownload)).toEqual({ ok: true });
+    expect(await f.invoke(IPC.driverUpdateOpenGuide)).toEqual({ ok: true });
+    expect(await f.invoke(IPC.driverUpdateInstallState)).toEqual({
+      phase: "idle",
+    });
+    expect(
+      await f.invoke(IPC.driverUpdateStartInstall, SERVER, {
+        gpuName: "NVIDIA GeForce RTX 5060",
+        requiredCuda: "13.0",
+        resumeModelId: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+      }),
+    ).toEqual({ ok: false, reason: "unsupported" });
+    expect(f.driverUpdater.openNvidiaApp).toHaveBeenCalledOnce();
+    expect(f.driverUpdater.openOfficialDownload).toHaveBeenCalledOnce();
+    expect(f.driverUpdater.openGuide).toHaveBeenCalledOnce();
+    expect(f.driverUpdater.startInstall).toHaveBeenCalledWith({
+      gpuName: "NVIDIA GeForce RTX 5060",
+      requiredCuda: "13.0",
+      resumeModelId: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+    });
+
+    await f.invoke(IPC.driverUpdateClearState);
+    expect(f.driverUpdater.clearInstallState).toHaveBeenCalledOnce();
+
+    f.driverUpdater.installState.mockReturnValue({
+      phase: "verifying",
+      version: "621.24",
+    } as never);
+    f.bus.emit("driver-update.changed");
+    expect(f.send).toHaveBeenCalledWith(IPC.driverUpdateInstallStateEvent, {
+      phase: "verifying",
+      version: "621.24",
+    });
+    await f.host.stop("quit");
+  });
+
+  it("rejects untrusted origins and invalid startInstall payloads", async () => {
+    const f = await fixture();
+    for (const channel of [
+      IPC.driverUpdateCapabilities,
+      IPC.driverUpdateOpenNvidiaApp,
+      IPC.driverUpdateOpenDownload,
+      IPC.driverUpdateOpenGuide,
+      IPC.driverUpdateInstallState,
+      IPC.driverUpdateStartInstall,
+      IPC.driverUpdateClearState,
+    ]) {
+      expect(() => f.invoke(channel, "https://evil.example.com")).toThrow(
+        "Not allowed",
+      );
+    }
+    expect(() =>
+      f.invoke(IPC.driverUpdateStartInstall, SERVER, {
+        requiredCuda: "bad;rm -rf /",
+      }),
+    ).toThrow();
+    expect(f.driverUpdater.startInstall).not.toHaveBeenCalled();
     await f.host.stop("quit");
   });
 });

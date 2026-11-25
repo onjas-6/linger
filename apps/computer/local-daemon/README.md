@@ -54,12 +54,17 @@ distributions record both from the kit's release (`runtimeVersions`,
 `runtimeBaselines`), and a Go test fails when either is below a minimum. Raise a minimum only
 after a kit that installs a release at or above it ships in the desktop
 distribution pins (`apps/desktop/distribution/*.json`).
-The Codex canary workflow (`.github/workflows/codex-canary.yml`) runs the native
-Codex compatibility tests daily against npm's newest stable Codex, because a
-user's own newer Codex reaches the Daemon before any kit locks it. The
-localmodels kit opens a lock update merge request for each new stable Codex at
-least seven days old; it should merge only after the canary passes on that
-version.
+The canary workflows run the native compatibility tests daily, because a
+user's own newer CLI reaches the Daemon before any kit locks it:
+`.github/workflows/codex-canary.yml` against npm's newest stable Codex, and
+`.github/workflows/claude-canary.yml` against the newest Claude Code on
+Anthropic's stable channel. The required `check (computer-go)` runs the same tests
+against the Codex and Claude Code the pinned kit installs (`runtimeVersions`
+in `apps/desktop/distribution/linux-x64.json`), so a Daemon change or a kit
+pin that breaks the managed Runtimes cannot land. The
+localmodels kit opens a lock update merge request for each new stable Codex
+or Claude Code at least seven days old; it should merge only after that
+Runtime's canary passes on that version.
 It performs bounded protocol and authentication probes.
 A protocol probe passes once the Runtime answers the handshake, however the
 process exits after its input closes. When the handshake fails, the daemon log
@@ -101,10 +106,14 @@ the recorded process group disappears.
 The Daemon accepts `execute` (kind `model_invoke`). `internal/daemon/model_invoke.go`
 handles admission and a concurrency limit of 3 (beyond it the reply is `busy`;
 `priority` only orders the Agent side's queue, and the Daemon accepts it without
-distinguishing), cancels on disconnect and drain, and checks before sending that
+distinguishing), cancels on disconnect and drain, loads a named Pi library model
+on demand through `ensureLocalModel` (matching `run.start`), clamps reasoning
+effort against the requested model, and checks before sending that
 the encoded `executed` (kind `model_invoke`) fits the 4 MiB frame limit (otherwise
-it reports `failed`). `internal/provider/model_invoke.go` runs one `codex exec` or
-`claude -p` in a temporary directory: the prompt goes through stdin, tools and
+it reports `failed`). `internal/provider/model_invoke.go` and
+`internal/provider/pi_model_invoke.go` run one `codex exec`, `claude -p`, or
+ephemeral `pi` RPC turn in a temporary directory, passing the requested `model`
+explicitly when supplied: the prompt goes through stdin, tools and
 user customization are off, and it refuses workspace files at the root named
 `AGENTS.md`, `AGENTS.override.md` or `CLAUDE.md` and anything under `.codex` or
 `.claude` at any depth. `internal/workspace/codex_invoke_home.go` prepares a
@@ -207,8 +216,11 @@ downloaded model that Run's Agent names.
   (Pi catalog below), and waits until that model is loaded. A model no row of the last readable snapshot
   names (a BYOK or setup-stack model) costs no tool call and no wait; once
   the installer lock wait below has ended, neither does a model that
-  snapshot shows loaded. Otherwise the Daemon reads the status once. A downloaded model that is `idle` or `failed` is loaded with
-  `library load <model>` and never `--unload`, so the Daemon does not evict
+  snapshot shows loaded while its loopback engine `/health` (and saved local
+  loopback gateway `/health`, when configured) still answers. Otherwise the Daemon reads the status once; a refreshed `loaded` row is trusted unless the saved local gateway does not answer. A downloaded model that is `idle` or `failed` is loaded with
+  `library load <model>` (resetting a `HEALTH_CHECK_FAILED` row or a dead-gateway
+  `loaded` row with `library unload <model>` first, as `Act` also does for
+  owner-initiated loads) and never `--unload`, so the Daemon does not evict
   a model to make room: a load that does not fit is refused, and the Run
   fails with `local_model_unavailable` when the Agent Service's welcome names
   that service feature, else with `model_unavailable` for an older service;
@@ -305,6 +317,21 @@ downloaded model that Run's Agent names.
   compatibly (unknown `engine` or out-of-range `concurrency` is omitted,
   `engine_label` is clipped) and sent only when `runner.welcome`'s
   `service_features` names `local_models_engine` (Computer 0.61.0 or later).
+  When `localmodels` reports a `loaded` model with configured
+  `concurrency > 1`, the Daemon runs a one-time loopback concurrency probe
+  (persisting only measured results atomically in `concurrency-probes.json`
+  under the local models cache directory, keyed by model ID, engine, engine
+  label, pool, context tokens, configured concurrency, and tool version;
+  looking up deploy auth bearer tokens and endpoint model names in
+  `<LOCALMODELS_STATE>/library/models/*.json` + `<deploy_dir>/api-key`). While
+  probing runs, the row is overlaid as `state: "loading"` with
+  `concurrency_probing: true` (sent only when `runner.welcome`'s
+  `service_features` names `local_models_concurrency_probe`, Computer 0.64.0
+  or later) and `EnsureLoaded` waits for probing to finish. A measured result
+  sets `concurrency` (`1` or `2`); transient probe errors or timeouts are not
+  cached, omit `concurrency` for that load so scheduling falls back to
+  adaptive limits, and retry on the next load. Models with omitted or `<= 1`
+  configured concurrency skip probing.
   The snapshot is sent after
   every welcome, after every action or job end, and at most every 2 seconds
   for progress. When a job enters the `download` phase, the Daemon publishes
@@ -365,13 +392,19 @@ base URL, path and endpoint and the protocol the owner's client chose; `check`
 sends one request there and `models` lists base URL + path + `/models`. The BYOK
 summary carries `path` and `endpoint` only after a `runner.welcome` that names
 the `byok_endpoint` service feature. `localmodels` writes
-`<state>/model-source.json`; the Daemon only adds the `runtime_paths` that the
-same `apply` reported. It re-reads the file on every discovery tick to overlay
-the Runtimes' environment (`OverlayEnvironment`) and executable paths
-(`OverlayRuntimePaths`), dropping any stale `byok-home` entry in `local` mode
-in favor of the managed `gateway-home` Pi profile, never falling back to cloud
-models in `local` mode (`agentRuntimeModel`), and under BYOK listing only the
-BYOK model in each Runtime's catalog.
+`<state>/model-source.json` without `runtime_paths`; on `source apply`, BYOK
+`remount`, and installer `applySource`, the caller merges valid executable
+non-harness paths from before the rewrite alongside any `runtime_paths` that
+`apply` reported, without pinning paths inside `<home>/runtime/harness`. The
+Daemon re-reads the file on every discovery tick to overlay the Runtimes'
+environment (`OverlayEnvironment`) and executable paths (`OverlayRuntimePaths`),
+scanning `<home>/runtime/harness/bin/<runtime>` and the highest-version
+`<home>/runtime/harness/tools/<runtime>/<version>/<runtime>` on each read so
+managed Runtime updates take effect without rewriting `model-source.json`. It
+also drops any stale `byok-home` entry in `local` mode in favor of the managed
+`gateway-home` Pi profile, never falls back to cloud models in `local` mode
+(`agentRuntimeModel`), and under BYOK lists only the BYOK model in each
+Runtime's catalog.
 
 Before a Run or model call on a Runtime whose profile is the BYOK source's,
 the Daemon checks the saved loopback gateway's `/health` (`EnsureGateway` in
@@ -472,6 +505,23 @@ heredoc (`internal/permission/shell_text.go`). Named variables such as `"$id"`,
 
 A hook that cannot run lets the command through.
 
+## Runtime discovery
+
+- Discovery searches the `PATH` the user's terminal has: `$SHELL -lic`
+  prints it within two seconds. When that read fails or times out, the
+  last `PATH` the same shell printed is used. With none, the user's own
+  install folders come first. The common install folders are always
+  searched too: Homebrew, `~/.local/bin`, `~/.npm-global/bin`, Volta, Bun,
+  every nvm Node's `bin` (newest first), fnm's default Node and pnpm's
+  global bin.
+- Every 15 seconds the monitor rechecks sign-in. Every fourth tick it runs a
+  full discovery, but not while an Operation runs.
+- On every tick it also searches again for each Runtime that was not
+  installed or too old. When an executable appears, or a new file replaces
+  the old one, it runs discovery for those Runtimes alone at once, even
+  while Operations run, because none can run on them. An install or upgrade
+  therefore shows within one tick.
+
 ## Antigravity
 
 The Antigravity CLI (`agy`) runs through its Agent Client Protocol (ACP)
@@ -498,19 +548,18 @@ for a browser sign-in when signed out.
   stored is not a usable session: `session/load` accepts it, but the prompt
   then fails, so Linger never assigns one. A stored session replays at least
   the prompt that made it, so a load that replays no prompt, or that
-  Antigravity refuses, finds no session. A resumed Run reports its
+  Antigravity refuses, finds no session and returns `session_not_found` so Agent
+  Service can clear the persisted session and restart the Run cleanly in a fresh
+  native session with recent messages. A resumed Run still reports its
   turn-started event before `session/load`, because loading takes seconds
-  and the Room shows the Agent working from that event. The executor can then
-  no longer start a fresh session, so the adapter opens `session/new` in the
-  same process and the terminal result carries the new session. Such a Run
-  announced the old session, so the Daemon declines every scheduler yield for
-  it, including the one Agent Service resends after a reconnect, and lets it
-  finish. Agent Service sends a later Stop as its own cancel with its own
-  reason. An Agent Service released before this sends no such cancel, so its
-  Stop cannot end such a Run. A Run that resumes after a yield ends as
-  `session_not_found` instead. A Run yields to
+  and the Room shows the Agent working from that event. A Run yields to
   the scheduler only after native work, because its session holds no prompt
   before that.
+- On a fresh `run.start` that names `previous_session` (Computer 0.63.0 or
+  later), the provider executor reads the superseded native session through
+  `runtimehistory`, writes a bounded, redacted Markdown tail to
+  `./playground/.previous-context.md`, and appends that path to the turn's
+  `<system-reminder>` only when the file was written.
 - A tool call is named by Antigravity's own tool name, such as
   `run_command`; its title is the whole command line, which the call's
   redacted input already shows.
@@ -561,15 +610,20 @@ the current SID and ACL, not POSIX permission bits. Writing a separate credentia
 does not change the permissions of an existing parent directory.
 
 The installer and the Daemon refuse a private path when another account can
-replace one of its parent directories. One exception applies: the Codex Windows
-sandbox may hold that right on a parent, such as AppData. The sandbox acts
+replace one of its parent directories, naming the offending ancestor path and
+SID. Ancestors trust the current user, `SYSTEM`, `BUILTIN\Administrators`,
+`TrustedInstaller`, built-in Administrator/Domain/Enterprise Admin SIDs
+(`S-1-5-21-*-*-*-500|512|519`), and direct individual/domain/Entra members of
+local `BUILTIN\Administrators` (excluding broad well-known groups). One
+additional exception applies on ancestor access rules: the Codex Windows
+sandbox may hold replace rights on a parent, such as AppData. The sandbox acts
 through the `CodexSandboxUsers` group and the capability SIDs in
-`%USERPROFILE%\.codex\cap_sid`. A sandboxed Codex command can therefore replace
-such a parent; Linger accepts this so it installs beside Codex. Private paths
-themselves still grant access only to the current user and SYSTEM. Their
-owner is the current user or, when that user is an administrator,
-Administrators, which owns what an elevated process (Run as administrator,
-the built-in Administrator) creates.
+`%USERPROFILE%\.codex\cap_sid` (or `%CODEX_HOME%\cap_sid`). A sandboxed Codex
+command can therefore replace such a parent; Linger accepts this so it installs
+beside Codex. Private paths themselves still grant access only to the current
+user and SYSTEM. Their owner is the current user or, when that user is an
+administrator, Administrators, which owns what an elevated process (Run as
+administrator, the built-in Administrator) creates.
 
 Process recovery uses the creation time and a held process handle, so a reused
 process ID is never mistaken for the original. Ordinary tasks are held by a Job
@@ -1073,14 +1127,22 @@ with its dependencies resolves its own jiti first. Node reads `NODE_PATH` at
 startup, so the extension then restores the value Pi inherited, and the
 commands Pi starts never resolve a package from the bundle.
 
-The same extension carries Pi's permission review, so the Daemon loads it for a
-Run with permission review even without MCP servers. Its `tool_call` hook opens
-an RPC `input` dialog titled `linger.permission_review` for each `bash` and
-`mcp__*` call, with the call as JSON. The Daemon answers it with a JSON verdict
-from the Run's permission review, with `bash` reviewed as a shell command. A
-Run without review gets an allow verdict, because a resident Pi process may
-serve both kinds of Run. A missing or unreadable verdict blocks the call. The
-Daemon cancels any other extension dialog.
+The same extension carries Pi's permission review and dynamic MCP attachment, so
+resident Pi processes and provider pre-starts load it with an empty managed MCP
+config file and `mcp__*` in `--tools`. On Room-presence `provider.prepare`, Pi
+starts with a 40-second timeout, verifies `get_state` and applies any clamped
+thinking level, then parks without submitting a prompt. When a Run adopts a
+parked Pi process whose MCP server set changed, the Daemon writes the new
+front-rewritten `linger-mcp.json`, verifies `get_commands` exposes
+`linger-sync-mcp`, runs `/linger-sync-mcp` and reads the structured verdict from
+its `linger.mcp_sync` RPC dialog before submitting the prompt; an attachment
+failure recycles the process and falls back to a cold spawn. Its `tool_call`
+hook opens an RPC `input` dialog titled `linger.permission_review` for each
+`bash` and `mcp__*` call, with the call as JSON. The Daemon answers it with a
+JSON verdict from the Run's permission review, with `bash` reviewed as a shell
+command. A Run without review gets an allow verdict, because a resident Pi
+process may serve both kinds of Run. A missing or unreadable verdict blocks the
+call. The Daemon cancels any other extension dialog.
 
 The compatibility probe of the pinned Playwright catalog is
 `TestPinnedPlaywrightCatalog`; it needs `LINGER_PLAYWRIGHT_COMPAT_ENTRY` and

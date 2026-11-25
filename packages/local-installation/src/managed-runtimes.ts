@@ -8,12 +8,19 @@ import type { runProcess } from "./process.js";
 import { localmodelsFailure } from "./localmodels-failure.js";
 import type { InstallOutcome, InstallerEvent } from "./events.js";
 import type { PreparationOptions } from "./dependencies.js";
+import {
+  probeRuntimesWithDaemon,
+  type DaemonRuntimeObservation,
+  type DaemonRuntimeStatus,
+} from "./daemon-runtime-probe.js";
 
 export type NativeRuntime = "codex" | "claude" | "pi";
 export type RuntimePreparationOptions = Omit<PreparationOptions, "dependency">;
 export interface RuntimeDependencies {
   run?: typeof runProcess;
   localmodels?: typeof runLocalmodels;
+  probeRuntimes?: typeof probeRuntimesWithDaemon;
+  daemonExecutable?: string;
 }
 export interface RuntimeDescriptor {
   configFingerprint?: string | null;
@@ -26,6 +33,9 @@ export interface RuntimeDescriptor {
   installed: boolean;
   authenticated: boolean;
   authMode: string | null;
+  status?: DaemonRuntimeStatus;
+  version?: string | null;
+  requiredVersion?: string | null;
   loginCommand: {
     executable: string;
     args: string[];
@@ -185,18 +195,214 @@ function inspectionFromDescriptor(
     descriptor: row,
   };
 }
+function defaultLoginCommands(
+  runtime: NativeRuntime,
+  executable: string,
+): Pick<RuntimeDescriptor, "loginCommand" | "deviceLoginCommand"> {
+  if (runtime === "codex") {
+    return {
+      loginCommand: { executable, args: ["login"], env: {} },
+      deviceLoginCommand: {
+        executable,
+        args: ["login", "--device-auth"],
+        env: {},
+      },
+    };
+  }
+  if (runtime === "claude") {
+    return {
+      loginCommand: { executable, args: ["auth", "login"], env: {} },
+    };
+  }
+  return { loginCommand: null };
+}
+
+function isManagedExecutable(home: string, executable: string | null): boolean {
+  if (!executable) return false;
+  const harnessRoot = root(home);
+  const relative = path.relative(harnessRoot, executable);
+  return (
+    !!relative && !relative.startsWith("..") && !path.isAbsolute(relative)
+  );
+}
+
+function descriptorFromDaemonObservation(
+  runtime: NativeRuntime,
+  obs: DaemonRuntimeObservation,
+  existing?: RuntimeDescriptor,
+): RuntimeDescriptor {
+  const base: RuntimeDescriptor = existing ?? {
+    runtime,
+    executable: null,
+    argvPrefix: [],
+    installed: false,
+    authenticated: false,
+    authMode: null,
+    loginCommand: null,
+  };
+  const executable = obs.executable ?? base.executable;
+  if (obs.status === "ready") {
+    return {
+      ...base,
+      executable,
+      installed: true,
+      authenticated: true,
+      authMode: base.authMode ?? "authenticated",
+      status: "ready",
+      version: obs.version ?? null,
+      requiredVersion: obs.requiredVersion ?? null,
+      ...(executable && !base.loginCommand
+        ? defaultLoginCommands(runtime, executable)
+        : {}),
+    };
+  }
+  if (obs.status === "authentication_required") {
+    return {
+      ...base,
+      executable,
+      installed: true,
+      authenticated: false,
+      authMode: null,
+      status: "authentication_required",
+      version: obs.version ?? null,
+      requiredVersion: obs.requiredVersion ?? null,
+      ...(executable && !base.loginCommand
+        ? defaultLoginCommands(runtime, executable)
+        : {}),
+    };
+  }
+  if (obs.status === "incompatible") {
+    return {
+      ...base,
+      executable,
+      installed: false,
+      authenticated: false,
+      authMode: null,
+      status: "incompatible",
+      version: obs.version ?? null,
+      requiredVersion: obs.requiredVersion ?? null,
+    };
+  }
+  if (obs.status === "not_installed") {
+    return {
+      ...base,
+      executable: null,
+      installed: false,
+      authenticated: false,
+      authMode: null,
+      status: "not_installed",
+      version: null,
+      requiredVersion: obs.requiredVersion ?? null,
+    };
+  }
+  return {
+    ...base,
+    executable,
+    installed: base.installed || obs.installed,
+    authenticated: false,
+    authMode: null,
+    status: "error",
+    version: obs.version ?? null,
+    requiredVersion: obs.requiredVersion ?? null,
+  };
+}
+
+const REAL_LOCALMODELS_RUNNER = Symbol.for("linger.localmodels.realRunner");
+
+function isMockedLocalmodels(
+  tool: typeof runLocalmodels,
+  dependencies: RuntimeDependencies,
+): boolean {
+  return (
+    Boolean(dependencies.localmodels) ||
+    !(tool as unknown as Record<symbol, unknown>)[REAL_LOCALMODELS_RUNNER]
+  );
+}
+
+/**
+ * Reconciles runtime discovery, version checks and authentication status with
+ * `linger-computer-daemon probe-runtimes --json` (single source of truth).
+ * Managed binaries installed under `<home>/runtime/harness` are passed via
+ * `--<runtime>-path` so the daemon verifies those exact executables; host
+ * binaries are discovered directly by the daemon itself.
+ */
+async function reconcileDescriptorsWithDaemon(
+  home: string,
+  rows: RuntimeDescriptor[],
+  options: {
+    signal?: AbortSignal;
+    env?: NodeJS.ProcessEnv;
+    platform?: NodeJS.Platform;
+  },
+  dependencies: RuntimeDependencies,
+): Promise<RuntimeDescriptor[]> {
+  const tool = dependencies.localmodels ?? runLocalmodels;
+  const shouldProbe =
+    Boolean(dependencies.probeRuntimes) || !isMockedLocalmodels(tool, dependencies);
+  if (!shouldProbe || rows.length === 0) return rows;
+
+  const probe = dependencies.probeRuntimes ?? probeRuntimesWithDaemon;
+  const hasCustomProfileEnv = rows.some(
+    (row) => row.environment && Object.keys(row.environment).length > 0,
+  );
+  if (!hasCustomProfileEnv) {
+    const configuredPaths: Partial<Record<NativeRuntime, string>> = {};
+    for (const row of rows) {
+      if (row.installed && isManagedExecutable(home, row.executable)) {
+        configuredPaths[row.runtime] = row.executable!;
+      }
+    }
+    const observations = await probe({
+      runtimes: rows.map((row) => row.runtime),
+      configuredPaths,
+      env: options.env ?? process.env,
+      daemonExecutable: dependencies.daemonExecutable,
+      platform: options.platform,
+      signal: options.signal,
+    });
+    if (!observations) return rows;
+    const byType = new Map(observations.map((obs) => [obs.type, obs]));
+    return rows.map((row) => {
+      const obs = byType.get(row.runtime);
+      return obs ? descriptorFromDaemonObservation(row.runtime, obs, row) : row;
+    });
+  }
+
+  return Promise.all(
+    rows.map(async (row) => {
+      const configuredPaths =
+        row.installed && isManagedExecutable(home, row.executable)
+          ? { [row.runtime]: row.executable! }
+          : undefined;
+      const observations = await probe({
+        runtimes: [row.runtime],
+        configuredPaths,
+        env: { ...(options.env ?? process.env), ...row.environment },
+        daemonExecutable: dependencies.daemonExecutable,
+        platform: options.platform,
+        signal: options.signal,
+      });
+      const obs = observations?.find((item) => item.type === row.runtime);
+      return obs ? descriptorFromDaemonObservation(row.runtime, obs, row) : row;
+    }),
+  );
+}
+
 export async function inspectRuntimeDescriptors(
   home: string,
   options: {
     signal?: AbortSignal;
     env?: NodeJS.ProcessEnv;
     runtime?: NativeRuntime;
+    platform?: NodeJS.Platform;
   } = {},
   dependencies: RuntimeDependencies = {},
 ): Promise<RuntimeDescriptor[]> {
   options.signal?.throwIfAborted();
+  const tool = dependencies.localmodels ?? runLocalmodels;
+  const mocked = isMockedLocalmodels(tool, dependencies);
   try {
-    const result = await (dependencies.localmodels ?? runLocalmodels)(
+    const result = await tool(
       home,
       [
         "harness",
@@ -213,13 +419,51 @@ export async function inspectRuntimeDescriptors(
       throw unavailable({ args: ["harness", "status"], result });
     const runtimes = parseRuntimeDescriptors(result.stdout);
     if (!runtimes) throw unavailable();
-    return runtimes;
+    return await reconcileDescriptorsWithDaemon(
+      home,
+      runtimes,
+      options,
+      dependencies,
+    );
   } catch (error) {
     options.signal?.throwIfAborted();
     if ((error as { code?: string })?.code === "COMMAND_TIMEOUT") throw error;
     const failure = runtimeVersionFailure(error);
     if (failure)
       throw Object.assign(new Error(failure.message), { code: failure.code });
+    // When localmodels no longer provides harness status (or is unavailable),
+    // local-daemon still supplies authoritative host runtime discovery and auth.
+    if (Boolean(dependencies.probeRuntimes) || !mocked) {
+      const requested: NativeRuntime[] = options.runtime
+        ? [options.runtime]
+        : ["codex", "claude", "pi"];
+      const probe = dependencies.probeRuntimes ?? probeRuntimesWithDaemon;
+      const observations = await probe({
+        runtimes: requested,
+        env: options.env ?? process.env,
+        daemonExecutable: dependencies.daemonExecutable,
+        platform: options.platform,
+        signal: options.signal,
+      });
+      if (observations) {
+        const byType = new Map(observations.map((obs) => [obs.type, obs]));
+        return requested.map((kind) => {
+          const obs = byType.get(kind);
+          return obs
+            ? descriptorFromDaemonObservation(kind, obs)
+            : {
+                runtime: kind,
+                executable: null,
+                argvPrefix: [],
+                installed: false,
+                authenticated: false,
+                authMode: null,
+                status: "not_installed",
+                loginCommand: null,
+              };
+        });
+      }
+    }
     if (error instanceof Error && runtimeFailureCode(error)) throw error;
     throw unavailable();
   }
@@ -365,8 +609,18 @@ export async function installNativeRuntime(
     const appliedRow = parseRuntimeDescriptors(applied.stdout)?.find(
       (item) => item.runtime === runtime,
     );
-    const state = appliedRow
-      ? inspectionFromDescriptor(runtime, appliedRow, options.platform)
+    const reconciledAppliedRow = appliedRow
+      ? (
+          await reconcileDescriptorsWithDaemon(
+            options.home,
+            [appliedRow],
+            options,
+            dependencies,
+          )
+        )[0]
+      : undefined;
+    const state = reconciledAppliedRow
+      ? inspectionFromDescriptor(runtime, reconciledAppliedRow, options.platform)
       : await inspectRuntime(runtime, options, dependencies);
     if (!state.installed) throw unavailable();
     return {
@@ -403,7 +657,12 @@ export async function inspectRuntime(
 ): Promise<RuntimeInspection> {
   const rows = await inspectRuntimeDescriptors(
     options.home,
-    { signal: options.signal, env: options.env, runtime },
+    {
+      signal: options.signal,
+      env: options.env,
+      runtime,
+      platform: options.platform,
+    },
     dependencies,
   );
   const row = rows.find((item) => item.runtime === runtime);
@@ -454,7 +713,14 @@ export async function prepareRuntime(
       details.descriptor.runtime === runtime
         ? inspectionFromDescriptor(
             runtime,
-            details.descriptor,
+            (
+              await reconcileDescriptorsWithDaemon(
+                options.home,
+                [details.descriptor],
+                options,
+                dependencies,
+              )
+            )[0] ?? details.descriptor,
             options.platform,
           )
         : await inspectRuntime(runtime, options, dependencies);

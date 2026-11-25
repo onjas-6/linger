@@ -41,6 +41,10 @@ scripts/ci/desktop-release.sh publish desktop-v0.16.36 --notes-file notes.md
   `scripts/ci/desktop-release.sh publish` validates the uploaded assets,
   attaches the release notes, marks it as the latest release, and cleans up
   matching `desktop-v<version>-rc.*` prereleases and tags.
+- Before publishing a stable release, upgrade the previous stable release to
+  the candidate on each platform following the
+  [upgrade recipe](../.agents/skills/verify-linger/features/desktop-and-installer.md#upgrade-from-the-previous-release);
+  a fresh install does not catch state an earlier release left behind.
 - The version comes from the tag. The build writes it into
   `apps/desktop/package.json` for packaging and restores the file afterwards, so
   no version commit is needed.

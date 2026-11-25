@@ -983,6 +983,42 @@ describe("quick Local Agent creation", () => {
       ).toBeVisible();
       expect(screen.getByRole("button", { name: "Create" })).toBeEnabled();
     });
+
+    it("hides the CLI connect-another-computer button for the desktop local server", async () => {
+      const runtime = await testRuntime();
+      const inventory =
+        await runtime.client.listTenantLocalComputers("tenant-northstar");
+      const enroll = stubDesktop(inventory.items[0]!.computer_id);
+      Object.assign(
+        (window as { lingerDesktop?: Record<string, unknown> }).lingerDesktop!,
+        { localAccount: { available: vi.fn(async () => true) } },
+      );
+      expect(enroll).not.toHaveBeenCalled();
+      renderCreation(runtime, "local");
+
+      expect(
+        await screen.findByRole("combobox", { name: "Model" }),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole("button", { name: "Connect new computer" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps the CLI connect-another-computer button when the desktop app connects to a remote server", async () => {
+      const runtime = await testRuntime();
+      const inventory =
+        await runtime.client.listTenantLocalComputers("tenant-northstar");
+      stubDesktop(inventory.items[0]!.computer_id);
+      Object.assign(
+        (window as { lingerDesktop?: Record<string, unknown> }).lingerDesktop!,
+        { localAccount: { available: vi.fn(async () => false) } },
+      );
+      renderCreation(runtime, "local");
+
+      expect(
+        await screen.findByRole("button", { name: "Connect new computer" }),
+      ).toBeVisible();
+    });
   });
 
   it("retries a failed room request without registering a second Local Agent", async () => {
@@ -997,6 +1033,36 @@ describe("quick Local Agent creation", () => {
     expect(create.count()).toBe(1);
     const [first, retry] = await directRoomOpenings(runtime);
     expect(retry).toEqual(first);
+  });
+
+  it("shows update guidance when creating a Local Agent on an incompatible Antigravity runtime", async () => {
+    const runtime = await testRuntime();
+    runtime.seed.localComputers = [
+      {
+        ...runtime.seed.localComputers[0]!,
+        platform: "darwin",
+        runtimes: [
+          {
+            error_code: "RUNTIME_INCOMPATIBLE",
+            message: "antigravity version 1.5.9 is below minimum 1.5.12",
+            models: [],
+            status: "incompatible",
+            type: "antigravity",
+            version: "1.5.9",
+          },
+        ],
+      },
+    ];
+    renderCreation(runtime, "local");
+    fireEvent.click(
+      await screen.findByRole("combobox", { name: "Local Computer" }),
+    );
+    fireEvent.click(await screen.findByRole("option", { name: "Jenny's Mac" }));
+    expect(await screen.findByText("agy update")).toBeVisible();
+    expect(
+      screen.queryByText("The npm commands need Node.js."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
   });
 });
 

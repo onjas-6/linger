@@ -435,3 +435,45 @@ it(
       .toBe(false);
   },
 );
+
+it("returns ready immediately when daemon reports CC Switch Codex ready without spawning codex login", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "runtime-ccswitch-ready-"));
+  clean.push(() => rm(home, { recursive: true, force: true }));
+  const marker = path.join(home, "login-spawned");
+  const exe = path.join(home, "codex");
+  await writeFile(
+    exe,
+    `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'spawned');process.exit(1);`,
+    { mode: 0o700 },
+  );
+  const manager = new RuntimeLoginManager(
+    async () => ({
+      runtime: "codex",
+      executable: exe,
+      installed: true,
+      ready: true,
+      loginCommand: `'${exe}' 'login'`,
+      descriptor: {
+        runtime: "codex",
+        executable: exe,
+        argvPrefix: [],
+        installed: true,
+        authenticated: true,
+        authMode: "authenticated",
+        status: "ready",
+        loginCommand: { executable: exe, args: ["login"], env: {} },
+      },
+    }),
+    "darwin",
+  );
+  clean.push(async () => manager.close());
+  const input = {
+    instance: "default",
+    home,
+    root: home,
+    runtime: "codex" as const,
+  };
+  expect(await manager.status(input)).toEqual({ state: "ready" });
+  expect(await manager.start(input)).toEqual({ state: "ready" });
+  await expect(access(marker)).rejects.toThrow();
+});

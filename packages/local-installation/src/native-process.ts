@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,12 +47,45 @@ export interface NativeProcessState {
   pid?: number;
 }
 const leaseKey = "LINGER_NATIVE_PROCESS_LEASE";
+/**
+ * How the supervisor restarts a service that exits without being asked to:
+ * after `delaysMs[n - 1]` for the n-th exit within `windowMs` (the last
+ * delay repeats), giving up at the `limit`-th. A service that exits before
+ * it has run for `armAfterMs` is not restarted: that is a startup failure,
+ * which the installer reports.
+ */
+export interface NativeRestartPolicy {
+  delaysMs: number[];
+  windowMs: number;
+  limit: number;
+  armAfterMs: number;
+}
+export const SERVICE_RESTART_POLICY: NativeRestartPolicy = {
+  delaysMs: [1_000, 2_000, 5_000],
+  windowMs: 60_000,
+  limit: 5,
+  armAfterMs: 10_000,
+};
 function paths(root: string, name: NativeService) {
   if (!services.has(name)) throw new Error("Invalid native service");
   return {
     record: path.join(root, "native", "processes", `${name}.json`),
     log: path.join(root, "native", "logs", `${name}.log`),
   };
+}
+/**
+ * Written before every intended stop signals a supervisor, which reads it
+ * before each restart; the name derives from its job file
+ * (`<name>.<lease>.job`), which the supervisor knows.
+ */
+function stopRequest(root: string, name: NativeService, lease: string) {
+  return path.join(root, "native", "processes", `${name}.${lease}.stop`);
+}
+// Only its presence counts, so appending nothing inside the private processes
+// directory is enough: it changes no file a link could point at, and skips
+// the ACL check a private write costs on Windows.
+async function requestStop(file: string) {
+  await writeFile(file, "", { flag: "a", mode: 0o600 });
 }
 async function stored(
   root: string,
@@ -104,8 +137,8 @@ async function stillLive(pid: number): Promise<boolean> {
     if (process.platform === "win32") {
       // Windows has no zombies; an exited PID is gone.
     } else if (process.platform === "linux") {
-      const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
-      if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z")) return false;
+      const info = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+      if (info.slice(info.lastIndexOf(")") + 2).startsWith("Z")) return false;
     } else {
       const state = await runProcess(
         "/bin/ps",
@@ -117,7 +150,21 @@ async function stillLive(pid: number): Promise<boolean> {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") {
+      // A PID owned by another user cannot be a native service this user
+      // started; ignoring a foreign-UID reused PID avoids locking out resume
+      // or stop while never signalling it.
+      if (process.platform === "linux") {
+        const owner = await stat(`/proc/${pid}`).then(
+          (entry) => entry.uid,
+          () => undefined,
+        );
+        if (owner === undefined || owner !== process.getuid?.()) return false;
+      }
+      return true;
+    }
     throw error;
   }
 }
@@ -125,7 +172,7 @@ async function groupLive(group: number): Promise<boolean> {
   // Windows has no process groups; the leader is the whole group.
   if (process.platform === "win32") return stillLive(group);
   if (process.platform === "linux")
-    return (await linuxProcessStates()).some(
+    return (await linuxProcessStates(true)).some(
       (process) => process.group === group && process.state !== "Z",
     );
   const result = await runProcess("/bin/ps", ["-axo", "pid=,pgid=,stat="], {
@@ -259,6 +306,11 @@ export async function startNativeProcess(
      * part of the configuration.
      */
     withoutAdministrators?: boolean;
+    /**
+     * Restart the service when it exits unasked. How it is supervised is not
+     * part of the configuration, so a running service keeps its supervisor.
+     */
+    restartOnExit?: NativeRestartPolicy;
   },
 ): Promise<NativeProcessState> {
   options.signal?.throwIfAborted();
@@ -298,6 +350,9 @@ export async function startNativeProcess(
         `Native ${options.name} process identity cannot be verified; refusing to replace it.`,
       );
     await rm(location.record, { force: true });
+    await rm(stopRequest(options.root, options.name, existing.lease), {
+      force: true,
+    });
   }
   await privateDirectory(path.dirname(location.record));
   await privateDirectory(path.dirname(location.log));
@@ -310,11 +365,13 @@ export async function startNativeProcess(
   await atomicPrivate(
     job,
     JSON.stringify({
+      name: options.name,
       executable: options.executable,
       args: options.args,
       cwd: options.cwd,
       env: { ...options.env, [leaseKey]: lease },
       ...(options.withoutAdministrators ? { withoutAdministrators: true } : {}),
+      ...(options.restartOnExit ? { restart: options.restartOnExit } : {}),
       log: location.log,
       redactions: [
         ...new Set(
@@ -422,14 +479,7 @@ export async function startNativeProcess(
         (candidate) => candidate.pid !== child.pid,
       );
       for (const candidate of descendants.length ? descendants : owned) {
-        if ((await observed(candidate.pid, lease, false)) !== candidate.birth)
-          continue;
-        try {
-          process.kill(candidate.pid, "SIGKILL");
-        } catch (failure) {
-          if ((failure as NodeJS.ErrnoException).code !== "ESRCH")
-            throw failure;
-        }
+        await signalLeasedProcess(options.name, candidate, lease, "SIGKILL");
       }
       await delay(20);
       if (Date.now() >= deadline)
@@ -463,7 +513,8 @@ async function endUnreapedGroup(child: ChildProcess): Promise<void> {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH" && code !== "EPERM") throw error;
     }
     await Promise.race([exited, delay(5_000)]);
   }
@@ -472,7 +523,9 @@ async function endUnreapedGroup(child: ChildProcess): Promise<void> {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM") return;
+      if (code !== "ESRCH") throw error;
     }
     await delay(100);
   }
@@ -485,6 +538,47 @@ async function endUnreapedGroup(child: ChildProcess): Promise<void> {
 export const NATIVE_PROCESS_REPLACED = "NATIVE_PROCESS_REPLACED";
 export const NATIVE_PROCESS_IDENTITY_UNVERIFIED =
   "NATIVE_PROCESS_IDENTITY_UNVERIFIED";
+export const NATIVE_PROCESS_SIGNAL_DENIED = "NATIVE_PROCESS_SIGNAL_DENIED";
+
+async function signalLeasedProcess(
+  name: NativeService,
+  candidate: { pid: number; birth: string },
+  lease: string,
+  signal: NodeJS.Signals,
+  record?: Pick<Lease, "pid" | "birth">,
+): Promise<void> {
+  // Revalidate the birth and unguessable lease immediately before signalling.
+  if (
+    record &&
+    candidate.pid === record.pid &&
+    candidate.birth !== record.birth
+  )
+    return;
+  if ((await observed(candidate.pid, lease, false)) !== candidate.birth) return;
+  try {
+    process.kill(candidate.pid, signal);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    if (code === "EPERM") {
+      // If the process exited and its PID was reused between verification and
+      // kill, it is already gone; otherwise report the service and PID clearly.
+      if ((await observed(candidate.pid, lease, false)) !== candidate.birth)
+        return;
+      throw Object.assign(
+        new Error(
+          `Native ${name} process (PID ${candidate.pid}) could not be signalled with ${signal} (EPERM); stop it manually and retry.`,
+        ),
+        {
+          code: NATIVE_PROCESS_SIGNAL_DENIED,
+          pid: candidate.pid,
+          cause: error,
+        },
+      );
+    }
+    throw error;
+  }
+}
 export async function stopNativeProcess(
   root: string,
   name: NativeService,
@@ -493,10 +587,14 @@ export async function stopNativeProcess(
 ): Promise<void> {
   const record = await stored(root, name);
   if (!record) return;
+  // Before any signal, so the supervisor never restarts what this ends.
+  const request = stopRequest(root, name, record.lease);
+  await requestStop(request);
   if (process.platform === "win32")
     await stopWindowsTree(name, record.lease, record);
   else await stopLease(name, record, interruptMs);
   await rm(paths(root, name).record, { force: true });
+  await rm(request, { force: true });
 }
 /**
  * macOS and Linux: ends the supervisor holding the lease and everything
@@ -519,23 +617,10 @@ async function stopLease(
       );
     return;
   }
-  const signalOwned = async (
+  const signalOwned = (
     candidate: { pid: number; birth: string },
     signal: NodeJS.Signals,
-  ) => {
-    // Revalidate the birth and unguessable lease immediately before signalling.
-    if (candidate.pid === record.pid && candidate.birth !== record.birth)
-      return;
-    if (
-      (await observed(candidate.pid, record.lease, false)) !== candidate.birth
-    )
-      return;
-    try {
-      process.kill(candidate.pid, signal);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
-  };
+  ) => signalLeasedProcess(name, candidate, record.lease, signal, record);
   const interrupted = new Map<number, string>();
   const deadline = Date.now() + interruptMs;
   for (;;) {
@@ -573,8 +658,15 @@ async function stopLease(
   }
   const owner = owned.find((candidate) => candidate.pid === record.pid);
   if (owner) await signalOwned(owner, "SIGKILL");
-  for (let count = 0; count < 30 && (await groupLive(record.pid)); count++)
+  // A supervisor that checked for the stop request just before it was
+  // written may have restarted its service since the last listing; with the
+  // supervisor gone nothing restarts it again.
+  for (let count = 0; count < 30; count++) {
+    owned = await nativeLeaseProcesses(record.lease);
+    if (!owned.length && !(await groupLive(record.pid))) break;
+    for (const candidate of owned) await signalOwned(candidate, "SIGKILL");
     await delay(100);
+  }
   if (
     (await groupLive(record.pid)) ||
     (await nativeLeaseProcesses(record.lease)).length
@@ -650,8 +742,13 @@ async function stopWindowsTree(
       throw new Error(`Native ${name} did not stop; identity record retained.`);
     }
     const order = windowsTerminationOrder(tree);
-    for (const pid of tree.length > 1 ? order.slice(0, -1) : order)
-      terminate(pid);
+    for (const pid of tree.length > 1 ? order.slice(0, -1) : order) {
+      try {
+        terminate(pid);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+      }
+    }
     await delay(100);
   }
 }
@@ -829,6 +926,34 @@ export async function reclaimNativeOrphans(
   }
 }
 
+/**
+ * The ones of `folders` that a running process of this user starts from: its
+ * command line names a path inside one. When processes cannot be listed,
+ * every folder counts as in use, so nothing a service needs is removed.
+ */
+export async function foldersInUse(
+  folders: readonly string[],
+): Promise<Set<string>> {
+  let commands: string[];
+  try {
+    commands =
+      process.platform === "win32"
+        ? (await windowsProcesses()).map((entry) => entry.command)
+        : (await ownCommands()).map((entry) => entry.command);
+  } catch {
+    return new Set(folders);
+  }
+  const used = await Promise.all(
+    folders.map(async (folder) => {
+      // A service may run from the resolved path of a linked folder.
+      const names = [folder, await realpath(folder).catch(() => folder)];
+      return commands.some((command) =>
+        names.some((name) => command.includes(name + path.sep)),
+      );
+    }),
+  );
+  return new Set(folders.filter((_, index) => used[index]));
+}
 /** Each process of this user with its command line (macOS and Linux). */
 async function ownCommands(): Promise<Array<{ pid: number; command: string }>> {
   if (process.platform === "linux") {
@@ -883,7 +1008,10 @@ async function reclaimUnrecordedLeases(
     const [, name, lease] = job as unknown as [string, NativeService, string];
     const birth = await observed(pid, lease);
     if (!birth) continue;
+    const request = stopRequest(root, name, lease);
+    await requestStop(request);
     await stopLease(name, { pid, birth, lease }, 12_000);
+    await rm(request, { force: true });
     ended.push(pid);
   }
   return ended;

@@ -53,6 +53,9 @@ type Options struct {
 	Environment map[string]string
 	// JobDirectory holds the output file of each running download or load.
 	JobDirectory string
+	// ProbeCacheDirectory holds concurrency-probes.json. When empty, New falls
+	// back to filepath.Dir(JobDirectory), then Tool.StateDirectory.
+	ProbeCacheDirectory string
 	// HarnessDirectory holds the on-demand Pi runtime provisioned when a
 	// local model is loaded on a Computer without Pi.
 	HarnessDirectory string
@@ -111,6 +114,7 @@ type Library struct {
 	ensurePiRetryInterval time.Duration
 	ensureLoadTimeout     time.Duration
 	now                   func() time.Time
+	healthCheck           func(ctx context.Context, healthURL string) bool
 	ctx                   context.Context
 	stop                  context.CancelFunc
 
@@ -143,6 +147,9 @@ type Library struct {
 	piFailures   int
 	piRetryAt    time.Time
 	jobs         map[string]*job
+	probes       map[string]*activeProbe
+	probeUnknown map[string]probeFingerprint
+	prober       *concurrencyProber
 	// causes holds, by model, the cause the last job's error line gave. The
 	// tool's status keeps only the code, so each read puts the cause back on
 	// a row that still fails with that code.
@@ -184,10 +191,23 @@ func New(options Options) *Library {
 		progressInterval: options.ProgressInterval, statusTimeout: options.StatusTimeout, actionTimeout: options.ActionTimeout,
 		ensurePiTimeout: options.EnsurePiTimeout, ensurePiRetryInterval: options.EnsurePiRetryInterval,
 		ensureLoadTimeout: options.EnsureLoadTimeout,
-		now:               time.Now, ctx: ctx, stop: stop, jobs: make(map[string]*job), causes: make(map[string]*wire.LocalModelError),
+		now:               time.Now, healthCheck: gatewayAnswers, ctx: ctx, stop: stop, jobs: make(map[string]*job), probes: make(map[string]*activeProbe), probeUnknown: make(map[string]probeFingerprint),
+		causes:            make(map[string]*wire.LocalModelError),
 		installerLockWait: defaultInstallerLockWait, installerLockRetry: defaultInstallerLockRetry, settledCh: make(chan struct{}),
 		changed: make(chan struct{}), jobEnded: make(map[string]uint64), ensures: make(map[string]*ensureLoad),
 	}
+	probeCacheDir := options.ProbeCacheDirectory
+	if probeCacheDir == "" && options.JobDirectory != "" {
+		probeCacheDir = filepath.Dir(options.JobDirectory)
+	}
+	toolStateDir := ""
+	if options.Tool != nil {
+		toolStateDir = options.Tool.StateDirectory
+	}
+	if probeCacheDir == "" {
+		probeCacheDir = toolStateDir
+	}
+	library.prober = newConcurrencyProber(probeCacheDir, toolStateDir)
 	if library.ensureLoadTimeout <= 0 {
 		library.ensureLoadTimeout = defaultEnsureLoadTimeout
 	}
@@ -327,6 +347,11 @@ func (l *Library) Refresh(ctx context.Context) wire.LocalModelsSnapshot {
 		l.refreshMu.Unlock()
 		return snapshot
 	}
+	if snapshot.Available {
+		l.reconcileProbes(&snapshot)
+	} else {
+		l.cancelAllProbes()
+	}
 	changed := false
 	catalogChanged := false
 	hasLoaded := false
@@ -452,6 +477,9 @@ func (l *Library) Act(ctx context.Context, action Action, deadline time.Time) (r
 			// Progress lines update the last snapshot; read one first.
 			l.Refresh(ctx)
 		}
+		if action.Name == ActionLoad && l.needsUnloadBeforeLoad(ctx, action.Model) {
+			return l.unloadAndStartJob(ctx, action, deadline)
+		}
 		return l.startJob(ctx, action, deadline)
 	case ActionUnload, ActionRemove, ActionCancel:
 		return l.runAction(ctx, action, deadline)
@@ -490,6 +518,10 @@ func (l *Library) runAction(ctx context.Context, action Action, deadline time.Ti
 	answer := newPendingAnswer()
 	go func() {
 		defer l.wg.Done()
+		cancelledProbe := false
+		if action.Name == ActionUnload || action.Name == ActionRemove {
+			cancelledProbe = l.cancelProbe(action.Model)
+		}
 		runCtx, cancel := context.WithTimeout(l.ctx, l.actionTimeout)
 		defer cancel()
 		stdout, exitCode, err := l.runOnce(runCtx, action)
@@ -503,9 +535,10 @@ func (l *Library) runAction(ctx context.Context, action Action, deadline time.Ti
 			if action.Name != ActionCancel {
 				l.runtimeChanged()
 			}
-		case answer.missed():
-			// Nobody heard the refusal; the snapshot is how the owner sees
-			// that nothing changed.
+		case answer.missed() || cancelledProbe:
+			// Nobody heard the refusal, or an active concurrency probe was
+			// cancelled before the refused call: refresh so the owner sees
+			// accurate state.
 			l.Refresh(l.ctx)
 		}
 	}()
@@ -563,19 +596,69 @@ func (p *pendingAnswer) await(ctx context.Context, deadline time.Time) (*wire.Lo
 	}
 }
 
+// unloadAndStartJob resets a stale loaded or health-check-failed model to idle
+// before starting action, answering from either an unload refusal or the load's
+// first event before deadline.
+func (l *Library) unloadAndStartJob(ctx context.Context, action Action, deadline time.Time) (*wire.LocalModelActionRefusal, bool) {
+	if !l.track(1) {
+		refusal := closedRefusal
+		return &refusal, true
+	}
+	answer := newPendingAnswer()
+	go func() {
+		defer l.wg.Done()
+		unloadCtx, cancel := context.WithTimeout(l.ctx, l.actionTimeout)
+		stdout, exitCode, err := l.runOnce(unloadCtx, Action{Name: ActionUnload, Model: action.Model})
+		cancel()
+		refusal := documentRefusal(stdout, exitCode, err)
+		slog.Info("local_models.action_finished", "action", ActionUnload, "model", action.Model,
+			"exit_code", exitCode, "refused", refusal != nil, "reason", "reset_before_load")
+		if refusal != nil {
+			answer.give(refusal)
+			if answer.missed() {
+				l.Refresh(l.ctx)
+			}
+			return
+		}
+		if l.ctx.Err() != nil {
+			refusal := closedRefusal
+			answer.give(&refusal)
+			return
+		}
+		l.launchJob(action, answer, true)
+	}()
+	return answer.await(ctx, deadline)
+}
+
 // startJob starts a download or load and answers from its first event.
 func (l *Library) startJob(ctx context.Context, action Action, deadline time.Time) (*wire.LocalModelActionRefusal, bool) {
+	answer := newPendingAnswer()
+	l.launchJob(action, answer, false)
+	return answer.await(ctx, deadline)
+}
+
+// launchJob spawns a download or load child process and supervises it, giving
+// the first refusal or acceptance to answer. When refreshOnRefusal is true (a
+// reset-unload already changed state on disk), any refusal refreshes the
+// snapshot and signals runtimeChanged so the idle state is published.
+func (l *Library) launchJob(action Action, answer *pendingAnswer, refreshOnRefusal bool) {
 	// tail and superviseJob are reserved before the job starts, so no job
 	// starts unsupervised after Close.
 	if !l.track(2) {
 		refusal := closedRefusal
-		return &refusal, true
+		answer.give(&refusal)
+		return
 	}
 	output, err := l.jobOutput()
 	if err != nil {
 		l.wg.Add(-2)
 		slog.Warn("local_models.job_output_failed", "error", err)
-		return &wire.LocalModelActionRefusal{Code: CodeToolFailed, Detail: "the Computer could not start localmodels"}, true
+		answer.give(&wire.LocalModelActionRefusal{Code: CodeToolFailed, Detail: "the Computer could not start localmodels"})
+		if refreshOnRefusal {
+			l.Refresh(l.ctx)
+			l.runtimeChanged()
+		}
+		return
 	}
 	cmd := l.tool.command(l.environment, action)
 	cmd.Stdout, cmd.Stderr = output, output
@@ -587,7 +670,12 @@ func (l *Library) startJob(ctx context.Context, action Action, deadline time.Tim
 		_ = output.Close()
 		_ = os.Remove(output.Name())
 		slog.Warn("local_models.job_start_failed", "action", action.Name, "error", err)
-		return &wire.LocalModelActionRefusal{Code: CodeToolFailed, Detail: "the Computer could not start localmodels"}, true
+		answer.give(&wire.LocalModelActionRefusal{Code: CodeToolFailed, Detail: "the Computer could not start localmodels"})
+		if refreshOnRefusal {
+			l.Refresh(l.ctx)
+			l.runtimeChanged()
+		}
+		return
 	}
 	_ = output.Close()
 	slog.Info("local_models.job_started", "action", action.Name, "model", action.Model, "pid", cmd.Process.Pid)
@@ -602,12 +690,10 @@ func (l *Library) startJob(ctx context.Context, action Action, deadline time.Tim
 		defer l.wg.Done()
 		ended <- l.tail(output.Name(), exited, events)
 	}()
-	answer := newPendingAnswer()
 	go func() {
 		defer l.wg.Done()
-		l.superviseJob(action, events, ended, answer)
+		l.superviseJob(action, events, ended, answer, refreshOnRefusal)
 	}()
-	return answer.await(ctx, deadline)
 }
 
 func (l *Library) jobOutput() (*os.File, error) {
@@ -675,7 +761,7 @@ func (l *Library) tail(path string, exited <-chan int, events chan<- libraryEven
 
 // superviseJob answers the action from its first event, then follows the
 // job to its end.
-func (l *Library) superviseJob(action Action, events <-chan libraryEvent, ended <-chan int, answer *pendingAnswer) {
+func (l *Library) superviseJob(action Action, events <-chan libraryEvent, ended <-chan int, answer *pendingAnswer, refreshOnRefusal bool) {
 	answered := false
 	accepted := false
 	reply := func(refusal *wire.LocalModelActionRefusal) {
@@ -685,6 +771,12 @@ func (l *Library) superviseJob(action Action, events <-chan libraryEvent, ended 
 			// accepted job must find it running.
 			if accepted {
 				l.mu.Lock()
+				if action.Name == ActionLoad {
+					l.cancelProbeLocked(action.Model)
+					for _, unloadModel := range action.UnloadFirst {
+						l.cancelProbeLocked(unloadModel)
+					}
+				}
 				l.jobs[action.Model] = &job{action: action}
 				delete(l.causes, action.Model)
 				l.mu.Unlock()
@@ -740,10 +832,13 @@ func (l *Library) superviseJob(action Action, events <-chan libraryEvent, ended 
 	}
 	slog.Info("local_models.job_finished", attrs...)
 	if !accepted {
-		if answer.missed() {
-			// Nobody heard the refusal; the snapshot is how the owner sees
-			// that nothing changed.
+		if answer.missed() || refreshOnRefusal {
+			// Nobody heard the refusal, or a reset-unload already moved the
+			// model to idle; publish a fresh snapshot so state stays current.
 			l.Refresh(l.ctx)
+			if refreshOnRefusal {
+				l.runtimeChanged()
+			}
 		}
 		return
 	}
@@ -779,16 +874,18 @@ func (l *Library) superviseJob(action Action, events <-chan libraryEvent, ended 
 func (l *Library) phaseStarted(event libraryEvent) {
 	l.refreshMu.Lock()
 	snapshot := l.read(l.ctx)
-	l.refreshMu.Unlock()
 	if l.ctx.Err() != nil {
+		l.refreshMu.Unlock()
 		return
 	}
 	if !snapshot.Available {
+		l.refreshMu.Unlock()
 		l.progress(event)
 		l.reconcile(snapshot)
 		return
 	}
 	applyProgress(&snapshot, event)
+	l.reconcileProbes(&snapshot)
 	l.publishMu.Lock()
 	l.mu.Lock()
 	key := loadedKey(snapshot)
@@ -799,6 +896,7 @@ func (l *Library) phaseStarted(event libraryEvent) {
 	l.publishThrottledLocked()
 	l.mu.Unlock()
 	l.publishMu.Unlock()
+	l.refreshMu.Unlock()
 	// A model unloaded first leaves Pi's catalog.
 	if changed {
 		l.runtimeChanged()
@@ -875,9 +973,9 @@ func applyProgress(snapshot *wire.LocalModelsSnapshot, event libraryEvent) bool 
 				rate := bytesValue(event.BytesPerSecond)
 				progress.BytesPerSecond = &rate
 			}
-			model.State, model.Download, model.Endpoint, model.Error, model.Note = "downloading", progress, nil, nil, nil
+			model.State, model.Download, model.Endpoint, model.ConcurrencyProbing, model.Error, model.Note = "downloading", progress, nil, nil, nil, nil
 		case "load", "warm":
-			model.State, model.Download, model.Endpoint, model.Error, model.Note = "loading", nil, nil, nil, nil
+			model.State, model.Download, model.Endpoint, model.ConcurrencyProbing, model.Error, model.Note = "loading", nil, nil, nil, nil, nil
 		default:
 			return false
 		}
@@ -951,6 +1049,9 @@ func (l *Library) hasAdoptedJobLocked(snapshot wire.LocalModelsSnapshot) bool {
 		if model.State != "downloading" && model.State != "loading" {
 			continue
 		}
+		if _, probing := l.probes[model.ID]; probing {
+			continue
+		}
 		if _, supervised := l.jobs[model.ID]; !supervised {
 			return true
 		}
@@ -1018,8 +1119,11 @@ func (l *Library) EnsureLoaded(ctx context.Context, piModel string) error {
 		return nil
 	}
 	if l.settled() {
-		if known && cached.State == "loaded" {
+		if known && cached.State == "loaded" && l.cachedLoadedHealthy(ctx, *cached) {
 			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 	} else if err := l.awaitSettled(ctx); err != nil {
 		// Until the installer's stop has finished, a cached loaded row may be
@@ -1060,10 +1164,20 @@ func (l *Library) EnsureLoaded(ctx context.Context, piModel string) error {
 		return nil
 	}
 	index := slices.IndexFunc(snapshot.Models, func(model wire.LocalModel) bool { return model.PiModel == piModel })
-	if index < 0 || snapshot.Models[index].State == "loaded" {
+	if index < 0 {
 		return nil
 	}
-	return l.ensureByID(ctx, snapshot.Models[index].ID, loadState(snapshot.Models[index]), waitedFrom)
+	row := snapshot.Models[index]
+	if row.State == "loaded" && l.localGatewayHealthy(ctx) {
+		return nil
+	}
+	state := loadState(row)
+	if state == "loaded" {
+		// The model server answered status, but its local gateway did not;
+		// treat it as failed so ensureByID resets and reloads it cleanly.
+		state = "failed"
+	}
+	return l.ensureByID(ctx, row.ID, state, waitedFrom)
 }
 
 // ensureByID loads id, last seen in state, unless it is loaded, and waits
@@ -1109,7 +1223,10 @@ func (l *Library) ensureByID(ctx context.Context, id, state string, waitedFrom t
 	}
 	l.mu.Unlock()
 	if state == "loaded" {
-		return nil
+		if l.localGatewayHealthy(ctx) {
+			return nil
+		}
+		state = "failed"
 	}
 	slog.Info(event, "phase", "started", "model", id, "state", state)
 	err := l.load(ctx, id, state)
@@ -1141,6 +1258,7 @@ func (l *Library) load(ctx context.Context, id, state string) error {
 	l.mu.Lock()
 	since := l.commits
 	l.mu.Unlock()
+	startedJob := false
 	switch state {
 	case "idle", "failed":
 		refusal, answered := l.Act(budget, Action{Name: ActionLoad, Model: id}, l.now().Add(l.actionTimeout))
@@ -1156,19 +1274,22 @@ func (l *Library) load(ctx context.Context, id, state string) error {
 			}
 			return &LocalModelLoadError{Code: refusal.Code, ModelID: id}
 		}
+		startedJob = true
 	case "loading":
 		// A load this or a previous Daemon started; the Library follows it.
 	default:
 		return &LocalModelLoadError{Code: CodeModelNotDownloaded, ModelID: id}
 	}
-	return l.waitLoaded(ctx, budget, id, since)
+	return l.waitLoaded(ctx, budget, id, since, startedJob)
 }
 
 // waitLoaded waits until id is loaded or its load has ended otherwise. A
 // row that is not loading counts as the outcome only once no supervised job
 // for id runs and the snapshot changed after since and after that job ended:
-// until then it may predate the job's first status.
-func (l *Library) waitLoaded(ctx, budget context.Context, id string, since uint64) error {
+// until then it may predate the job's first status. When requireSettled is
+// true (load started a job), a loaded row also waits for settled so a forced
+// reload on a dead gateway cannot accept the stale pre-unload loaded row.
+func (l *Library) waitLoaded(ctx, budget context.Context, id string, since uint64, requireSettled bool) error {
 	if l.testWaiting != nil {
 		l.testWaiting(id)
 	}
@@ -1185,7 +1306,7 @@ func (l *Library) waitLoaded(ctx, budget context.Context, id string, since uint6
 		l.mu.Unlock()
 		if available {
 			switch {
-			case row != nil && row.State == "loaded":
+			case row != nil && row.State == "loaded" && (!requireSettled || settled):
 				return nil
 			case !settled || (row != nil && row.State == "loading"):
 			case row != nil && row.State == "failed" && row.Error != nil && row.Error.Code != "":

@@ -83,10 +83,16 @@ Gateway and runs Agents. The daemon exits with the app.
   status summary, tray menu and tray icons, drawn from the logo PNGs in
   `resources/tray/` with a status badge.
 - `src/main/local-server.ts`: LocalServer, the setup page's Quick Install
-  path. It fetches the pinned Node runtime (sources in the download region's
+  path. On Windows, install preflight checks both the install home and the
+  Computer daemon directory (`<userData>/computer`) non-destructively via
+  `windowsPrivateLocation` before fetching Node or unpacking, so ancestor ACL
+  refusals fail immediately with the offending ancestor path and SID instead of
+  after enrollment. It fetches the pinned Node runtime (sources in the download region's
   order, `scripts/installs/README.md`) and unpacks the linger source package
   into the install location (the default home, or a folder picked under
-  Customize; tar runs inside the target with relative paths, and the
+  Customize; tar runs inside the target with relative paths, falling back to
+  the pure-Node extractor when `tar.exe` is missing with `ENOENT` on stripped
+  Windows images, and the
   finished folder is moved into place with `renameRetrying`, which waits out
   Windows' short-lived locks on new files) and starts the bundled
   `dist/installer/installer.js` headless (`--no-open`), which runs every
@@ -128,7 +134,14 @@ Gateway and runs Agents. The daemon exits with the app.
   Desktop config. After sign-in, when reusing a completed job, or when the installer
   omits the runtime, it reads `GET /api/instances/desktop/runtime` for the current
   environment. The job's setup choice identifies the runtime for sign-in when available.
-  Desktop also saves the runtime its `setupChoice` runs (`local-models` runs
+  On Windows that lookup can take minutes (#385, #549): the
+  desktop waits for it while the installer answers, asks again after a
+  dropped connection (the installer joins the running lookup), and gives up
+  only after `RUNTIME_LOOKUP_LIMIT_MS` (10 minutes) with the typed `failure`
+  `runtime_lookup_timed_out` or, once unreachable for the reconnect window,
+  `runtime_lookup_unreachable`; the setup page words both. After 15 seconds
+  the status carries `waiting: "runtime"` and the page says what the bar
+  waits on. Desktop also saves the runtime its `setupChoice` runs (`local-models` runs
   on Pi) as `preferredRuntime`. The daemon config carries that as
   `preferred_runtime`, and the daemon marks that runtime's diagnostic
   `preferred`, so TeamHub creates Another Me and the starter Agents on it
@@ -201,9 +214,16 @@ Gateway and runs Agents. The daemon exits with the app.
   (`local_server.inspected`), never to the page. Under Customize the Local
   model card stays visible once the check ends: disabled, "Not available on
   this computer", with that reason. For `cuda-driver-update-required` and
-  `cuda-driver-version-unknown`, the page explains the NVIDIA driver
-  requirement and shows Check again (`local.recheck`) so the user can
-  re-check after updating the driver.
+  `cuda-driver-version-unknown`, the page explains the NVIDIA graphics driver
+  requirement (with required driver branch via `@linger/service-kit/nvidia-driver`),
+  offers one-click verified Windows GeForce RTX driver installation
+  (`driver.start-install`, downloading from NVIDIA's allowlisted CDN, verifying
+  NVIDIA Authenticode signature before elevated silent install, and persisting
+  `pendingDriverUpdate` across reboots), NVIDIA App launch on Windows
+  (`driver.open-nvidia-app`), NVIDIA's official download and upgrade guide links
+  (`SETUP_EXTERNAL_URLS`), and Check again (`local.recheck`), and auto-rechecks
+  when installation completes or the setup window regains focus after a driver
+  action.
   Off macOS the page names the system tray, not the menu bar.
   Under Customize the local model runs only behind Pi: with another runtime
   it is greyed (`aria-disabled`, still focusable), does not toggle, and says
@@ -256,10 +276,14 @@ Gateway and runs Agents. The daemon exits with the app.
   origin (`details.origin`, or the setup job's `origin`). The record, the
   window's `serverUrl` and the `savedEnrollments` entry follow it together
   (`setServer` with the previous origin emits `server.moved`, not
-  `server.changed`), so the Computer stays enrolled: it reaches TeamHub
-  through the gateway URL TeamHub gave it, and the session cookies are not
-  port-scoped. The record and `serverUrl` change only together, so a later
-  launch still resumes. A source folder removed since, or
+  `server.changed`), so the Computer stays enrolled and the session cookies
+  are not port-scoped. When `node-services` also (or independently) moved off
+  a taken port, `LocalServer` reads the instance's `source.ports.nodeServices`
+  after resume or a fast-ready move and updates the saved loopback `gatewayUrl`
+  in `credential.json` through `Enrollment.syncLocalGatewayUrl` (emitting
+  `computer.changed` to restart the daemon on the new port without changing the
+  Computer identity or token; remote gateway URLs are never rewritten). The
+  record and `serverUrl` change only together, so a later launch still resumes. A source folder removed since, or
   one the installer no longer accepts as a Linger checkout (such as one the
   earlier Simplex app unpacked, or this package's own folder with files
   missing since), is unpacked again from the app's package first and
@@ -271,7 +295,9 @@ Gateway and runs Agents. The daemon exits with the app.
   new folder (`details.source`) and the origin answers does it record that
   folder and prune the older one; otherwise the older services keep running
   from their folder, the record keeps naming it, and the start failure page's
-  Retry moves them again. An app older than the recorded version
+  Retry moves them again. A prune never removes a folder a running process
+  still starts from (`foldersInUse`; when processes cannot be listed, it
+  removes nothing) and logs `local_server.source_in_use` instead. An app older than the recorded version
   (a downgrade) leaves the services on their newer source and logs
   `local_server.source_newer_than_app`. When local models fail to come back on a
   resume, the installer still brings up the services and reports
@@ -302,7 +328,15 @@ Gateway and runs Agents. The daemon exits with the app.
   mid-download without toggling the saved `preventSleep` preference. A Quick Install that stopped
   before the computer enrolled is not resumed: setup shows again and Install
   finishes it, reusing a finished job only while its origin answers (a stopped
-  server gets a new job, which starts the services again). The start failure
+  server gets a new job, which starts the services again). It follows a
+  running or finished job only when that job's `setupChoice` is what the
+  person chose now (`local-models` for the local model; any but
+  `local-models` for the installer's pick); otherwise it asks for a new job.
+  The installer answers at once with that job `queued` and runs it once it
+  has stopped the earlier one, such as a local model download that kept
+  running after a quit or services still starting; setup polls the queued
+  job like any other, so a subscription chosen since never shows the earlier
+  download. The start failure
   page's Set Up Again forgets the record (`local-server.json`), clears the
   active enrollment while keeping per-origin `savedEnrollments` in
   `config.json` (`legacy_data_set_aside` clears `savedEnrollments` as well),
@@ -357,7 +391,13 @@ Gateway and runs Agents. The daemon exits with the app.
   `control.key`, `credential.json`, `launch.html`, `*.env`, `*.input.json`,
   keys, cookies, databases) never go in, every saved voice key is replaced
   wherever a log printed it, and every text passes through `redact` plus a
-  secret-key JSON filter, and the person's home folder becomes `~`. It
+  secret-key JSON filter, and the person's home folder becomes `~`. It also
+  bundles the newest bounded `localmodels` stack run records
+  (`runtime/localmodels/state/stacks/*.run.json` and `.progress`), local
+  deployment records (`runtime/localmodels/state/deployments/local/*.json`),
+  and deployment engine logs (`runtime/localmodels/models/deployments/*/server.log`),
+  capped in count and byte size and excluding `byok.json`, `api-key`, and model
+  weights. It
   imports no Electron API, so it is tested with Windows paths on any
   platform.
 - `src/main/diagnostics-upload.ts`: "Send Diagnostics" on the setup page, the
@@ -403,7 +443,18 @@ Gateway and runs Agents. The daemon exits with the app.
   redacted `error` bounded to 500 chars with query/hash stripped). A resume
   whose saved BYOK gateway did not come back still succeeds and logs
   `local_server.byok_gateway_unavailable` (`code`, `message`); the Computer
-  mounts the gateway again before the next Run on it.
+  mounts the gateway again before the next Run on it. Once ready, a server
+  the window shows can still stop: its supervisor restarts it, and the
+  desktop resumes it like a launch when it does not answer
+  (`local_server.unreachable_resume` with `trigger`): at once on
+  `local-server.retry`, and after `UNREACHABLE_GRACE_MS` (longer than the
+  supervisor's restart delays) on `local-server.unreachable` (WindowManager
+  emits it when it shows `offline.html` for a failed load) or the
+  `WATCH_MS` watch. Those two resume at most once a minute, and only after
+  `UNREACHABLE_PROBES` checks in a row spread over the grace went unanswered,
+  each allowed `UNREACHABLE_PROBE_TIMEOUT_MS` (longer than the launch's 1 s
+  fast check), so a server slowed by heavy load is not taken for a stopped
+  one; a resume that fails shows the start failure page as on launch.
 - `src/main/voice-window.ts`: the floating voice window. Electron cannot open
   Document Picture-in-Picture windows, so the SPA opens a small native window
   with `window.open("")` under the target `linger-voice-window-<n>`
@@ -457,7 +508,20 @@ Gateway and runs Agents. The daemon exits with the app.
   English. Errors from transfers and servers stay in English.
 - `src/preload/index.ts`: the only SPA API, `window.lingerDesktop`. Its
   `update` reads the Updater's state (without the release page URL) and runs
-  the tray's install and check, for the SPA's account menu.
+  the tray's install and check, for the SPA's account menu; `settings` exposes
+  `preventSleep` (`get`, `set`, `onChange`) so Settings › Computers mirrors and
+  stays in sync with the tray's Prevent Sleep toggle; `driverUpdate`
+  (`src/main/driver-updater.ts`, `src/main/windows-driver-platform.ts`) detects
+  and launches NVIDIA App / GeForce Experience on Windows, opens the allowlisted
+  NVIDIA download/guide URLs, and on Windows x64 runs verified one-click GeForce
+  RTX DCH WHQL downloads (allowlisted CDN, Windows Authenticode check, elevated
+  `-s -noreboot -noeula` install, `PowerGuard` sleep block, and `config.json`
+  `pendingDriverUpdate` post-reboot resume) with `getInstallState` /
+  `onInstallState` / `startInstall` / `clearInstallState`; and
+  `localServer.owned()` reports whether the window points at this app's own
+  local installation regardless of startup/resume readiness, so the SPA can hide
+  CLI daemon download entry points even during hot start or install-time
+  preload.
 - `src/shared/api.ts`, `src/shared/shell.ts`: preload contract types and IPC
   channel names.
 - `src/main/computer-daemon.ts`: ComputerDaemon. While the computer is
@@ -467,7 +531,14 @@ Gateway and runs Agents. The daemon exits with the app.
   credential in `LINGER_COMPUTER_TOKEN` (`gateway.token_env`). The config's
   `desktop` section puts the daemon in Desktop mode: no self-update, it exits
   when its stdin closes, and it reports `{"type":"status",...}` lines on
-  stdout, which drive the tray and the SPA status. Its log goes to
+  stdout (`gateway_state`, `active_operations`, `active_model_invokes`).
+  `active_operations` drives the tray busy state, quit confirmation, idle
+  restarts, updater waiting and the SPA status (`runtime.activity`);
+  `active_model_invokes` (omitted by older daemons, treated as `0`) emits
+  `runtime.model_activity` for `PowerGuard` only, so background model calls
+  (Memory, Wiki) hold `prevent-app-suspension` while running and through a
+  short release tail (`MODEL_ACTIVITY_TAIL_MS`) without marking the Computer
+  busy. Its log goes to
   `<userData>/logs/computer-daemon.log`. Crashes and launch failures retry
   with backoff. The Desktop reports the reason after three consecutive
   attempts fail before the daemon reports a status. The exit log

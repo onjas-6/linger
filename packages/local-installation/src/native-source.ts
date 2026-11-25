@@ -50,6 +50,7 @@ import {
   inspectNativeProcess,
   nativeConfigurationChanged,
   reclaimNativeOrphans,
+  SERVICE_RESTART_POLICY,
   startNativeProcess,
   stopNativeProcess,
   type NativeService,
@@ -688,7 +689,7 @@ async function runNativeSource(
       let byokGateway: ByokGatewayFailure | undefined;
       let localModelsDegraded: LocalModelsDegraded | undefined;
       const resumeLocalModels =
-        Boolean(options.resume) &&
+        Boolean(options.resume || options.degradeLocalModels) &&
         !options.setupChoice &&
         !options.localModelsApproval &&
         !options.localModelsReplan;
@@ -958,7 +959,7 @@ async function runNativeSource(
               packages: !offline,
             }),
         );
-        const voice = await timed("Preparing the voice tools", () =>
+        const voiceTools = await timed("Preparing the voice tools", () =>
           prepareNativeVoiceTools({
             home,
             signal,
@@ -973,13 +974,14 @@ async function runNativeSource(
           });
           return undefined;
         });
-        if (!voice)
+        if (!voiceTools)
           emit({
             kind: "log",
             stage,
             message:
               "Voice stays off: this installation has no voice tools for this computer.\n",
           });
+        const voice = configured.liveKit ? voiceTools : undefined;
         // node-services downloads its voice model packages from the region's
         // registry first, and nothing it starts probes again.
         const region = await resolveRegion(home, { signal });
@@ -1325,6 +1327,9 @@ async function runNativeSource(
                   nodeDeps: activeBundleRelease.infra.nodeDeps,
                 }),
                 restartOnConfigurationChange: true,
+                // Its supervisor brings it back when it exits unasked, so the
+                // window does not wait on a dead port until the next launch.
+                restartOnExit: SERVICE_RESTART_POLICY,
               };
             }
             return {
@@ -1343,6 +1348,9 @@ async function runNativeSource(
               // proxy restarts it.
               settings: baseSettings,
               restartOnConfigurationChange: true,
+              // Its supervisor brings it back when it exits unasked, so the
+              // window does not wait on a dead port until the next launch.
+              restartOnExit: SERVICE_RESTART_POLICY,
             };
           };
           // Stop the Agent Service only when TeamHub is about to restart for a

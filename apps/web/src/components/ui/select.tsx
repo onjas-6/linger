@@ -17,6 +17,8 @@ import { Icon } from "@/components/ui/icon";
 export interface SelectItemProps {
   children: ReactNode;
   disabled?: boolean;
+  /** Compact label rendered in the trigger when selected; falls back to `children`. */
+  triggerLabel?: ReactNode;
   value: string;
 }
 
@@ -25,6 +27,7 @@ const SelectPopup = lazy(() =>
 );
 
 export function Select({
+  align,
   "aria-describedby": ariaDescribedBy,
   "aria-invalid": ariaInvalid,
   autoFocus,
@@ -38,6 +41,7 @@ export function Select({
   value,
   variant = "field",
 }: {
+  align?: "auto" | "left" | "right";
   "aria-describedby"?: string;
   "aria-invalid"?: boolean;
   autoFocus?: boolean;
@@ -101,7 +105,9 @@ export function Select({
         <span
           className={`min-w-0 flex-1 truncate ${selectedIndex >= 0 ? "" : "text-app-placeholder"}`}
         >
-          {options[selectedIndex]?.children ?? placeholder}
+          {options[selectedIndex]?.triggerLabel ??
+            options[selectedIndex]?.children ??
+            placeholder}
         </span>
         <Icon
           className={`shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
@@ -112,6 +118,7 @@ export function Select({
       {open ? (
         <Suspense fallback={null}>
           <SelectPopup
+            align={align}
             id={listboxId}
             onChoose={(option) => {
               onValueChange(option.value);

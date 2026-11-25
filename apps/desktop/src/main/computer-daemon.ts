@@ -206,6 +206,7 @@ export class ComputerDaemonModule implements Module {
   #state: RuntimeState = "stopped";
   #connection = "disconnected";
   #running = 0;
+  #modelInvokes = 0;
   #failures = 0;
   #startedAt = 0;
   #retry: NodeJS.Timeout | undefined;
@@ -229,6 +230,11 @@ export class ComputerDaemonModule implements Module {
   // Operations the daemon is executing right now.
   running(): number {
     return this.#running;
+  }
+
+  // One-shot background model invocations the daemon is executing right now.
+  modelInvokes(): number {
+    return this.#modelInvokes;
   }
 
   // online, connecting, auth_failed, upgrade_required, or disconnected
@@ -436,6 +442,7 @@ export class ComputerDaemonModule implements Module {
         permission?: unknown;
         gateway_state?: unknown;
         active_operations?: unknown;
+        active_model_invokes?: unknown;
       };
       try {
         status = JSON.parse(line) as typeof status;
@@ -459,11 +466,14 @@ export class ComputerDaemonModule implements Module {
         this.#setConnection(connectionState(status.gateway_state));
       if (typeof status.active_operations === "number")
         this.#setRunning(status.active_operations);
+      if (typeof status.active_model_invokes === "number")
+        this.#setModelInvokes(status.active_model_invokes);
     });
     child.onExit((code, reason) => {
       if (this.#child !== child) return;
       this.#child = undefined;
       this.#setRunning(0);
+      this.#setModelInvokes(0);
       this.#setConnection("disconnected");
       if (this.#stopping) return;
       if (Date.now() - this.#startedAt >= HEALTHY_AFTER_MS) this.#failures = 0;
@@ -542,6 +552,7 @@ export class ComputerDaemonModule implements Module {
     if (!child) return;
     this.#child = undefined;
     this.#setRunning(0);
+    this.#setModelInvokes(0);
     this.#setConnection("disconnected");
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -600,6 +611,12 @@ export class ComputerDaemonModule implements Module {
     if (this.#running === running) return;
     this.#running = running;
     this.#ctx?.bus.emit("runtime.activity", running);
+  }
+
+  #setModelInvokes(modelInvokes: number): void {
+    if (this.#modelInvokes === modelInvokes) return;
+    this.#modelInvokes = modelInvokes;
+    this.#ctx?.bus.emit("runtime.model_activity", modelInvokes);
   }
 
   #setConnection(connection: string): void {

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -59,6 +60,71 @@ const userShell = (): string | undefined => {
   }
 };
 
+const compareNodeVersions = (left: string, right: string): number => {
+  const leftParts = left.replace(/^v/, "").split(".");
+  const rightParts = right.replace(/^v/, "").split(".");
+  const length = Math.min(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index++) {
+    const l = leftParts[index]!;
+    const r = rightParts[index]!;
+    if (!/^\d+$/.test(l) || !/^\d+$/.test(r)) {
+      return left < right ? -1 : left > right ? 1 : 0;
+    }
+    const diff = Number(l) - Number(r);
+    if (diff !== 0) return diff;
+  }
+  return leftParts.length - rightParts.length;
+};
+
+// Existing global bin folders of Node version managers, matching
+// nodeManagerDirectories in local-daemon/internal/provider/terminal_environment.go.
+const nodeManagerDirectories = (home: string): string[] => {
+  if (process.platform === "win32" || !path.isAbsolute(home)) return [];
+  const directories: string[] = [];
+  const nvmRoot = path.join(home, ".nvm", "versions", "node");
+  try {
+    const bins: { version: string; bin: string }[] = [];
+    for (const entry of readdirSync(nvmRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const bin = path.join(nvmRoot, entry.name, "bin");
+      try {
+        if (statSync(bin).isDirectory())
+          bins.push({ version: entry.name, bin });
+      } catch {
+        // Ignore unreadable or missing bin folders.
+      }
+    }
+    bins.sort((a, b) => compareNodeVersions(b.version, a.version));
+    for (const item of bins) directories.push(item.bin);
+  } catch {
+    // nvm is not installed.
+  }
+  for (const relative of [
+    ".local/share/fnm/aliases/default/bin",
+    "Library/Application Support/fnm/aliases/default/bin",
+    ".fnm/aliases/default/bin",
+    "Library/pnpm",
+    ".local/share/pnpm",
+  ]) {
+    const directory = path.join(home, relative);
+    try {
+      if (statSync(directory).isDirectory()) directories.push(directory);
+    } catch {
+      // Ignore missing directory.
+    }
+  }
+  return directories;
+};
+
+// Holds each shell's last captured login environment, keyed by shell and HOME,
+// matching lastTerminalPaths in local-daemon/internal/provider/terminal_environment.go.
+const lastLoginShellEnvs = new Map<string, Record<string, string>>();
+
+export interface LoginShellOptions {
+  readonly reuseLast?: boolean;
+  readonly cache?: Map<string, Record<string, string>>;
+}
+
 // The environment as the user's terminal sees it: PATH, API keys, proxy and CA
 // certificate settings from the shell profile. Interactive so that version
 // managers set up in .zshrc / .bashrc (nvm, volta) are included; markers keep
@@ -66,11 +132,15 @@ const userShell = (): string | undefined => {
 export const loginShellEnvironment = async (
   env: NodeJS.ProcessEnv = process.env,
   run: RunShell = runShell,
+  options: LoginShellOptions = {},
 ): Promise<Record<string, string> | undefined> => {
   if (process.platform === "win32") return undefined;
   // Without SHELL (e.g. a stripped child environment) use the account shell.
   const shell = (env.SHELL ?? userShell())?.trim();
   if (!shell || !path.isAbsolute(shell)) return undefined;
+  const cache = options.cache ?? lastLoginShellEnvs;
+  const reuseLast = options.reuseLast ?? run === runShell;
+  const cacheKey = `${shell}\0${env.HOME ?? ""}`;
   const script = `printf '${ENV_MARKER}'; /usr/bin/env -0; printf '${ENV_MARKER}'`;
   // Start from what a new terminal window gets, so the shell's own PATH order
   // wins over the app's inherited one.
@@ -98,7 +168,14 @@ export const loginShellEnvironment = async (
       stdout,
     );
     const variables = code === 0 ? parseEnv(match?.[1] ?? "") : {};
-    if (variables.PATH) return variables;
+    if (variables.PATH) {
+      if (reuseLast) cache.set(cacheKey, { ...variables });
+      return variables;
+    }
+  }
+  if (reuseLast) {
+    const cached = cache.get(cacheKey);
+    if (cached) return { ...cached };
   }
   return undefined;
 };
@@ -116,7 +193,7 @@ const parseEnv = (text: string): Record<string, string> => {
 
 // The login shell's PATH first, so `codex` and `claude` resolve to the same
 // executables as in the user's terminal, then the inherited PATH, then the
-// common install directories.
+// common install directories and Node version manager bins (nvm, fnm, pnpm).
 export const runtimeSearchPath = (
   current: string | undefined,
   login: string | undefined,
@@ -127,11 +204,14 @@ export const runtimeSearchPath = (
     ...(current ?? "").split(path.delimiter),
     ...(process.platform === "win32"
       ? []
-      : COMMON_DIRECTORIES.map((directory) =>
-          directory.startsWith("~/")
-            ? path.join(home, directory.slice(2))
-            : directory,
-        )),
+      : [
+          ...COMMON_DIRECTORIES.map((directory) =>
+            directory.startsWith("~/")
+              ? path.join(home, directory.slice(2))
+              : directory,
+          ),
+          ...nodeManagerDirectories(home),
+        ]),
   ].filter((directory) => directory && path.isAbsolute(directory));
   return [...new Set(directories)].join(path.delimiter);
 };

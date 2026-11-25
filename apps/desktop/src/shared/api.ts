@@ -1,6 +1,20 @@
 // Contract between the remote SPA (through preload) and the main process.
 // The SPA detects the desktop shell with `typeof window.lingerDesktop`.
 
+import type {
+  DesktopDriverActionResult,
+  DesktopDriverCapabilities,
+  DesktopDriverInstallRequest,
+  DesktopDriverInstallState,
+} from "@linger/service-kit/nvidia-driver";
+
+export type {
+  DesktopDriverActionResult,
+  DesktopDriverCapabilities,
+  DesktopDriverInstallRequest,
+  DesktopDriverInstallState,
+};
+
 export type RuntimeState =
   | "stopped"
   | "starting"
@@ -27,6 +41,7 @@ export interface WorkspaceGrantView {
 export interface DesktopSettings {
   readonly serverUrl: string;
   readonly displayName: string;
+  readonly preventSleep: boolean;
 }
 
 // Signing in with the owner account of the Linger this app installed; the
@@ -140,13 +155,22 @@ export interface LingerDesktopApi {
   };
   readonly settings: {
     get(): Promise<DesktopSettings>;
-    set(patch: { displayName?: string }): Promise<DesktopSettings>;
+    set(patch: {
+      displayName?: string;
+      preventSleep?: boolean;
+    }): Promise<DesktopSettings>;
+    onChange(callback: (settings: DesktopSettings) => void): () => void;
   };
   // The owner account of the Linger installed on this computer.
   readonly localAccount: {
     // Whether the window shows that Linger; false for any other server.
     available(): Promise<boolean>;
     signIn(): Promise<LocalAccountSignIn>;
+  };
+  // Whether the window is pointed at this app's own local installation,
+  // independent of startup/resume readiness.
+  readonly localServer: {
+    owned(): Promise<boolean>;
   };
   // The app's own updates, as in the tray.
   readonly update: {
@@ -202,6 +226,22 @@ export interface LingerDesktopApi {
   readonly permissions?: {
     act(step: DesktopPermissionStep): Promise<void>;
   };
+  // Native NVIDIA driver update helpers (Windows / Linux). Older desktop apps
+  // lack it, so the page falls back to direct browser links and copyable steps.
+  readonly driverUpdate?: {
+    getCapabilities(): Promise<DesktopDriverCapabilities>;
+    openNvidiaApp(): Promise<DesktopDriverActionResult>;
+    openOfficialDownload(): Promise<DesktopDriverActionResult>;
+    openGuide(): Promise<DesktopDriverActionResult>;
+    getInstallState(): Promise<DesktopDriverInstallState>;
+    onInstallState(
+      callback: (state: DesktopDriverInstallState) => void,
+    ): () => void;
+    startInstall(
+      request: DesktopDriverInstallRequest,
+    ): Promise<DesktopDriverActionResult>;
+    clearInstallState?(): Promise<void>;
+  };
 }
 
 export const IPC = {
@@ -214,9 +254,19 @@ export const IPC = {
   workspaceRevoke: "workspace.revoke",
   settingsGet: "settings.get",
   settingsSet: "settings.set",
+  settingsEvent: "settings.event",
   permissionAct: "permission.act",
+  driverUpdateCapabilities: "driver-update.capabilities",
+  driverUpdateOpenNvidiaApp: "driver-update.open-nvidia-app",
+  driverUpdateOpenDownload: "driver-update.open-download",
+  driverUpdateOpenGuide: "driver-update.open-guide",
+  driverUpdateInstallState: "driver-update.install-state",
+  driverUpdateInstallStateEvent: "driver-update.install-state.event",
+  driverUpdateStartInstall: "driver-update.start-install",
+  driverUpdateClearState: "driver-update.clear-state",
   localAccountAvailable: "local-account.available",
   localAccountSignIn: "local-account.sign-in",
+  localServerOwned: "local-server.owned",
   updateState: "update.state",
   updateStateEvent: "update.state.event",
   updateInstall: "update.install",

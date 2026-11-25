@@ -102,6 +102,9 @@ func run(args []string) (resultErr error) {
 	if handled, err := platformEntry(args); handled {
 		return err
 	}
+	if len(args) > 0 && args[0] == "probe-runtimes" {
+		return runProbeRuntimes(context.Background(), args[1:], computerconfig.ProcessEnvironment(), os.Stdout)
+	}
 	if len(args) != 2 || args[0] != "--config" || args[1] == "" {
 		return errors.New("linger-computer-daemon requires --config <path>")
 	}
@@ -358,9 +361,10 @@ func run(args []string) (resultErr error) {
 	}
 	localModels = localmodels.New(localmodels.Options{
 		Tool: localModelsTool, Environment: baseProviderEnvironment,
-		JobDirectory:     jobDir,
-		HarnessDirectory: libraryHarnessDir,
-		NodePath:         nodePath,
+		JobDirectory:        jobDir,
+		ProbeCacheDirectory: filepath.Join(computer.StateDirectory, "local-models"),
+		HarnessDirectory:    libraryHarnessDir,
+		NodePath:            nodePath,
 		// The library publishes only from Act and Refresh, which the Daemon
 		// calls once it runs.
 		Publish: func(snapshot wire.LocalModelsSnapshot) { localDaemon.PublishLocalModels(snapshot) },

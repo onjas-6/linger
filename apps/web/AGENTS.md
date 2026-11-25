@@ -53,12 +53,30 @@ build:assets` to check the initial JS budget.
   pick among installed local models in `SwitchToLocalNotice` or click
   `Use for Agents` on a loaded row, highlights Thinking Machines' Inkling 2
   Mini in a featured spotlight frame (`featured-model-spotlight.tsx`) wrapping
-  the matching `ModelRow` so status and actions stay in one place (matched via
-  `@linger/service-kit/featured-models`, degrading to a partner highlight with
-  external links when absent from the catalog),
-  renders tinted family icon tiles, Agent
-  usage counts, structured engine pills (`PolyStrata` / `llama.cpp` / `Strata`),
-  capability/parameter badges (never matched against
+  its grouped `ModelRow` so status, sibling quantizations and actions stay in
+  one place (matched via `@linger/service-kit/featured-models`, preferring a
+  hardware-fitting `DRIVER_UPDATE_REQUIRED` variant over a
+  `MEMORY_INSUFFICIENT` one, moving below `Available to download` when
+  unavailable while other models fit, and degrading to a partner highlight with
+  external links when absent from the catalog), guides owners through outdated
+  NVIDIA drivers via `UpdateDriverDialog` (`local-model-driver-dialog.tsx`)
+  with engine-scoped driver guidance, signed one-click Windows installation
+  with live progress and post-reboot resume banners
+  (`window.lingerDesktop.driverUpdate`), desktop NVIDIA App launch, copyable
+  Linux commands, and focus-triggered rechecks, groups sibling quantizations of
+  the same logical model (via structured `source_url`) into a single card with
+  a clean base title and right-aligned quantization pill (interactive pill
+  switcher for multiple versions, matching static pill for a single version)
+  while keeping any extra active on-computer variants visible, splits the list
+  into `On this computer`, `Available to download`, and a collapsible
+  unavailable/needs-more-memory disclosure (auto-expanded when nothing fits),
+  renders tinted family icon tiles, download + memory/VRAM (and hybrid
+  VRAM + RAM for PolyStrata) footprints on available and loaded rows,
+  explicit VRAM vs RAM shortfall copy (`memory_kind`), Agent usage counts,
+  structured engine pills (`PolyStrata` / `llama.cpp` / `Strata`, hiding
+  redundant `llama.cpp` pills on single-engine hosts while keeping multi-engine
+  version switcher pills compact when quantizations are distinct),
+  capability/parameter/context badges (never matched against
   `name` or `description`), state-distinct cards (`loaded`, `recommended`,
   `failed` with short failure reasons and direct `Remove` for damaged/missing
   files, `unavailable`), download speed/ETA, live Bifrost (`Pi`) `Gateway`
@@ -83,7 +101,11 @@ build:assets` to check the initial JS budget.
   refusal (or while offline), the row shows a requested load or download as
   started, labels a cancel, unload or remove under way (Cancelling, Unloading,
   Removing), and spins that action's button, with the row's actions off; a
-  download the Computer accepted can be cancelled before its first progress.
+  download the Computer accepted can be cancelled before its first progress. A
+  `loading` row with `concurrency_probing: true` labels its status
+  `Probing max concurrency` (`statusProbingConcurrency`) until the one-time
+  concurrency probe finishes and publishes `loaded` with the verified
+  `concurrency`.
   Make room filters stale unloaded IDs out of `unload_first`, lists what else
   holds the pool (components and other apps) when unloading models cannot free
   enough, and says a model cannot fit only when it needs more than the pool's
@@ -236,7 +258,14 @@ build:assets` to check the initial JS budget.
   development forwards `/install/` to the local Agent Service listener. Both
   hosts forward the Computer `teamhub` CLI's `/api/agent/` to
   `TEAMHUB_BASE_URL`, so a Computer needs only the Web origin.
-  Never bundle installers or CLI releases into Web.
+  Never bundle installers or CLI releases into Web. The desktop app's own local
+  server runs with its built-in Computer and ships no `/install/` release, so
+  when `window.lingerDesktop.localServer.owned()` (falling back to
+  `localAccount.available()` on older desktop builds) reports true
+  (`useCliInstallAvailable`), Web hides standalone CLI daemon download, update,
+  and terminal troubleshooting entry points across Computers, LocalComputerGate,
+  and Agent creation; browsers and desktop windows connected to a remote server
+  keep them.
 - Effects owning SSE, WebSocket, polling, timers, or subscriptions may depend only on resource identity; UI callbacks and presentation state must not recreate them. Lifecycle changes require a test proving unrelated rerenders do not resubscribe and identity changes clean up exactly once.
 - Browser configuration for local Vite reads `import.meta.env.VITE_*`
   through the app config boundary. Production builds follow the page origin

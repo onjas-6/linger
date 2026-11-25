@@ -643,3 +643,152 @@ it("prepareRuntime with reuseInstalled falls back to plan and apply when not ins
   expect(descriptors).toHaveLength(1);
   expect(descriptors[0]).toMatchObject({ runtime: "pi", installed: true });
 });
+
+it("delegates Codex auth verification to local-daemon so CC Switch Codex is ready without prompting codex auth", async () => {
+  const options = await fixture();
+  const localmodels = vi.fn(async () => ({
+    code: 0,
+    stdout: JSON.stringify(status("codex", false)),
+    stderr: "",
+  }));
+  const probeRuntimes = vi.fn(async () => [
+    {
+      type: "codex" as const,
+      status: "ready" as const,
+      installed: true,
+      authenticated: true,
+      version: "codex-cli 0.171.0",
+      requiredVersion: "0.166.0",
+      executable: "/opt/homebrew/bin/codex",
+    },
+  ]);
+
+  const outcome = await prepareRuntime(
+    "codex",
+    { ...options, reuseInstalled: true },
+    { localmodels, probeRuntimes },
+  );
+  expect(outcome).toMatchObject({ code: 0, state: "ready" });
+  expect(probeRuntimes).toHaveBeenCalledTimes(1);
+});
+
+it("falls back directly to local-daemon observations when localmodels harness status is unavailable", async () => {
+  const options = await fixture();
+  const localmodels = vi.fn(async () => ({
+    code: 1,
+    stdout: "",
+    stderr: "harness status removed",
+  }));
+  const probeRuntimes = vi.fn(async () => [
+    {
+      type: "claude" as const,
+      status: "ready" as const,
+      installed: true,
+      authenticated: true,
+      version: "2.1.310 (Claude Code)",
+      requiredVersion: "2.1.282",
+      executable: "/Users/me/.local/bin/claude",
+    },
+  ]);
+
+  const inspection = await inspectRuntime("claude", options, {
+    localmodels,
+    probeRuntimes,
+  });
+  expect(inspection).toMatchObject({
+    runtime: "claude",
+    installed: true,
+    ready: true,
+    executable: "/Users/me/.local/bin/claude",
+  });
+  expect(inspection.descriptor.status).toBe("ready");
+});
+
+it("refuses to reuse an incompatible local runtime and passes managed harness paths to local-daemon", async () => {
+  const options = await fixture();
+  const id = "e".repeat(64);
+  const managedClaude = path.join(
+    options.home,
+    "runtime",
+    "harness",
+    "tools",
+    "claude",
+    "2.1.310",
+    "claude",
+  );
+  const localmodels = vi.fn(async (_home: string, args: string[]) => {
+    if (args[1] === "status") {
+      return {
+        code: 0,
+        stdout: JSON.stringify(status("claude", true)),
+        stderr: "",
+      };
+    }
+    if (args[1] === "plan") {
+      await writeFile(
+        args[args.indexOf("--out") + 1]!,
+        JSON.stringify({
+          schema: "localmodels.harness-plan/v1",
+          id,
+          runtime: "claude",
+        }),
+      );
+    }
+    if (args[1] === "apply") {
+      const applied = status("claude", true);
+      applied.runtimes[0]!.executable = managedClaude;
+      return {
+        code: 0,
+        stdout: JSON.stringify(applied),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  let calls = 0;
+  const probeRuntimes = vi.fn(async () => {
+    calls += 1;
+    if (calls === 1) {
+      return [
+        {
+          type: "claude" as const,
+          status: "incompatible" as const,
+          installed: true,
+          authenticated: false,
+          version: "2.1.100 (Claude Code)",
+          requiredVersion: "2.1.282",
+          executable: "/usr/local/bin/claude",
+        },
+      ];
+    }
+    return [
+      {
+        type: "claude" as const,
+        status: "ready" as const,
+        installed: true,
+        authenticated: true,
+        version: "2.1.310 (Claude Code)",
+        requiredVersion: "2.1.282",
+        executable: managedClaude,
+      },
+    ];
+  });
+
+  const outcome = await prepareRuntime(
+    "claude",
+    { ...options, reuseInstalled: true },
+    { localmodels, probeRuntimes },
+  );
+  expect(outcome.state).toBe("ready");
+  expect(localmodels.mock.calls.map(([, args]) => args[1])).toEqual([
+    "status",
+    "plan",
+    "apply",
+  ]);
+  // Second probe verifies the newly installed managed harness binary via configuredPaths.
+  expect(probeRuntimes).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      configuredPaths: { claude: managedClaude },
+    }),
+  );
+});

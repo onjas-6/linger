@@ -419,3 +419,112 @@ it("checks the installation target while keeping tool state in the existing home
     expect.anything(),
   );
 });
+
+it("uses local-daemon as single source of truth even when localmodels omits harness runtime data", async () => {
+  const base = upstream(false);
+  const localmodels = runner({
+    schema: base.schema,
+    facts: base.facts,
+    stack: base.stack,
+  });
+  const probeRuntimes = vi.fn(async () => [
+    {
+      type: "codex" as const,
+      status: "authentication_required" as const,
+      installed: true,
+      authenticated: false,
+      version: "codex-cli 0.171.0",
+      requiredVersion: "0.166.0",
+      executable: "/Applications/Codex.app/Contents/Resources/codex",
+    },
+    {
+      type: "claude" as const,
+      status: "ready" as const,
+      installed: true,
+      authenticated: true,
+      version: "2.1.310 (Claude Code)",
+      requiredVersion: "2.1.282",
+      executable: "/Users/me/.local/bin/claude",
+    },
+    {
+      type: "pi" as const,
+      status: "not_installed" as const,
+      installed: false,
+      authenticated: false,
+      requiredVersion: "1.2.0",
+    },
+  ]);
+
+  const report = await inspectSetup({ localmodels, probeRuntimes });
+  expect(report.recommendation).toBe("claude");
+  expect(report.runtimes.find((r) => r.choice === "claude")).toMatchObject({
+    installed: true,
+    auth: "authenticated",
+    status: "ready",
+    version: "2.1.310 (Claude Code)",
+    requiredVersion: "2.1.282",
+  });
+  expect(report.runtimes.find((r) => r.choice === "codex")).toMatchObject({
+    installed: true,
+    auth: "unauthenticated",
+    status: "authentication_required",
+  });
+});
+
+it("prefers daemon-verified CC Switch Codex as ready and surfaces incompatible local Claude", async () => {
+  const base = upstream(false);
+  const localmodels = runner({
+    ...base,
+    harness: {
+      schema: "localmodels.harness-status/v1",
+      runtimes: [
+        { runtime: "codex", installed: true, authenticated: false },
+        { runtime: "claude", installed: true, authenticated: true },
+        { runtime: "pi", installed: false, authenticated: false },
+      ],
+    },
+    recommendation: "claude",
+  });
+  const probeRuntimes = vi.fn(async () => [
+    {
+      type: "codex" as const,
+      status: "ready" as const,
+      installed: true,
+      authenticated: true,
+      version: "codex-cli 0.171.0",
+      requiredVersion: "0.166.0",
+      executable: "/opt/homebrew/bin/codex",
+    },
+    {
+      type: "claude" as const,
+      status: "incompatible" as const,
+      installed: true,
+      authenticated: false,
+      version: "2.1.100 (Claude Code)",
+      requiredVersion: "2.1.282",
+      executable: "/usr/local/bin/claude",
+    },
+    {
+      type: "pi" as const,
+      status: "not_installed" as const,
+      installed: false,
+      authenticated: false,
+      requiredVersion: "1.2.0",
+    },
+  ]);
+
+  const report = await inspectSetup({ localmodels, probeRuntimes });
+  expect(report.recommendation).toBe("codex");
+  expect(report.runtimes.find((r) => r.choice === "codex")).toMatchObject({
+    installed: true,
+    auth: "authenticated",
+    status: "ready",
+  });
+  expect(report.runtimes.find((r) => r.choice === "claude")).toMatchObject({
+    installed: true,
+    auth: "unauthenticated",
+    status: "incompatible",
+    version: "2.1.100 (Claude Code)",
+    requiredVersion: "2.1.282",
+  });
+});
