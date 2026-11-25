@@ -52,6 +52,8 @@ import { liveInputRate, xaiSpeedTool } from "./xai-live.js";
 
 export const liveDataTopic = "linger.voice.live";
 export const liveReplyTrackName = "linger-live-reply";
+/** "1" while the provider session is open, "0" while it opens or reconnects. */
+export const providerReadyAttribute = "linger.voice_provider_ready";
 const replySampleRate = 24_000;
 const replyChunkSamples = 480;
 /** Local speech this long means the user is talking (16 kHz samples). */
@@ -580,6 +582,23 @@ export class LiveVoiceWorker {
     });
   }
 
+  /**
+   * Tells the browser whether the provider session is open. The call already
+   * listens before then (speech waits in the input buffer), so this only lets
+   * the browser say it is still waking up; it never gates audio.
+   */
+  private announceProviderReady() {
+    const local = this.ctx?.room.localParticipant;
+    if (!local) return;
+    void withTimeout(
+      local.setAttributes({
+        [providerReadyAttribute]: this.session ? "1" : "0",
+      }),
+      1_000,
+      "Voice provider readiness timed out",
+    ).catch(() => undefined);
+  }
+
   /** Logs one connect stage once, in ms since the job entry began. */
   private timing(stage: string) {
     if (this.timed.has(stage)) return;
@@ -664,6 +683,7 @@ export class LiveVoiceWorker {
       this.timing("room_connected");
       const local = room.localParticipant;
       if (!local) throw new Error("Voice Runtime participant is unavailable");
+      this.announceProviderReady();
       this.source = new AudioSource(replySampleRate, 1);
       await local.publishTrack(
         LocalAudioTrack.createAudioTrack(liveReplyTrackName, this.source),
@@ -673,6 +693,7 @@ export class LiveVoiceWorker {
       this.session = await opening;
       if (this.muted) this.session.mute();
       this.markSessionReady();
+      this.announceProviderReady();
       this.timing("session_ready");
       // The call opens with the user, as a person lets the caller start.
       this.userFirstUntil =
@@ -779,6 +800,7 @@ export class LiveVoiceWorker {
           this.queuedUpdates.unshift(...this.pendingSpeech.updates);
         this.clearPendingSpeech();
         this.session = undefined;
+        this.announceProviderReady();
         await new Promise((resolve) =>
           setTimeout(
             resolve,
@@ -787,6 +809,7 @@ export class LiveVoiceWorker {
         );
         try {
           this.session = await this.connectSession();
+          this.announceProviderReady();
           this.flushNotes();
           this.flushUpdates();
         } catch (reconnectError) {
@@ -2148,6 +2171,7 @@ export class LiveVoiceWorker {
               "linger.voice_ready_track": trackSid,
               "linger.voice_ready_at": String(Date.now()),
               "linger.voice_purpose": "chat_live",
+              [providerReadyAttribute]: this.session ? "1" : "0",
             }),
             1_000,
             "Voice input readiness timed out",

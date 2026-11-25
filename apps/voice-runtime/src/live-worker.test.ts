@@ -570,6 +570,13 @@ describe("LiveVoiceWorker", () => {
             expect.objectContaining({ "linger.voice_ready_generation": "1" }),
           ),
         );
+        // ...while the browser still hears that the provider is waking up.
+        expect(readyAttributes()).not.toContainEqual(
+          expect.objectContaining({ "linger.voice_provider_ready": "1" }),
+        );
+        expect(readyAttributes()).toContainEqual(
+          expect.objectContaining({ "linger.voice_provider_ready": "0" }),
+        );
         track.frame(1);
         ready();
       },
@@ -579,6 +586,11 @@ describe("LiveVoiceWorker", () => {
       expect(test.session().audio.length).toBeGreaterThanOrEqual(2),
     );
     expect(test.session().audio[0]![0]).toBe(0);
+    await vi.waitFor(() =>
+      expect(test.localParticipant.setAttributes).toHaveBeenLastCalledWith(
+        expect.objectContaining({ "linger.voice_provider_ready": "1" }),
+      ),
+    );
     await test.shutdown();
   });
 
