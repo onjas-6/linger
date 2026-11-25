@@ -156,15 +156,19 @@ describe("Voice Mode turn delivery", () => {
     await controller.start();
     receive({ kind: "turn", id: "one", text: "Hello", endOffsetMs: 100 });
     await tick();
-    // Waiting for the live verdict, the words stay where the Human sees them.
+    // Waiting for the live verdict, the words stay where the Human sees them,
+    // and nothing is being sent yet.
     expect(controller.getState().text).toBe("Hello");
+    expect(controller.getState().sending).toBe(false);
     queue();
+    expect(controller.getState().sending).toBe(true);
     // The outbox shows the turn now, so the words leave in the same moment
     // rather than showing twice until the server answers.
     expect(controller.getState().text).toBe("");
     accept();
     await controller.whenDeliverySettles();
     expect(controller.getState().text).toBe("");
+    expect(controller.getState().sending).toBe(false);
   });
   it.each(["success", "failure"] as const)(
     "keeps an in-flight send out of the exit draft until its %s settles",

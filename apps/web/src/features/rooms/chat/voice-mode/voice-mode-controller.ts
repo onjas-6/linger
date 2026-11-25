@@ -82,6 +82,8 @@ export class VoiceModeController {
   private partial = { text: "", endOffsetMs: -1 };
   private carriedText = "";
   private inFlightId?: string;
+  /** A delivery pump is running; only one runs at a time. */
+  private delivering = false;
   private deliveryCompletion: Promise<void> = Promise.resolve();
   private deliveryFailed = false;
   private readonly seen = new Set<string>();
@@ -300,20 +302,22 @@ export class VoiceModeController {
   }
 
   private async deliver(manualRetry = false) {
-    if (this.state.sending || (!this.automatic && !manualRetry)) return;
+    if (this.delivering || (!this.automatic && !manualRetry)) return;
     let done!: () => void;
     this.deliveryCompletion = new Promise<void>((resolve) => {
       done = resolve;
     });
-    this.publish({ sending: true });
+    this.delivering = true;
+    this.publish({});
     try {
       await this.deliverHead(manualRetry, maximumQueuedTurns);
     } catch (error) {
       this.deliveryFailed = true;
       this.fail(error);
     } finally {
+      this.delivering = false;
       this.inFlightId = undefined;
-      this.publish({ sending: false });
+      this.publish({});
       done();
     }
     if (this.automatic && !this.state.error && this.queue.length)
@@ -399,6 +403,10 @@ export class VoiceModeController {
     // Submitted text is retained by the ordinary durable outbox, not also
     // copied into an editable draft while its result is still unknown.
     const heardText = queuedText.filter(Boolean).join("\n");
+    // A live turn waiting for its reply to end is not being sent yet: it
+    // shows as heard words, and sending starts once the outbox has it.
+    const inFlight = this.queue.find((turn) => turn.id === this.inFlightId);
+    const waiting = Boolean(inFlight?.send?.keepsText && !inFlight.queued);
     const speakingText = [
       this.carriedText,
       ...[...this.speech.values()].map((part) => part.text),
@@ -409,6 +417,7 @@ export class VoiceModeController {
     this.state = {
       ...this.state,
       ...update,
+      sending: this.delivering && !waiting,
       text: [heardText, speakingText].filter(Boolean).join("\n"),
       heardText,
       speakingText,
