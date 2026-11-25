@@ -530,7 +530,7 @@ async function runNativeSource(
       let byokGateway: ByokGatewayFailure | undefined;
       let localModelsDegraded: LocalModelsDegraded | undefined;
       let localModelsRestored = false;
-      const restoredLocalModels: string[] = [];
+      const restoredLocalModels = new Set<string>();
       const resumeLocalModels =
         Boolean(options.resume || options.degradeLocalModels) &&
         !options.setupChoice &&
@@ -550,10 +550,7 @@ async function runNativeSource(
             onEvent: emit,
             onRestored: (models) => {
               localModelsRestored = true;
-              for (const id of models) {
-                if (!restoredLocalModels.includes(id))
-                  restoredLocalModels.push(id);
-              }
+              for (const id of models) restoredLocalModels.add(id);
             },
           });
           if (restored) {
@@ -732,14 +729,16 @@ async function runNativeSource(
                 (runtimeOutcome.details as { code?: string } | undefined)
                   ?.code === "RUNTIME_AUTH_REQUIRED")
             ) {
-              if (options.setupChoice !== undefined)
+              const hasPendingLocal =
+                options.setupChoice === undefined &&
+                (await hasPendingLibraryModelsToRestore(home));
+              if (options.setupChoice !== undefined || !hasPendingLocal)
                 runtimeOutcome =
                   (await applyNativeSource(home, "subscription", choice, {
                     signal,
                     onEvent: emit,
                   })) ?? runtimeOutcome;
-              else if (await hasPendingLibraryModelsToRestore(home))
-                await restoreSavedLocalModel();
+              else await restoreSavedLocalModel();
             } else if (
               choice === "pi" &&
               options.setupChoice === undefined &&
@@ -1474,7 +1473,9 @@ async function runNativeSource(
               ...(byokGateway ? { byokGateway } : {}),
               ...(localModelsDegraded ? { localModelsDegraded } : {}),
               ...(localModelsRestored ? { localModelsRestored: true } : {}),
-              ...(restoredLocalModels.length ? { restoredLocalModels } : {}),
+              ...(restoredLocalModels.size
+                ? { restoredLocalModels: [...restoredLocalModels] }
+                : {}),
             },
           };
         }
@@ -1519,7 +1520,9 @@ async function runNativeSource(
               ...(byokGateway ? { byokGateway } : {}),
               ...(localModelsDegraded ? { localModelsDegraded } : {}),
               ...(localModelsRestored ? { localModelsRestored: true } : {}),
-              ...(restoredLocalModels.length ? { restoredLocalModels } : {}),
+              ...(restoredLocalModels.size
+                ? { restoredLocalModels: [...restoredLocalModels] }
+                : {}),
               ...(authPending && typeof runtimeOutcome?.details === "object"
                 ? runtimeOutcome.details
                 : {}),

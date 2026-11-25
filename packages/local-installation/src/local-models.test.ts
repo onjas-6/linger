@@ -16,6 +16,7 @@ import {
   prepareLocalModels,
   localModelsEnvironment,
   reasonCodeList,
+  restoreByokSource,
   restoreLocalModels,
   stackProgress,
   localModelsLockFile,
@@ -2537,10 +2538,13 @@ test("restores multiple models in local mode, preserves savedRuntimeModel as pri
   expect(await readResumeLocalModels(f.home)).toBeUndefined();
 });
 
-test("respects an explicit empty resume record from an intentional unload", async () => {
-  const f = await stoppedLocalSetup("local");
+test("respects an explicit empty resume record from an intentional unload without blocking stack recovery", async () => {
+  // With a saved Quick Install plan stopped at quit, `stack up` still brings
+  // the stack and gateway back up, while `models: []` prevents reloading the
+  // intentionally unloaded library model.
+  const withPlan = await stoppedLocalSetup("local");
   await writeFile(
-    path.join(f.home, "runtime/localmodels/state/model-source.json"),
+    path.join(withPlan.home, "runtime/localmodels/state/model-source.json"),
     JSON.stringify({
       schema: "localmodels.model-source/v1",
       mode: "local",
@@ -2552,12 +2556,118 @@ test("respects an explicit empty resume record from an intentional unload", asyn
     }),
     { mode: 0o600 },
   );
-  await writeResumeLocalModels(f.home, []);
+  await writeResumeLocalModels(withPlan.home, []);
   expect(
-    await restoreLocalModels(f.instance, f.options, { localmodels: f.call }),
+    await restoreLocalModels(withPlan.instance, withPlan.options, {
+      localmodels: withPlan.call,
+    }),
   ).toBeUndefined();
-  expect(f.call).not.toHaveBeenCalled();
-  expect(await readResumeLocalModels(f.home)).toEqual([]);
+  expect(commands(withPlan)).toContain("stack up");
+  expect(commands(withPlan)).not.toContain("library load");
+  expect(withPlan.call.mock.calls.at(-1)![1]).not.toContain("--model");
+
+  // Without a saved stack plan (library-only local mode), an explicit empty
+  // resume record avoids invoking localmodels altogether.
+  const withoutPlan = await fixture();
+  await writeSetupChoice(withoutPlan.instance, "claude");
+  const state = localmodelsStateDirectory(withoutPlan.home);
+  await mkdir(state, { recursive: true });
+  await writeFile(
+    path.join(state, "model-source.json"),
+    JSON.stringify({
+      schema: "localmodels.model-source/v1",
+      mode: "local",
+      runtime: "pi",
+      runtime_model: "localmodels-library/model-a/Model-A",
+      model_label: null,
+      gateway_url: "http://127.0.0.1:18480",
+      environment: {},
+    }),
+    { mode: 0o600 },
+  );
+  await writeResumeLocalModels(withoutPlan.home, []);
+  expect(
+    await restoreLocalModels(withoutPlan.instance, withoutPlan.options, {
+      localmodels: withoutPlan.call,
+    }),
+  ).toBeUndefined();
+  expect(withoutPlan.call).not.toHaveBeenCalled();
+  expect(await readResumeLocalModels(withoutPlan.home)).toEqual([]);
+});
+
+test("snapshots on-disk loaded library models in restoreByokSource before BYOK source apply unloads them", async () => {
+  const f = await fixture();
+  await writeSetupChoice(f.instance, "claude");
+  const state = localmodelsStateDirectory(f.home);
+  const modelsDir = path.join(state, "library", "models");
+  await mkdir(modelsDir, { recursive: true });
+  await writeFile(
+    path.join(state, "model-source.json"),
+    JSON.stringify({
+      schema: "localmodels.model-source/v1",
+      mode: "byok",
+      runtime: "pi",
+      runtime_model: "localmodels-byok/my-model",
+      model_label: "my-model",
+      gateway_url: "http://127.0.0.1:18480",
+      environment: {},
+    }),
+    { mode: 0o600 },
+  );
+  const recordFile = path.join(modelsDir, "spark.json");
+  await writeFile(
+    recordFile,
+    JSON.stringify({ id: "spark-x2.6-4b:Q4_K_M", state: "loaded" }),
+    { mode: 0o644 },
+  );
+  f.call.mockImplementation(async (...a) => {
+    if (a[1][0] === "source" && a[1][1] === "apply") {
+      // Simulate `localmodels source apply --mode byok` unloading loaded models
+      // and marking their on-disk library record idle.
+      await writeFile(
+        recordFile,
+        JSON.stringify({ id: "spark-x2.6-4b:Q4_K_M", state: "idle" }),
+        { mode: 0o644 },
+      );
+      return { code: 0, stdout: "{}", stderr: "" };
+    }
+    if (a[1][0] === "library" && a[1][1] === "status") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          schema: "localmodels.library-status/v1",
+          models: [{ id: "spark-x2.6-4b:Q4_K_M", state: "idle" }],
+        }),
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "{}", stderr: "" };
+  });
+
+  const byokFailure = await restoreByokSource(f.home, f.options, {
+    localmodels: f.call,
+    fetch: async () => {
+      throw new Error("connection refused");
+    },
+  });
+  expect(byokFailure).toBeUndefined();
+  expect(await readResumeLocalModels(f.home)).toEqual(["spark-x2.6-4b:Q4_K_M"]);
+
+  const restored: string[][] = [];
+  expect(
+    await restoreLocalModels(
+      f.instance,
+      { ...f.options, onRestored: (models) => restored.push(models) },
+      { localmodels: f.call },
+    ),
+  ).toBeUndefined();
+  expect(commands(f)).toEqual([
+    "source apply",
+    "library status",
+    "library load",
+  ]);
+  expect(restored).toEqual([["spark-x2.6-4b:Q4_K_M"]]);
+  expect(await readResumeLocalModels(f.home)).toBeUndefined();
 });
 
 test("continues restoring remaining models after a partial failure and preserves pending models on abort", async () => {

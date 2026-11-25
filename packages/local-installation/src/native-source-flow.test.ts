@@ -745,6 +745,58 @@ test("a cold resume in local-models mode restores models from resume-models.json
   expect(applyNativeSource).not.toHaveBeenCalled();
 });
 
+test("a legacy subscription restart without model-source.json preserves source apply when idle and avoids unloading when local models are pending", async () => {
+  const f = await fixture();
+  vi.mocked(prepareRuntime).mockResolvedValue({
+    code: 0,
+    state: "ready",
+    message: "ok",
+  });
+  await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-flow",
+    setupChoice: "codex",
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  // No model-source.json on disk and no pending local models: creates
+  // model-source.json via source apply --mode subscription.
+  vi.mocked(applyNativeSource).mockClear();
+  vi.mocked(restoreLocalModels).mockClear();
+  const migrated = await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-flow",
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(migrated.code).toBe(0);
+  expect(applyNativeSource).toHaveBeenCalledWith(
+    path.resolve(f.home),
+    "subscription",
+    "codex",
+    { signal: expect.any(AbortSignal), onEvent: expect.any(Function) },
+  );
+  expect(restoreLocalModels).not.toHaveBeenCalled();
+
+  // With pending local models and still no model-source.json: skips
+  // subscription source apply so active local models are not unloaded.
+  await writeResumeLocalModels(f.home, ["spark-x2.6-4b:Q4_K_M"]);
+  vi.mocked(applyNativeSource).mockClear();
+  vi.mocked(restoreLocalModels).mockClear();
+  const preserved = await installNativeSource({
+    home: f.home,
+    repo: f.repo,
+    name: "native-flow",
+    signal: new AbortController().signal,
+    onEvent: () => {},
+  });
+  expect(preserved.code).toBe(0);
+  expect(applyNativeSource).not.toHaveBeenCalled();
+  expect(restoreLocalModels).toHaveBeenCalledTimes(1);
+});
+
 test("a restart keeps a saved local source as before", async () => {
   const { result } = await restartAfter("local-models", {
     mode: "local",

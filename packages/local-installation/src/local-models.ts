@@ -33,6 +33,7 @@ import {
   readOnDiskLoadedLibraryModels,
   readResumeLocalModels,
   runLocalmodels,
+  uniqueLibraryModelIds,
   writeResumeLocalModels,
 } from "./localmodels-tool.js";
 import {
@@ -787,7 +788,21 @@ export async function restoreByokSource(
   // gateway that answers before it ends is not proof that it stays up.
   const held = await waitForLocalModelsLock(
     home,
-    () => mountSavedByokSource(home, source, options, dependencies),
+    async () => {
+      // `source apply --mode byok` unloads any library models marked `loaded`
+      // on disk (e.g. after a crash or reboot when no `resume-models.json`
+      // exists). Snapshot them into `resume-models.json` first so the
+      // following `restoreLocalModels` still brings them back.
+      const onDiskLoaded = await readOnDiskLoadedLibraryModels(home);
+      if (onDiskLoaded.length > 0) {
+        const existing = await readResumeLocalModels(home);
+        await writeResumeLocalModels(home, [
+          ...(existing ?? []),
+          ...onDiskLoaded,
+        ]).catch(() => undefined);
+      }
+      return mountSavedByokSource(home, source, options, dependencies);
+    },
     options.signal,
     dependencies,
   );
@@ -1108,20 +1123,6 @@ export function isLocalRuntimeModel(runtimeModel: string): boolean {
   );
 }
 
-function mergeUniqueIds(
-  primary: readonly string[],
-  secondary: readonly string[],
-): string[] {
-  const seen = new Set<string>();
-  const merged: string[] = [];
-  for (const id of [...primary, ...secondary]) {
-    if (!isLibraryModelId(id) || seen.has(id)) continue;
-    seen.add(id);
-    merged.push(id);
-  }
-  return merged;
-}
-
 function stoppedDownloadOutcome(
   failedTarget: ObservedFailedLibraryModel,
 ): InstallOutcome {
@@ -1368,12 +1369,14 @@ export async function restoreLocalModels(
     source?.mode === "local" || (!source && setupChoice === "local-models");
   const explicitlyEmptyResume =
     resumeFileModels !== undefined && resumeFileModels.length === 0;
-  const wantedModelIds = mergeUniqueIds(resumeFileModels ?? [], onDiskLoaded);
+  const wantedModelIds = uniqueLibraryModelIds([
+    ...(resumeFileModels ?? []),
+    ...onDiskLoaded,
+  ]);
 
-  // Respect an explicit stop that found downloaded models all intentionally
-  // unloaded (unless a model was subsequently loaded on disk).
-  if (explicitlyEmptyResume && wantedModelIds.length === 0) return;
-
+  // Respect an explicit empty stop record when deciding whether to fall back
+  // to `savedRuntimeModel`, while still letting `needsStack` bring a stopped
+  // Quick Install stack and gateway back up on warm resume.
   const savedRuntimeModel = source?.mode === "local" ? source.runtimeModel : "";
   const wantsFallbackSavedRuntimeModel =
     isLocalSource &&

@@ -110,16 +110,14 @@ export async function resumeSourceInstance(
     // Models page to manage local models or choose another AI runtime.
     let localModelsDegraded: LocalModelsDegraded | undefined;
     let localModelsRestored = false;
-    const restoredLocalModels: string[] = [];
+    const restoredLocalModels = new Set<string>();
     try {
       const restored = await restore(instance, {
         signal: options.signal,
         onEvent,
         onRestored: (models) => {
           localModelsRestored = true;
-          for (const id of models) {
-            if (!restoredLocalModels.includes(id)) restoredLocalModels.push(id);
-          }
+          for (const id of models) restoredLocalModels.add(id);
         },
       });
       if (restored)
@@ -142,7 +140,9 @@ export async function resumeSourceInstance(
         ...(byokGateway ? { byokGateway } : {}),
         ...(localModelsDegraded ? { localModelsDegraded } : {}),
         ...(localModelsRestored ? { localModelsRestored: true } : {}),
-        ...(restoredLocalModels.length ? { restoredLocalModels } : {}),
+        ...(restoredLocalModels.size
+          ? { restoredLocalModels: [...restoredLocalModels] }
+          : {}),
       },
     };
   }

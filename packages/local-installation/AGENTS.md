@@ -301,8 +301,10 @@ Bifrost gateway on every resume (warm, or a restart from the saved choice,
 which then prepares the saved runtime and no other source) BEFORE restoring
 local library models, because `source apply --mode byok` unloads local models
 before mounting BYOK on Bifrost. Under the same
-lock, waiting as the restore check does, it skips a loopback gateway whose
-`/health` answers, otherwise runs `source apply` from the kit's saved
+lock, waiting as the restore check does, it first snapshots any on-disk
+`state: "loaded"` library records into `resume-models.json` (so crash/reboot
+recovery survives BYOK unloading them to `idle`), then skips a loopback gateway
+whose `/health` answers, otherwise runs `source apply` from the kit's saved
 configuration, so the key never passes through Node. Each re-mount sends
 the kit's one small probe request to the person's endpoint and adds a few
 seconds to a launch after a quit. A failure (`LOCAL_MODELS_BUSY` when the

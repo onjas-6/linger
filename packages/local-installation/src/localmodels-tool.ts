@@ -583,7 +583,8 @@ export function isLibraryModelId(id: unknown): id is string {
   return typeof id === "string" && LIBRARY_MODEL_ID_PATTERN.test(id);
 }
 
-function uniqueLibraryModelIds(values: readonly unknown[]): string[] {
+/** Filters valid library model IDs and deduplicates them in order. */
+export function uniqueLibraryModelIds(values: readonly unknown[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
   for (const value of values) {
