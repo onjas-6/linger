@@ -56,6 +56,17 @@ const serviceFeatureLocalModelUnavailable = "local_model_unavailable"
 // execution_failed to it instead.
 const serviceFeatureModelGatewayUnavailable = "model_gateway_unavailable"
 
+// serviceFeatureLocalModelsAdmissionV2 in runner.welcome's service_features
+// says the Agent Service accepts elastic admission metadata on LocalModel,
+// LocalModelError, and LocalModelActionRefusal rows. Older services close the
+// connection on unknown properties.
+const serviceFeatureLocalModelsAdmissionV2 = "local_models_admission_v2"
+
+// serviceFeatureLocalModelLoadingStatus in runner.welcome's service_features
+// says the Agent Service accepts pre-run.started status.changed events carrying
+// stage loading_local_model while EnsureLoaded wakes a standby model.
+const serviceFeatureLocalModelLoadingStatus = "local_model_loading_status"
+
 // LocalModelLibrary runs the actions a Computer owner chooses on this
 // Computer's localmodels library. The Daemon never picks a model: on its
 // own it loads only the downloaded model a Run's Agent already names, and it
@@ -70,6 +81,9 @@ type LocalModelLibrary interface {
 	// piModel when it is not loaded, and waits for it. It returns nil when
 	// piModel names no library model.
 	EnsureLoaded(ctx context.Context, piModel string) error
+	// WillLoad reports whether EnsureLoaded will load or wait on a load for
+	// piModel before the Runtime can start.
+	WillLoad(piModel string) bool
 	// IsStandbyModel reports whether piModel names a known local library model
 	// that is currently unloaded or otherwise not loaded.
 	IsStandbyModel(piModel string) bool
@@ -79,6 +93,15 @@ type LocalModelLibrary interface {
 	// AcquireUse holds an active use lease for piModel until the returned
 	// release callback runs, preventing idle auto-unload while work runs.
 	AcquireUse(piModel string) func()
+}
+
+// willLoadLocalModel reports whether a Pi Run targeting model will trigger a
+// local model load before the Runtime starts.
+func (d *Daemon) willLoadLocalModel(runtimeType, model string) bool {
+	if d.localModels == nil || runtimeType != "pi" || model == "" {
+		return false
+	}
+	return d.localModels.WillLoad(model)
 }
 
 // acquireLocalModelUse holds an active use lease on a Pi local model while a
@@ -163,6 +186,9 @@ func (d *Daemon) PublishLocalModels(snapshot wire.LocalModelsSnapshot) {
 	if !d.localModelsExternalHolders.Load() {
 		snapshot = stripLocalModelsExternalHolders(snapshot)
 	}
+	if !d.localModelsAdmissionV2.Load() {
+		snapshot = stripLocalModelsAdmissionV2(snapshot)
+	}
 	d.localModelsRevision++
 	sentAt := time.Now().UTC()
 	frame := wire.RunnerLocalModels{
@@ -196,7 +222,12 @@ func (d *Daemon) handleLocalModelsCommand(ctx context.Context, stream transport.
 		slog.Info("local_models.command_expired", "action", request.Action, "model", request.ModelID)
 		return nil
 	}
-	action := localmodels.Action{Name: request.Action, Model: request.ModelID, UnloadFirst: request.UnloadFirst}
+	action := localmodels.Action{
+		Name:        request.Action,
+		Model:       request.ModelID,
+		UnloadFirst: request.UnloadFirst,
+		Force:       request.Force != nil && *request.Force,
+	}
 	var refusal *wire.LocalModelActionRefusal
 	switch {
 	case request.RunnerID != d.computerID || !d.ownedBy(request.TenantID, request.OwnerActorID):
@@ -236,6 +267,9 @@ func (d *Daemon) handleLocalModelsCommand(ctx context.Context, stream transport.
 		if !d.localModelsDiagnostics.Load() {
 			wireRefusal = downgradeLocalModelActionRefusal(wireRefusal)
 		}
+		if !d.localModelsAdmissionV2.Load() {
+			wireRefusal = stripLocalModelActionRefusalAdmissionV2(wireRefusal)
+		}
 		route = protocol.EventCapabilityLocalModelsRefused
 		frame = wire.CapabilityLocalModelsRefused{
 			ProtocolVersion: request.ProtocolVersion, CommandID: request.CommandID, RunnerID: request.RunnerID,
@@ -262,9 +296,9 @@ func (d *Daemon) handleLocalModelsCommand(ctx context.Context, stream transport.
 func validLocalModelAction(action localmodels.Action) bool {
 	switch action.Name {
 	case localmodels.ActionRefresh:
-		return action.Model == "" && len(action.UnloadFirst) == 0
+		return action.Model == "" && len(action.UnloadFirst) == 0 && !action.Force
 	case localmodels.ActionDownload, localmodels.ActionCancel, localmodels.ActionUnload, localmodels.ActionRemove:
-		return localmodels.ValidModelID(action.Model) && len(action.UnloadFirst) == 0
+		return localmodels.ValidModelID(action.Model) && len(action.UnloadFirst) == 0 && !action.Force
 	case localmodels.ActionLoad:
 		if !localmodels.ValidModelID(action.Model) {
 			return false
@@ -365,6 +399,45 @@ func stripLocalModelsExternalHolders(snapshot wire.LocalModelsSnapshot) wire.Loc
 	}
 	snapshot.Pools = pools
 	return snapshot
+}
+
+// stripLocalModelsAdmissionV2 omits elastic admission metadata when talking to
+// an Agent Service that did not announce serviceFeatureLocalModelsAdmissionV2.
+func stripLocalModelsAdmissionV2(snapshot wire.LocalModelsSnapshot) wire.LocalModelsSnapshot {
+	if len(snapshot.Models) == 0 {
+		return snapshot
+	}
+	models := make([]wire.LocalModel, len(snapshot.Models))
+	for i, model := range snapshot.Models {
+		model.MinimumMemoryBytes = nil
+		model.Degraded = nil
+		model.RequestedPosture = nil
+		model.EffectivePosture = nil
+		model.DegradationReason = ""
+		model.MemoryPressureWarning = nil
+		model.OomRetries = nil
+		model.Forced = nil
+		if model.Error != nil {
+			copied := *model.Error
+			copied.Pool = ""
+			copied.NeedBytes = nil
+			copied.FreeBytes = nil
+			copied.ShortfallBytes = nil
+			copied.CanForce = nil
+			model.Error = &copied
+		}
+		models[i] = model
+	}
+	snapshot.Models = models
+	return snapshot
+}
+
+// stripLocalModelActionRefusalAdmissionV2 omits elastic admission refusal
+// fields when talking to an Agent Service without local_models_admission_v2.
+func stripLocalModelActionRefusalAdmissionV2(refusal wire.LocalModelActionRefusal) wire.LocalModelActionRefusal {
+	refusal.ShortfallBytes = nil
+	refusal.CanForce = nil
+	return refusal
 }
 
 func downgradeLocalModelActionRefusal(refusal wire.LocalModelActionRefusal) wire.LocalModelActionRefusal {

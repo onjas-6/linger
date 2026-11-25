@@ -126,6 +126,18 @@ Progress and outcomes travel back only as snapshots:
    knows `model_gateway_unavailable` reports a Run whose local model gateway it
    could not start or reach with `model_gateway_unavailable` instead of
    `execution_failed`.
+   Elastic admission metadata (`minimum_memory_bytes`, `degraded`,
+   `requested_posture`, `effective_posture`, `degradation_reason`,
+   `memory_pressure_warning`, `oom_retries`, `forced`, and `shortfall_bytes` /
+   `can_force` on `LocalModelError` and `LocalModelActionRefusal`) travels only
+   when `service_features` declares `local_models_admission_v2`; otherwise the
+   Daemon strips those fields for older Agent Services.
+   Pre-`run.started` `status.changed` events with `status: "queued"` and
+   `stage: "loading_local_model"` are emitted before `ensureLocalModel` only
+   when `service_features` declares `local_model_loading_status`.
+   `execute` `local_models` with `action: "load"` also accepts optional
+   `force: true` to pass `--force` when the owner overrides a refusal with
+   `can_force: true`.
    `execute` `model_invoke` carries optional `wake_local_model` (default `true`
    when omitted; sent only to Computer 0.65.0 and later,
    `FIRST_MODEL_INVOKE_WAKE_LOCAL_MODEL_COMPUTER_VERSION`) so passive

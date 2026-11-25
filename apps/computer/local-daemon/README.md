@@ -213,7 +213,12 @@ downloaded model that Run's Agent names.
   handling runs off the connection loop.
 - Before a Run. A Pi Run whose model is a library row's `pi_model` reaches
   the Daemon because the Pi catalog lists every downloaded library model
-  (Pi catalog below), and waits until that model is loaded. A model no row of the last readable snapshot
+  (Pi catalog below), and waits until that model is loaded. When
+  `d.localModels.WillLoad(model)` reports that the model needs to load (or wait
+  on an active load) and `runner.welcome`'s `service_features` names
+  `local_model_loading_status`, the Daemon emits a pre-`run.started`
+  `status.changed` event (`status: "queued", stage: "loading_local_model"`)
+  before blocking in `EnsureLoaded`. A model no row of the last readable snapshot
   names (a BYOK or setup-stack model) costs no tool call and no wait; once
   the installer lock wait below has ended, neither does a model that
   snapshot shows loaded while its loopback engine `/health` (and saved local
@@ -332,6 +337,15 @@ downloaded model that Run's Agent names.
   cached, omit `concurrency` for that load so scheduling falls back to
   adaptive limits, and retry on the next load. Models with omitted or `<= 1`
   configured concurrency skip probing.
+  Elastic admission metadata (`minimum_memory_bytes`, `degraded`,
+  `requested_posture`, `effective_posture`, `degradation_reason`,
+  `memory_pressure_warning`, `oom_retries`, `forced` on `LocalModel`, plus
+  `pool`, `need_bytes`, `free_bytes`, `shortfall_bytes`, `can_force` on
+  `LocalModelError` and `shortfall_bytes`, `can_force` on
+  `LocalModelActionRefusal`) is sanitized forward-compatibly and sent only when
+  `runner.welcome`'s `service_features` names `local_models_admission_v2`; it
+  is stripped otherwise. `load` commands may carry `force: true` (passed to
+  `localmodels library load --force`).
   The snapshot is sent after
   every welcome, after every action or job end, and at most every 2 seconds
   for progress. When a job enters the `download` phase, the Daemon publishes

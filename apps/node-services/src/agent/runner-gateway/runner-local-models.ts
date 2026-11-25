@@ -13,6 +13,8 @@ import {
 import { TeamHubRuntimeStateError } from "../executor/teamhub-runtime-state-client.js";
 import { logAgentEvent } from "../observability/agent-log.js";
 import {
+  FIRST_LOCAL_MODELS_FORCE_LOAD_COMPUTER_VERSION,
+  isComputerVersionAtLeast,
   LocalComputerCapabilityError,
   LocalComputerNotFoundError,
   LocalComputerOfflineError,
@@ -43,6 +45,8 @@ export interface LocalModelActionCommand {
   readonly modelId?: string;
   /** Only for load. */
   readonly unloadFirst?: readonly string[];
+  /** Only for load. Override the memory safety guard when allowed. */
+  readonly force?: boolean;
   readonly expiresAt: string;
   readonly signal?: AbortSignal;
 }
@@ -202,6 +206,17 @@ export class RunnerLocalModels {
         "Local Computer has not reported a model library",
       );
     }
+    if (
+      command.force &&
+      !isComputerVersionAtLeast(
+        connection.hello.daemon_version,
+        FIRST_LOCAL_MODELS_FORCE_LOAD_COMPUTER_VERSION,
+      )
+    ) {
+      throw new LocalComputerCapabilityError(
+        "Local Computer must be updated before force loading a model",
+      );
+    }
     const commandId = this.context.createId();
     const envelope = parseAgentToDaemonEnvelope({
       type: "execute",
@@ -218,6 +233,7 @@ export class RunnerLocalModels {
       ...(command.unloadFirst === undefined
         ? {}
         : { unload_first: [...command.unloadFirst] }),
+      ...(command.force ? { force: true } : {}),
     });
     const signal = command.signal;
     let onAbort: (() => void) | undefined;

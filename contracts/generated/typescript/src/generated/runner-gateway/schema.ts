@@ -214,6 +214,8 @@ export const runnerGatewayEnvelopeSchema = {
         "local_model_unavailable",
         "model_gateway_unavailable",
         "local_models_external_holders",
+        "local_models_admission_v2",
+        "local_model_loading_status",
       ],
     },
     Timestamp: {
@@ -2570,6 +2572,28 @@ export const runnerGatewayEnvelopeSchema = {
           minLength: 1,
           maxLength: 4096,
         },
+        pool: {
+          description: "With LOAD_NO_ROOM.",
+          $ref: "#/$defs/LocalModelPoolId",
+        },
+        need_bytes: {
+          description: "With LOAD_NO_ROOM.",
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+        free_bytes: {
+          description: "With LOAD_NO_ROOM.",
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+        shortfall_bytes: {
+          description:
+            "Minimum additional free memory needed to load even at the lowest posture rung.",
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+        can_force: {
+          description:
+            "True when the owner may override admission with Load Anyway (--force).",
+          type: "boolean",
+        },
       },
     },
     LocalModelNote: {
@@ -2617,6 +2641,65 @@ export const runnerGatewayEnvelopeSchema = {
         "Inference engine family that runs this model entry. Never inferred from name or description.",
       type: "string",
       enum: ["llama.cpp", "polystrata", "strata"],
+    },
+    LocalModelKvQuant: {
+      description:
+        "Symmetric KV-cache quantization of a model posture; omitted when asymmetric or unknown.",
+      type: "string",
+      enum: ["f16", "q8_0", "q4_0"],
+    },
+    LocalModelPosture: {
+      description:
+        "Context length, concurrent slots, and optional KV-cache quantization for a loaded or requested model posture.",
+      type: "object",
+      additionalProperties: false,
+      required: ["context_tokens", "slots"],
+      properties: {
+        context_tokens: {
+          $ref: "#/$defs/PositiveInteger",
+        },
+        slots: {
+          type: "integer",
+          minimum: 1,
+          maximum: 64,
+        },
+        kv_cache_quant: {
+          $ref: "#/$defs/LocalModelKvQuant",
+        },
+      },
+    },
+    LocalModelDegradationReason: {
+      description:
+        "Why a loaded model stepped down from its requested posture or overrode normal memory headroom.",
+      type: "string",
+      enum: [
+        "reduced_slots",
+        "reduced_context",
+        "above_soft_budget",
+        "oom_retry",
+        "forced_overcommit",
+      ],
+    },
+    LocalModelPressureWarning: {
+      description: "Present when loaded under tight memory without failing.",
+      type: "object",
+      additionalProperties: false,
+      required: ["level"],
+      properties: {
+        level: {
+          type: "string",
+          enum: ["soft", "high"],
+        },
+        pool: {
+          $ref: "#/$defs/LocalModelPoolId",
+        },
+        free_bytes: {
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+        budget_bytes: {
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+      },
     },
     LocalModel: {
       description:
@@ -2808,6 +2891,48 @@ export const runnerGatewayEnvelopeSchema = {
             "Additional host system RAM used alongside GPU VRAM for hybrid offload engines. Sent only when runner.welcome service_features names local_models_engine.",
           $ref: "#/$defs/NonNegativeInteger",
         },
+        minimum_memory_bytes: {
+          description:
+            "Estimated footprint at the lowest elastic posture rung (floor context and 1 slot). Sent only when runner.welcome service_features names local_models_admission_v2.",
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+        degraded: {
+          description:
+            "True when loaded on a lower-memory posture rung than requested or after an OOM retry. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          type: "boolean",
+        },
+        requested_posture: {
+          description:
+            "Requested posture before elastic step-down. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          $ref: "#/$defs/LocalModelPosture",
+        },
+        effective_posture: {
+          description:
+            "Effective loaded posture. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          $ref: "#/$defs/LocalModelPosture",
+        },
+        degradation_reason: {
+          description:
+            "Why the loaded model stepped down or overrode normal memory headroom. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          $ref: "#/$defs/LocalModelDegradationReason",
+        },
+        memory_pressure_warning: {
+          description:
+            "Present when loaded under tight memory without failing. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          $ref: "#/$defs/LocalModelPressureWarning",
+        },
+        oom_retries: {
+          description:
+            "Number of automatic OOM step-down retries taken before this load succeeded; omitted when 0. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          type: "integer",
+          minimum: 0,
+          maximum: 64,
+        },
+        forced: {
+          description:
+            "True when loaded via --force overriding normal memory headroom checks; omitted when false. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          type: "boolean",
+        },
       },
     },
     LocalModelsUnavailableReason: {
@@ -2912,6 +3037,11 @@ export const runnerGatewayEnvelopeSchema = {
                 $ref: "#/$defs/LocalModelId",
               },
             },
+            force: {
+              description:
+                "Only for load. Override the memory safety guard when the Computer allows forced loading.",
+              type: "boolean",
+            },
           },
           if: {
             properties: {
@@ -2924,6 +3054,7 @@ export const runnerGatewayEnvelopeSchema = {
             properties: {
               model_id: false,
               unload_first: false,
+              force: false,
             },
           },
           else: {
@@ -2946,6 +3077,7 @@ export const runnerGatewayEnvelopeSchema = {
           else: {
             properties: {
               unload_first: false,
+              force: false,
             },
           },
         },
@@ -3016,6 +3148,16 @@ export const runnerGatewayEnvelopeSchema = {
           description:
             "With LOAD_NO_ROOM, MEMORY_INSUFFICIENT or DISK_INSUFFICIENT.",
           $ref: "#/$defs/NonNegativeInteger",
+        },
+        shortfall_bytes: {
+          description:
+            "With LOAD_NO_ROOM. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          $ref: "#/$defs/NonNegativeInteger",
+        },
+        can_force: {
+          description:
+            "With LOAD_NO_ROOM. Sent only when runner.welcome service_features names local_models_admission_v2.",
+          type: "boolean",
         },
       },
     },
@@ -5171,6 +5313,22 @@ export const runnerGatewayEnvelopeSchema = {
             },
             dispatched_at_unix_ms: {
               $ref: "#/$defs/NonNegativeInteger",
+            },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["type", "status", "stage"],
+          properties: {
+            type: {
+              const: "status.changed",
+            },
+            status: {
+              const: "queued",
+            },
+            stage: {
+              enum: ["loading_local_model"],
             },
           },
         },

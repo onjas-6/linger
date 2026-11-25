@@ -166,6 +166,10 @@ export interface ExecutionSpec {
     event: RuntimeStopHookEvent,
     signal: AbortSignal,
   ) => Promise<RuntimeStopHookDecision>;
+  /** Receives pre-start status updates emitted before run.started (e.g. local model loading). */
+  onPreStartStatus?: (
+    event: Extract<RunEvent, { readonly type: "status.changed" }>,
+  ) => void;
   signal?: AbortSignal;
   resources?: ProviderResourceBundle;
   runContext?: ProviderRunContext;
@@ -210,6 +214,7 @@ export interface ModelRespondedEvent {
 }
 
 export type RunActivityStatus = "working" | "thinking";
+export type RunActivityStage = "loading_local_model";
 export type RunActivityKind =
   | "command"
   | "tool"
@@ -241,7 +246,8 @@ export type RunEvent =
   | { type: "run.started" }
   | {
       type: "status.changed";
-      status: RunActivityStatus;
+      status: RunActivityStatus | "queued";
+      stage?: RunActivityStage;
       title?: string;
     }
   | {

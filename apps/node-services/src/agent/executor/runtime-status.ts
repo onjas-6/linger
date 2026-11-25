@@ -32,6 +32,11 @@ export interface RuntimeStatusOpenInput {
   /** The Agent Service epoch that claimed the Run. */
   readonly epoch: string;
   readonly sourceInboxIds: readonly string[];
+  /** Optional first status event; defaults to working when omitted. */
+  readonly initialStatus?: Extract<
+    RuntimeStatusUpdate,
+    { readonly type: "status.changed" }
+  >;
 }
 
 export interface RuntimeStatusPublisher {
@@ -77,7 +82,9 @@ class TeamHubRuntimeStatusPublisher implements RuntimeStatusPublisher {
     const session = new TeamHubRuntimeStatusSession({
       publish: (updates) => this.#publish(input.executionId, updates),
     });
-    await session.publish([{ type: "status.changed", status: "working" }]);
+    await session.publish([
+      input.initialStatus ?? { type: "status.changed", status: "working" },
+    ]);
     return session;
   }
 
@@ -162,12 +169,24 @@ const toContractEvent = (
   update: RuntimeStatusUpdate,
 ): OfferedEvent["event"] => {
   if (update.type === "status.changed") {
-    if (update.status !== "working" && update.status !== "thinking") {
-      throw new TypeError("Runtime status must be working or thinking");
+    if (
+      update.status !== "queued" &&
+      update.status !== "working" &&
+      update.status !== "thinking"
+    ) {
+      throw new TypeError("Runtime status must be queued, working or thinking");
+    }
+    if (update.stage !== undefined) {
+      if (
+        update.status !== "queued" ||
+        update.stage !== "loading_local_model"
+      ) {
+        throw new TypeError("Runtime status stage is invalid");
+      }
     }
     if (update.title !== undefined) {
       if (
-        update.status !== "thinking" ||
+        (update.status !== "thinking" && update.status !== "queued") ||
         update.title.trim().length === 0 ||
         [...update.title].length > 50_000
       ) {
@@ -179,6 +198,7 @@ const toContractEvent = (
     return {
       type: "status.changed",
       status: update.status,
+      ...(update.stage === undefined ? {} : { stage: update.stage }),
       ...(update.title === undefined ? {} : { title: update.title }),
     };
   }

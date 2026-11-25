@@ -233,7 +233,7 @@ func New(options Options) *Library {
 		ensurePiTimeout: options.EnsurePiTimeout, ensurePiRetryInterval: options.EnsurePiRetryInterval,
 		ensureLoadTimeout: options.EnsureLoadTimeout,
 		idleUnloadTTL:     idleUnloadTTL, idleSweepInterval: idleSweepInterval,
-		now:               nowFunc, healthCheck: gatewayAnswers, ctx: ctx, stop: stop, jobs: make(map[string]*job), probes: make(map[string]*activeProbe), probeUnknown: make(map[string]probeFingerprint),
+		now: nowFunc, healthCheck: gatewayAnswers, ctx: ctx, stop: stop, jobs: make(map[string]*job), probes: make(map[string]*activeProbe), probeUnknown: make(map[string]probeFingerprint),
 		causes:            make(map[string]*wire.LocalModelError),
 		installerLockWait: defaultInstallerLockWait, installerLockRetry: defaultInstallerLockRetry, settledCh: make(chan struct{}),
 		changed: make(chan struct{}), jobEnded: make(map[string]uint64), ensures: make(map[string]*ensureLoad),
@@ -459,8 +459,9 @@ func (l *Library) read(ctx context.Context) wire.LocalModelsSnapshot {
 	return snapshot
 }
 
-// restoreCauses puts each kept cause back on its failed row, and forgets one
-// whose row no longer fails with the code it came with.
+// restoreCauses puts each kept cause and refusal detail back on its failed
+// row when library status did not persist it, and forgets one whose row no
+// longer fails with the code it came with.
 func (l *Library) restoreCauses(snapshot *wire.LocalModelsSnapshot) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -470,7 +471,29 @@ func (l *Library) restoreCauses(snapshot *wire.LocalModelsSnapshot) {
 			delete(l.causes, id)
 			continue
 		}
-		snapshot.Models[index].Error.Cause, snapshot.Models[index].Error.Path = cause.Cause, cause.Path
+		target := snapshot.Models[index].Error
+		if target.Cause == "" && cause.Cause != "" {
+			target.Cause, target.Path = cause.Cause, cause.Path
+		}
+		if target.Pool == "" && cause.Pool != "" {
+			target.Pool = cause.Pool
+		}
+		if target.NeedBytes == nil && cause.NeedBytes != nil {
+			v := *cause.NeedBytes
+			target.NeedBytes = &v
+		}
+		if target.FreeBytes == nil && cause.FreeBytes != nil {
+			v := *cause.FreeBytes
+			target.FreeBytes = &v
+		}
+		if target.ShortfallBytes == nil && cause.ShortfallBytes != nil {
+			v := *cause.ShortfallBytes
+			target.ShortfallBytes = &v
+		}
+		if target.CanForce == nil && cause.CanForce != nil {
+			v := *cause.CanForce
+			target.CanForce = &v
+		}
 	}
 }
 
@@ -1541,6 +1564,31 @@ func (l *Library) IsStandbyModel(piModel string) bool {
 	}
 	row := l.rowLocked(func(model wire.LocalModel) bool { return model.PiModel == piModel })
 	return row != nil && row.State != "loaded"
+}
+
+// WillLoad reports whether EnsureLoaded will load or wait on a load for
+// piModel before the Runtime can start: true when the last snapshot shows a
+// downloaded library model in idle, loading, or failed state, false when it is
+// already loaded, not downloaded, or outside the library.
+func (l *Library) WillLoad(piModel string) bool {
+	if piModel == "" || l.tool == nil || !l.tool.installed() {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.current == nil || !l.current.Available {
+		return false
+	}
+	row := l.rowLocked(func(model wire.LocalModel) bool { return model.PiModel == piModel })
+	if row == nil {
+		return false
+	}
+	switch loadState(*row) {
+	case "idle", "loading", "failed":
+		return true
+	default:
+		return false
+	}
 }
 
 // IsLoadedHealthy reports whether piModel can answer without loading a standby
