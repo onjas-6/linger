@@ -21,6 +21,7 @@ import {
 } from "./native-runtime.js";
 import {
   planBundleNativeCommand,
+  restoreBaselineNativeRelease,
   switchNativeRelease,
 } from "./native-source.js";
 import {
@@ -136,6 +137,7 @@ describe("V2 local-installation release descriptors & decoupled bundles", () => 
       path.join(home, "store/web/web-111111111111/static-host.mjs"),
     );
     expect(webCmd.env.LINGER_WEB_CONTROL_TOKEN).toBe("tok123");
+    expect(webCmd.env.LINGER_WEB_ARTIFACT_ID).toBe("web-111111111111");
 
     const thCmd = planBundleNativeCommand("teamhub", home, descriptor, {
       platform: "win32",
@@ -147,8 +149,10 @@ describe("V2 local-installation release descriptors & decoupled bundles", () => 
       path.join(home, "store/backend/backend-111111111111/skills"),
     );
 
+    const fallbackDeps = path.join(home, "repo/.simplexai-runtime/offline/node-services");
     const nsCmd = planBundleNativeCommand("node-services", home, descriptor, {
       platform: "darwin",
+      fallbackNodeDepsDir: fallbackDeps,
     });
     expect(nsCmd.args[0]).toBe("--import");
     expect(nsCmd.args[1]).toContain("v2-esm-resolve.mjs");
@@ -159,6 +163,11 @@ describe("V2 local-installation release descriptors & decoupled bundles", () => 
     expect(nsCmd.env.LINGER_NODE_DEPS_DIR).toBe(
       path.join(home, "infra/node-deps/nd-aaaaaaaaaaaaaaaa"),
     );
+    expect(nsCmd.env.LINGER_FALLBACK_NODE_DEPS_DIR).toBe(fallbackDeps);
+    expect(nsCmd.env.NODE_PATH?.split(path.delimiter).slice(0, 2)).toEqual([
+      path.join(home, "infra/node-deps/nd-aaaaaaaaaaaaaaaa", "node_modules"),
+      path.join(fallbackDeps, "node_modules"),
+    ]);
     expect(nsCmd.env.LINGER_VOICE_RUNTIME_DIR).toBe(
       path.join(home, "store/backend/backend-111111111111/node-services/voice-runtime"),
     );
@@ -302,6 +311,131 @@ setInterval(() => {}, 60_000);
       );
     } finally {
       await stopNativeProcess(root, "web").catch(() => undefined);
+      await stopNativeProcess(root, "postgres").catch(() => undefined);
+    }
+  });
+
+  it("restoreBaselineNativeRelease restarts selected services from .simplexai-runtime baseline while keeping postgres untouched", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "linger-restore-baseline-"));
+    tempDirs.push(home);
+    const root = instanceRoot({ name: "desktop", home });
+    const repo = path.join(home, "repo");
+    const offlineWebDir = path.join(repo, ".simplexai-runtime", "offline", "web");
+    const offlineNsDist = path.join(
+      repo,
+      ".simplexai-runtime",
+      "offline",
+      "node-services",
+      "dist",
+    );
+    await mkdir(root, { recursive: true });
+    await mkdir(offlineWebDir, { recursive: true });
+    await mkdir(offlineNsDist, { recursive: true });
+
+    const observedWeb = path.join(home, "baseline-web.json");
+    const observedNs = path.join(home, "baseline-ns.json");
+    await writeFile(
+      path.join(offlineWebDir, "static-host.mjs"),
+      `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(observedWeb)}, JSON.stringify({
+  mode: "baseline-web",
+  webRoot: process.env.LINGER_WEB_ROOT ?? null,
+  artifactId: process.env.LINGER_WEB_ARTIFACT_ID ?? null,
+}));
+setInterval(() => {}, 60_000);
+`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(offlineNsDist, "supervisor.js"),
+      `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(observedNs)}, JSON.stringify({
+  mode: "baseline-ns",
+  depsDir: process.env.LINGER_NODE_DEPS_DIR ?? null,
+  fallbackDir: process.env.LINGER_FALLBACK_NODE_DEPS_DIR ?? null,
+}));
+setInterval(() => {}, 60_000);
+`,
+      "utf8",
+    );
+
+    const instance: Instance = {
+      schemaVersion: 1,
+      name: "desktop",
+      mode: "source-native",
+      root,
+      project: composeProject(root, "desktop"),
+      origin: "http://localhost:3200",
+      port: 3200,
+      releaseDir: repo,
+      computerConfig: path.join(root, "computer.json"),
+      computerExecutable: "/bin/true",
+      source: {
+        repo,
+        ports: {
+          web: 3200,
+          teamhub: 3201,
+          nodeServices: 3202,
+          document: 3203,
+          postgres: 3204,
+        },
+      },
+    };
+
+    try {
+      await startNativeProcess({
+        root,
+        name: "postgres",
+        executable: process.execPath,
+        args: ["-e", "setInterval(() => {}, 60000)"],
+        cwd: home,
+        env: process.env,
+        settings: "pg-baseline",
+      });
+      const pgBefore = await inspectNativeProcess(root, "postgres");
+      expect(pgBefore.running).toBe(true);
+
+      const restored = await restoreBaselineNativeRelease(instance, {
+        home,
+        services: ["node-services", "web"],
+      });
+      expect(restored).toEqual({
+        appVersion: "baseline",
+        restarted: ["node-services", "web"],
+      });
+
+      const pgAfter = await inspectNativeProcess(root, "postgres");
+      expect(pgAfter.running).toBe(true);
+      expect(pgAfter.pid).toBe(pgBefore.pid);
+
+      await vi.waitFor(
+        async () => {
+          const web = JSON.parse(await readFile(observedWeb, "utf8")) as {
+            mode: string;
+            webRoot: string | null;
+            artifactId: string | null;
+          };
+          const ns = JSON.parse(await readFile(observedNs, "utf8")) as {
+            mode: string;
+            depsDir: string | null;
+            fallbackDir: string | null;
+          };
+          expect(web).toEqual({
+            mode: "baseline-web",
+            webRoot: null,
+            artifactId: null,
+          });
+          expect(ns).toEqual({
+            mode: "baseline-ns",
+            depsDir: null,
+            fallbackDir: null,
+          });
+        },
+        { timeout: 3_000 },
+      );
+    } finally {
+      await stopNativeProcess(root, "web").catch(() => undefined);
+      await stopNativeProcess(root, "node-services").catch(() => undefined);
       await stopNativeProcess(root, "postgres").catch(() => undefined);
     }
   });

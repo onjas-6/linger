@@ -174,6 +174,7 @@ async function stageUnifiedBackendDir(
     daemonRoot = null,
     teamhubCliDir = null,
     nodeServicesDir = null,
+    nodeNativeDepsDir = null,
     installerDistDir = null,
     addUpgradeMarkers = false,
     faulty = false,
@@ -248,6 +249,19 @@ async function stageUnifiedBackendDir(
         `if (port > 0) server.listen(port, "127.0.0.1");\n`,
       "utf8",
     );
+  }
+  if (!existsSync(path.join(nodeServicesDest, "package.json"))) {
+    await writeFile(
+      path.join(nodeServicesDest, "package.json"),
+      `${JSON.stringify({ name: "@linger/node-services", private: true, type: "module" }, null, 2)}\n`,
+      "utf8",
+    );
+  }
+  const targetModelsJson = nodeNativeDepsDir
+    ? path.join(nodeNativeDepsDir, target, "models.json")
+    : null;
+  if (targetModelsJson && existsSync(targetModelsJson)) {
+    await cp(targetModelsJson, path.join(nodeServicesDest, "models.json"));
   }
   if (addUpgradeMarkers) {
     await mkdir(path.join(nodeServicesDest, "prompts"), { recursive: true });
@@ -625,6 +639,7 @@ export async function buildV2TestUpgradePacks({
         daemonRoot: daemonDir,
         teamhubCliDir,
         nodeServicesDir,
+        nodeNativeDepsDir,
         installerDistDir: installerDistDir ?? path.join(repoRoot, "apps/linger-installer/dist"),
         addUpgradeMarkers: false,
         faulty: false,
@@ -681,6 +696,7 @@ export async function buildV2TestUpgradePacks({
           daemonRoot: daemonV2Dir ?? daemonDir,
           teamhubCliDir,
           nodeServicesDir,
+          nodeNativeDepsDir,
           installerDistDir: installerDistDir ?? path.join(repoRoot, "apps/linger-installer/dist"),
           addUpgradeMarkers: true,
           faulty: false,
@@ -707,6 +723,7 @@ export async function buildV2TestUpgradePacks({
           daemonRoot: daemonV2Dir ?? daemonDir,
           teamhubCliDir,
           nodeServicesDir,
+          nodeNativeDepsDir,
           installerDistDir: installerDistDir ?? path.join(repoRoot, "apps/linger-installer/dist"),
           addUpgradeMarkers: true,
           faulty: true,

@@ -52,8 +52,11 @@ export interface ReleaseOrchestratorHooks {
     release: LocalReleaseDescriptor,
     changed: readonly BundleModuleId[],
   ) => Promise<void>;
+  readonly restoreBaselineServices?: (
+    changed: readonly BundleModuleId[],
+  ) => Promise<void>;
   readonly buildHealthProbes: (
-    release: LocalReleaseDescriptor,
+    release: LocalReleaseDescriptor | undefined,
     changed: readonly BundleModuleId[],
   ) => readonly HealthProbe[];
   readonly onProgress?: (progress: ReleaseProgressUpdate) => void;
@@ -308,7 +311,10 @@ export class ReleaseOrchestratorModule implements Module {
       await this.#hooks.onComplete?.(next);
 
       // Post-commit 2-minute crash observation window for backend restarts.
-      if (diff.requiresDrain && current) {
+      if (
+        diff.requiresDrain &&
+        (current || this.#hooks.restoreBaselineServices)
+      ) {
         watchdog.startObservation({
           appVersion: version,
           windowMs: this.#hooks.observationWindowMs,
@@ -439,11 +445,36 @@ export class ReleaseOrchestratorModule implements Module {
           })
           .catch(() => undefined);
       }
+    } else if (this.#hooks.restoreBaselineServices) {
+      await this.#hooks
+        .restoreBaselineServices(changedModules)
+        .catch((err) => {
+          ctx.log.warn("release_orchestrator.baseline_restore_failed", {
+            failedVersion,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      const watchdog = ctx.get<HealthWatchdogModule>("HealthWatchdog");
+      const restoreProbes = this.#hooks.buildHealthProbes(
+        undefined,
+        changedModules,
+      );
+      if (restoreProbes.length > 0) {
+        await watchdog
+          .waitForHealthy(restoreProbes, {
+            timeoutMs: this.#hooks.healthGateTimeoutMs,
+            intervalMs: this.#hooks.healthGateIntervalMs,
+          })
+          .catch(() => undefined);
+      }
     }
     this.#stagedVersion = undefined;
     const notice: RollbackNotice = {
       fromVersion: failedVersion,
-      toVersion: restoredPtr?.appVersion ?? previousRelease?.appVersion ?? "previous",
+      toVersion:
+        restoredPtr?.appVersion ??
+        previousRelease?.appVersion ??
+        (this.#hooks.restoreBaselineServices ? "baseline" : "previous"),
       reason,
     };
     this.#rollbackNotice = notice;

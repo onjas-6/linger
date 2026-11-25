@@ -16,6 +16,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const depsDir = process.env.LINGER_NODE_DEPS_DIR;
+const fallbackDepsDir = process.env.LINGER_FALLBACK_NODE_DEPS_DIR;
 const voiceRuntimeDir = process.env.LINGER_VOICE_RUNTIME_DIR;
 
 const isBareSpecifier = (specifier) =>
@@ -27,15 +28,38 @@ const isBareSpecifier = (specifier) =>
   !specifier.startsWith("data:") &&
   !/^[A-Za-z]:[\\/]/.test(specifier);
 
-if (depsDir || voiceRuntimeDir) {
-  const depsAnchorUrl = depsDir
-    ? pathToFileURL(
-        path.join(path.resolve(depsDir), "__linger_deps_anchor__.mjs"),
-      ).href
-    : undefined;
+const depsAnchorUrls = [];
+const resolvedPrimaryDeps = depsDir ? path.resolve(depsDir) : undefined;
+if (resolvedPrimaryDeps) {
+  depsAnchorUrls.push(
+    pathToFileURL(
+      path.join(resolvedPrimaryDeps, "__linger_deps_anchor__.mjs"),
+    ).href,
+  );
+}
+const resolvedFallbackDeps = fallbackDepsDir
+  ? path.resolve(fallbackDepsDir)
+  : undefined;
+if (resolvedFallbackDeps && resolvedFallbackDeps !== resolvedPrimaryDeps) {
+  depsAnchorUrls.push(
+    pathToFileURL(
+      path.join(resolvedFallbackDeps, "__linger_fallback_deps_anchor__.mjs"),
+    ).href,
+  );
+}
+
+if (depsAnchorUrls.length > 0 || voiceRuntimeDir) {
   const resolvedVoiceDir = voiceRuntimeDir
     ? path.resolve(voiceRuntimeDir)
     : undefined;
+
+  const isModuleNotFound = (error) =>
+    Boolean(
+      error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ERR_MODULE_NOT_FOUND",
+    );
 
   registerHooks({
     resolve(specifier, context, nextResolve) {
@@ -61,19 +85,27 @@ if (depsDir || voiceRuntimeDir) {
       try {
         return nextResolve(specifier, context);
       } catch (error) {
-        const code =
-          error && typeof error === "object" && "code" in error
-            ? error.code
-            : undefined;
         if (
-          depsAnchorUrl &&
+          depsAnchorUrls.length > 0 &&
           isBareSpecifier(specifier) &&
-          code === "ERR_MODULE_NOT_FOUND"
+          isModuleNotFound(error)
         ) {
-          return nextResolve(specifier, {
-            ...context,
-            parentURL: depsAnchorUrl,
-          });
+          let lastError = error;
+          for (const anchorUrl of depsAnchorUrls) {
+            if (context.parentURL === anchorUrl) continue;
+            try {
+              return nextResolve(specifier, {
+                ...context,
+                parentURL: anchorUrl,
+              });
+            } catch (candidateError) {
+              if (!isModuleNotFound(candidateError)) {
+                throw candidateError;
+              }
+              lastError = candidateError;
+            }
+          }
+          throw lastError;
         }
         throw error;
       }

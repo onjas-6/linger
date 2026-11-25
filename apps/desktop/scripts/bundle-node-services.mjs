@@ -147,18 +147,52 @@ export async function bundleNodeServices(repo, output, options = {}) {
       2,
     ),
   );
+  if (options.writePackageJson) {
+    await writeFile(
+      path.join(output, "package.json"),
+      `${JSON.stringify(
+        { name: "@linger/node-services", private: true, type: "module" },
+        null,
+        2,
+      )}\n`,
+    );
+  }
   return { files, inputs: [...inputs], imports };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const rawArgs = process.argv.slice(2);
   const v2Layout = rawArgs.includes("--v2");
-  const [repo, output] = rawArgs.filter((arg) => !arg.startsWith("--"));
+  const importsJsonIdx = rawArgs.indexOf("--imports-json");
+  const importsJsonPath =
+    importsJsonIdx >= 0 ? rawArgs[importsJsonIdx + 1] : undefined;
+  const positional = [];
+  for (let i = 0; i < rawArgs.length; i += 1) {
+    const arg = rawArgs[i];
+    if (arg === "--imports-json") {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--")) continue;
+    positional.push(arg);
+  }
+  const [repo, output] = positional;
   const result = await bundleNodeServices(
     path.resolve(repo),
     path.resolve(output),
-    v2Layout ? { voiceRuntimeDir: "voice-runtime" } : {},
+    v2Layout
+      ? { voiceRuntimeDir: "voice-runtime", writePackageJson: true }
+      : {},
   );
+  if (importsJsonPath) {
+    const resolvedImportsPath = path.resolve(importsJsonPath);
+    await mkdir(path.dirname(resolvedImportsPath), { recursive: true });
+    await writeFile(
+      resolvedImportsPath,
+      `${JSON.stringify([...result.imports].sort(), null, 2)}\n`,
+      "utf8",
+    );
+  }
   for (const { file, bytes } of result.files)
     console.log(`${(bytes / 1e6).toFixed(2).padStart(7)} MB ${file}`);
   console.log([...result.imports].sort().join("\n"));

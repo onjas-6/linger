@@ -580,6 +580,49 @@ async function main(): Promise<void> {
         changed,
       });
     },
+    restoreBaselineServices: async (changed) => {
+      const servicesToRestore: ("teamhub" | "node-services" | "web")[] = [];
+      if (changed.includes("backend")) {
+        servicesToRestore.push("teamhub", "node-services");
+      }
+      if (changed.includes("web")) {
+        servicesToRestore.push("web");
+      }
+      if (
+        servicesToRestore.length > 0 &&
+        (await localServer.hasLocalInstance())
+      ) {
+        await localServer.restoreBaselineRelease({
+          services: servicesToRestore,
+        });
+      }
+      if (changed.includes("backend")) {
+        const toolsNode = resolveToolsNodePath({
+          home,
+          resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
+          isPackaged: app.isPackaged,
+        });
+        const toolsDir = computerToolsDirectory();
+        computerDaemon.reloadBinary({
+          spawn: spawnDaemon(
+            shellDaemonPath,
+            path.join(userData, "logs", "computer-daemon.log"),
+          ),
+          teamhubCliDirectory: path.join(here, "../teamhub-cli"),
+          extraEnv: {
+            ...(toolsNode ? { LINGER_TOOLS_NODE_PATH: toolsNode } : {}),
+            LINGER_CLI_NODE_PATH: process.execPath,
+            ...(existsSync(toolsDir)
+              ? { LINGER_COMPUTER_TOOLS_DIR: toolsDir }
+              : {}),
+          },
+          whenIdle: false,
+        });
+      }
+      log.info("release_orchestrator.baseline_services_restored", {
+        changed,
+      });
+    },
     buildHealthProbes: (_release, changed) => {
       const origin = config.get().serverUrl;
       const localOrigin = origin && isLoopbackOrigin(origin) ? origin : undefined;

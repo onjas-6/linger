@@ -71,7 +71,7 @@ export const RUNTIME_LAYOUTS = {
 export const RUNTIME_DIRECTORY = ROOT;
 export const NODE_DIRECTORY = "node";
 
-const PLATFORMS = {
+export const PLATFORMS = {
   "win32-x64": { os: "win32", cpu: "x64" },
   "linux-x64": { os: "linux", cpu: "x64", libc: "glibc" },
   "darwin-arm64": { os: "darwin", cpu: "arm64" },
@@ -98,7 +98,7 @@ const MODEL_REGISTRIES = [
 ];
 // Imports inside try/catch for features Native does not use; development
 // does not install them either.
-const OPTIONAL_IMPORTS = new Set([
+export const OPTIONAL_IMPORTS = new Set([
   "@pdf-lib/fontkit",
   "bufferutil",
   "pdf-lib",

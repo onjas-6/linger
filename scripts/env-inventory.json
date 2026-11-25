@@ -38,6 +38,7 @@
       "names": [
         "HOST",
         "LINGER_ALLOWED_WEB_ROOT",
+        "LINGER_WEB_ARTIFACT_ID",
         "LINGER_WEB_CONTROL_TOKEN",
         "LINGER_WEB_ROOT",
         "PORT",
@@ -147,6 +148,7 @@
         "PYTHONINSPECT",
         "PYTHONSTARTUP",
         "LINGER_COMPUTER_BIN",
+        "LINGER_FALLBACK_NODE_DEPS_DIR",
         "LINGER_HOME",
         "LINGER_LOCALMODELS_DEV_MODULE_DIR",
         "LINGER_LOCALMODELS_DEV_PYTHON",

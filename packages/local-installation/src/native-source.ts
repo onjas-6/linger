@@ -135,6 +135,7 @@ export function planBundleNativeCommand(
     readonly baseEnv?: Readonly<Record<string, string | undefined>>;
     readonly webControlToken?: string;
     readonly esmResolveHookPath?: string;
+    readonly fallbackNodeDepsDir?: string;
   } = {},
 ): PlannedBundleCommand {
   const platform = options.platform ?? process.platform;
@@ -161,6 +162,7 @@ export function planBundleNativeCommand(
         env: {
           LINGER_WEB_ROOT: path.join(webDir, "dist"),
           LINGER_ALLOWED_WEB_ROOT: path.join(path.resolve(home), "store", "web"),
+          LINGER_WEB_ARTIFACT_ID: release.modules.web.artifactId,
           ...(options.webControlToken
             ? { LINGER_WEB_CONTROL_TOKEN: options.webControlToken }
             : {}),
@@ -183,6 +185,9 @@ export function planBundleNativeCommand(
         cwd: path.resolve(home),
         env: resolveBundleRuntimeEnv({
           nodeDepsDir,
+          ...(options.fallbackNodeDepsDir
+            ? { fallbackNodeDepsDir: options.fallbackNodeDepsDir }
+            : {}),
           voiceRuntimeDir,
           esmResolveHookPath,
           promptsDir,
@@ -240,6 +245,44 @@ export async function resolveBundleReleaseDescriptor(
     resolveSafeHomePath(home, pointer.releaseFile),
     parseLocalReleaseDescriptor,
   );
+}
+
+function resolveFallbackNodeDepsDir(repoDir?: string): string | undefined {
+  if (!repoDir) return undefined;
+  const candidate = path.join(
+    repoDir,
+    ".simplexai-runtime",
+    "offline",
+    "node-services",
+  );
+  return existsSync(candidate) ? candidate : undefined;
+}
+
+function resolveBaselineTeamhubBinary(
+  repoDir: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const prebuiltDir = path.join(repoDir, ".simplexai-runtime", "prebuilt");
+  const manifestPath = path.join(prebuiltDir, "manifest.json");
+  if (existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+        binaries?: { teamhub?: { file?: unknown } };
+      };
+      const file = manifest.binaries?.teamhub?.file;
+      if (typeof file === "string" && /^[\w-]+(?:\.exe)?$/.test(file)) {
+        const candidate = path.join(prebuiltDir, file);
+        if (existsSync(candidate)) return candidate;
+      }
+    } catch {
+      // Fall through to direct binary check.
+    }
+  }
+  const direct = path.join(
+    prebuiltDir,
+    platform === "win32" ? "teamhub.exe" : "teamhub",
+  );
+  return existsSync(direct) ? direct : undefined;
 }
 
 function resolveWebHostScript(
@@ -1358,12 +1401,17 @@ async function runNativeSource(
               activeBundleRelease &&
               hasBundleServiceArtifacts(home, activeBundleRelease, name)
             ) {
+              const fallbackNodeDepsDir =
+                name === "node-services"
+                  ? resolveFallbackNodeDepsDir(current.source?.repo)
+                  : undefined;
               const planned = planBundleNativeCommand(
                 name,
                 home,
                 activeBundleRelease,
                 {
                   baseEnv: baseServiceEnv,
+                  ...(fallbackNodeDepsDir ? { fallbackNodeDepsDir } : {}),
                   ...(name === "web" && webControlToken
                     ? { webControlToken }
                     : {}),
@@ -2073,8 +2121,12 @@ export async function switchNativeRelease(
       }
 
       if (switchNodeServices) {
+        const fallbackNodeDepsDir = resolveFallbackNodeDepsDir(
+          instance.source?.repo,
+        );
         const nsCmd = planBundleNativeCommand("node-services", home, release, {
           baseEnv,
+          ...(fallbackNodeDepsDir ? { fallbackNodeDepsDir } : {}),
         });
         const nsEntry = nsCmd.args.find((arg) => arg.endsWith("supervisor.js"));
         if (nsEntry && existsSync(nsEntry)) {
@@ -2149,6 +2201,241 @@ export async function switchNativeRelease(
       appVersion: release.appVersion,
       backendArtifactId: release.modules.backend.artifactId,
       webArtifactId: release.modules.web.artifactId,
+      restarted,
+    };
+  });
+}
+
+export interface RestoreBaselineNativeReleaseOptions {
+  readonly home: string;
+  readonly services?: readonly SwitchableReleaseService[];
+  readonly signal?: AbortSignal;
+  readonly log?: (message: string) => void;
+}
+
+export interface RestoreBaselineNativeReleaseResult {
+  readonly appVersion: "baseline";
+  readonly restarted: readonly SwitchableReleaseService[];
+}
+
+/**
+ * Restores selected application services (`teamhub`, `node-services`, and/or
+ * `web`) back to the Shell's baseline runtime under
+ * `<instance.source.repo>/.simplexai-runtime/...` (or `scripts/source-native.mjs`
+ * in developer checkouts) while keeping `postgres` and `livekit` running.
+ * Used when the very first V2 upgrade from Shell baseline fails and rolls back.
+ */
+export async function restoreBaselineNativeRelease(
+  instance: Instance,
+  options: RestoreBaselineNativeReleaseOptions,
+): Promise<RestoreBaselineNativeReleaseResult> {
+  const source = requireNative(instance);
+  const { signal, log } = options;
+  const targetServices = new Set<SwitchableReleaseService>(
+    options.services && options.services.length > 0
+      ? options.services
+      : ["teamhub", "node-services", "web"],
+  );
+  return withInstanceLock(instance, async () => {
+    const rawNativeEnv = await readPrivate(
+      path.join(instance.root, "native.env"),
+    ).catch(() => undefined);
+    const parsedNativeEnv: Record<string, string> = rawNativeEnv
+      ? Object.fromEntries(
+          Object.entries(parseEnv(rawNativeEnv)).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        )
+      : {};
+    const userEnv = await readUserEnvironment(instance.root).catch(() => ({}));
+    const identityKey = await readLocalIdentityKey(instance.root).catch(
+      () => undefined,
+    );
+    const baselineEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...parsedNativeEnv,
+      ...userEnv,
+    };
+    // Strip any V2-specific overrides so restored baseline services run cleanly
+    // against the Shell's built-in `.simplexai-runtime` layout.
+    delete baselineEnv.TEAMHUB_LOCAL_IDENTITY_KEY;
+    delete baselineEnv.TEAMHUB_SKILLS_DIR;
+    delete baselineEnv.LINGER_NODE_DEPS_DIR;
+    delete baselineEnv.LINGER_FALLBACK_NODE_DEPS_DIR;
+    delete baselineEnv.LINGER_VOICE_RUNTIME_DIR;
+    delete baselineEnv.LINGER_PROMPTS_DIR;
+    delete baselineEnv.LINGER_WEB_ROOT;
+    delete baselineEnv.LINGER_WEB_ARTIFACT_ID;
+    const proxyEnv = systemProxyEnvironment(baselineEnv);
+
+    const repo = source.repo;
+    const sourceNativeScript = path.join(repo, "scripts", "source-native.mjs");
+    const hasSourceNativeScript = existsSync(sourceNativeScript);
+    const offlineDir = path.join(repo, ".simplexai-runtime", "offline");
+
+    const restoreTeamhub = targetServices.has("teamhub");
+    const restoreNodeServices = targetServices.has("node-services");
+    const restoreBackend = restoreTeamhub || restoreNodeServices;
+    const restoreWeb = targetServices.has("web");
+
+    const restarted: SwitchableReleaseService[] = [];
+
+    if (restoreBackend) {
+      log?.("Stopping V2 backend services to restore Shell baseline.");
+      if (restoreNodeServices) {
+        await stopNativeProcess(instance.root, "node-services");
+      }
+      if (restoreTeamhub) {
+        await stopNativeProcess(instance.root, "teamhub");
+      }
+
+      if (restoreTeamhub) {
+        const prebuiltTeamhub = resolveBaselineTeamhubBinary(repo);
+        const teamhubEnv: NodeJS.ProcessEnv = {
+          ...baselineEnv,
+          ...proxyEnv,
+          GIN_MODE: "release",
+          ...(identityKey ? { TEAMHUB_LOCAL_IDENTITY_KEY: identityKey } : {}),
+        };
+        if (prebuiltTeamhub) {
+          const teamhubCwd = existsSync(path.join(repo, "apps", "teamhub"))
+            ? path.join(repo, "apps", "teamhub")
+            : repo;
+          log?.("Restoring baseline teamhub from .simplexai-runtime/prebuilt.");
+          await startNativeProcess({
+            root: instance.root,
+            name: "teamhub",
+            executable: prebuiltTeamhub,
+            args: [],
+            cwd: teamhubCwd,
+            env: teamhubEnv,
+            signal,
+            settings: JSON.stringify({
+              release: "baseline",
+              proxy: proxyEnv.HTTPS_PROXY ?? "",
+            }),
+            restartOnConfigurationChange: true,
+            restartOnExit: SERVICE_RESTART_POLICY,
+          });
+          restarted.push("teamhub");
+        } else if (hasSourceNativeScript) {
+          log?.("Restoring baseline teamhub via source-native.mjs.");
+          await startNativeProcess({
+            root: instance.root,
+            name: "teamhub",
+            executable: process.execPath,
+            args: [sourceNativeScript, "teamhub"],
+            cwd: repo,
+            env: teamhubEnv,
+            signal,
+            settings: JSON.stringify({
+              release: "baseline",
+              proxy: proxyEnv.HTTPS_PROXY ?? "",
+            }),
+            restartOnConfigurationChange: true,
+            restartOnExit: SERVICE_RESTART_POLICY,
+          });
+          restarted.push("teamhub");
+        }
+      }
+
+      if (restoreNodeServices) {
+        const offlineSupervisor = path.join(
+          offlineDir,
+          "node-services",
+          "dist",
+          "supervisor.js",
+        );
+        const nsEnv: NodeJS.ProcessEnv = {
+          ...baselineEnv,
+          ...proxyEnv,
+        };
+        if (existsSync(offlineSupervisor)) {
+          log?.(
+            "Restoring baseline node-services from .simplexai-runtime/offline.",
+          );
+          await startNativeProcess({
+            root: instance.root,
+            name: "node-services",
+            executable: process.execPath,
+            args: [
+              "--conditions=linger-production",
+              offlineSupervisor,
+              "--compiled",
+            ],
+            cwd: repo,
+            env: nsEnv,
+            signal,
+            settings: JSON.stringify({
+              release: "baseline",
+              proxy: proxyEnv.HTTPS_PROXY ?? "",
+            }),
+            restartOnConfigurationChange: true,
+            restartOnExit: SERVICE_RESTART_POLICY,
+          });
+          restarted.push("node-services");
+        } else if (hasSourceNativeScript) {
+          log?.("Restoring baseline node-services via source-native.mjs.");
+          await startNativeProcess({
+            root: instance.root,
+            name: "node-services",
+            executable: process.execPath,
+            args: [sourceNativeScript, "node-services"],
+            cwd: repo,
+            env: nsEnv,
+            signal,
+            settings: JSON.stringify({
+              release: "baseline",
+              proxy: proxyEnv.HTTPS_PROXY ?? "",
+            }),
+            restartOnConfigurationChange: true,
+            restartOnExit: SERVICE_RESTART_POLICY,
+          });
+          restarted.push("node-services");
+        }
+      }
+    }
+
+    if (restoreWeb) {
+      const offlineWebHost = path.join(offlineDir, "web", "static-host.mjs");
+      if (existsSync(offlineWebHost)) {
+        log?.("Stopping V2 web to restore Shell baseline.");
+        await stopNativeProcess(instance.root, "web");
+        log?.("Restoring baseline web from .simplexai-runtime/offline.");
+        await startNativeProcess({
+          root: instance.root,
+          name: "web",
+          executable: process.execPath,
+          args: [offlineWebHost],
+          cwd: path.join(offlineDir, "web"),
+          env: baselineEnv,
+          signal,
+          settings: JSON.stringify({ release: "baseline" }),
+          restartOnConfigurationChange: true,
+          restartOnExit: SERVICE_RESTART_POLICY,
+        });
+        restarted.push("web");
+      } else if (hasSourceNativeScript) {
+        log?.("Stopping V2 web to restore Shell baseline via source-native.mjs.");
+        await stopNativeProcess(instance.root, "web");
+        await startNativeProcess({
+          root: instance.root,
+          name: "web",
+          executable: process.execPath,
+          args: [sourceNativeScript, "web"],
+          cwd: repo,
+          env: baselineEnv,
+          signal,
+          settings: JSON.stringify({ release: "baseline" }),
+          restartOnConfigurationChange: true,
+          restartOnExit: SERVICE_RESTART_POLICY,
+        });
+        restarted.push("web");
+      }
+    }
+
+    return {
+      appVersion: "baseline",
       restarted,
     };
   });

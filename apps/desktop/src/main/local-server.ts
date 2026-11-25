@@ -1793,6 +1793,22 @@ export class LocalServerModule implements Module {
     });
   }
 
+  /**
+   * Restores selected local services (`teamhub`, `node-services`, and/or `web`)
+   * back to the Shell's baseline runtime (`--switch-release baseline`) when the
+   * first V2 upgrade fails before any previous V2 release existed.
+   */
+  async restoreBaselineRelease(
+    optionsOrSignal:
+      | AbortSignal
+      | {
+          readonly services?: readonly ("teamhub" | "node-services" | "web")[];
+          readonly signal?: AbortSignal;
+        } = this.#abort.signal,
+  ): Promise<void> {
+    return this.switchRelease("baseline", optionsOrSignal);
+  }
+
   // The owner account the installer created, read from its private file on
   // every call so the password is never kept in memory.
   async account(): Promise<LocalAccount> {

@@ -323,4 +323,77 @@ it("parses --switch-release with optional --services and requires --instance", a
       "web",
     ]),
   ).toThrow(/--switch-release/i);
+  expect(
+    parseInstallerArguments([
+      "--home",
+      "/tmp/linger-home",
+      "--instance",
+      "desktop",
+      "--switch-release",
+      "baseline",
+      "--services",
+      "teamhub,node-services,web",
+    ]),
+  ).toMatchObject({
+    switchRelease: "baseline",
+    switchServices: ["teamhub", "node-services", "web"],
+  });
+});
+
+it("routes --switch-release baseline to restoreBaselineNativeRelease", async () => {
+  const loadInstance = vi.fn().mockResolvedValue({ name: "desktop" });
+  const restoreBaselineNativeRelease = vi.fn().mockResolvedValue({
+    appVersion: "baseline",
+    restarted: ["teamhub", "node-services", "web"],
+  });
+  const switchNativeRelease = vi.fn();
+  vi.doMock("@linger/local-installation/instance", () => ({
+    loadInstance,
+  }));
+  vi.doMock("@linger/local-installation/native-source", () => ({
+    restoreBaselineNativeRelease,
+    switchNativeRelease,
+  }));
+  const argv = process.argv;
+  const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+  const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+  try {
+    process.argv = [
+      process.execPath,
+      fileURLToPath(new URL("./main.ts", import.meta.url)),
+      "--home",
+      "/tmp/linger-baseline-home",
+      "--instance",
+      "desktop",
+      "--switch-release",
+      "baseline",
+      "--services",
+      "teamhub,node-services,web",
+    ];
+    vi.resetModules();
+    await import("./main.js");
+    expect(switchNativeRelease).not.toHaveBeenCalled();
+    expect(restoreBaselineNativeRelease).toHaveBeenCalledWith(
+      { name: "desktop" },
+      expect.objectContaining({
+        home: path.resolve("/tmp/linger-baseline-home"),
+        services: ["teamhub", "node-services", "web"],
+      }),
+    );
+    expect(stdout).toHaveBeenCalledWith(
+      `${JSON.stringify({
+        ok: true,
+        appVersion: "baseline",
+        restarted: ["teamhub", "node-services", "web"],
+      })}\n`,
+      expect.any(Function),
+    );
+  } finally {
+    process.argv = argv;
+    stdout.mockRestore();
+    stderr.mockRestore();
+    vi.doUnmock("@linger/local-installation/instance");
+    vi.doUnmock("@linger/local-installation/native-source");
+    vi.resetModules();
+  }
 });

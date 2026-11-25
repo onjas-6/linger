@@ -93,11 +93,12 @@ export function createStaticHost({
   root = process.env.LINGER_WEB_ROOT,
   controlToken = process.env.LINGER_WEB_CONTROL_TOKEN,
   allowedStaticRoot = process.env.LINGER_ALLOWED_WEB_ROOT,
+  artifactId = process.env.LINGER_WEB_ARTIFACT_ID,
 } = {}) {
   let activeRoot = resolve(
     root || fileURLToPath(new URL("./dist", import.meta.url)),
   );
-  let activeArtifactId = "initial";
+  let activeArtifactId = artifactId || "initial";
   let serveFiles = makeSirvHandler(activeRoot);
 
   return async function staticHost(request, response) {

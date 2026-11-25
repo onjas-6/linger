@@ -328,15 +328,21 @@ jobs:
           chmod +x "$stage/teamhub-cli/teamhub"
           printf '@echo off\r\nsetlocal\r\nset "app="\r\nif defined LINGER_CLI_NODE_PATH if exist "%%LINGER_CLI_NODE_PATH%%" set "app=%%LINGER_CLI_NODE_PATH%%"\r\nif not defined app set "app=%%~dp0..\\..\\..\\..\\Linger.exe"\r\nif not exist "%%app%%" set "app=node"\r\nset ELECTRON_RUN_AS_NODE=1\r\n"%%app%%" --use-env-proxy "%%~dp0teamhub.js" %%*\r\n' >"$stage/teamhub-cli/teamhub.cmd"
 
-          echo "==> 3/4 Building node-services (when present in checkout)"
+          echo "==> 3/4 Building node-services & staging real per-target node-native-deps (when present in checkout)"
           if [ -d apps/node-services/src ] && [ -d apps/voice-runtime/src ]; then
-            node apps/desktop/scripts/bundle-node-services.mjs "$PWD" "$stage/node-services" --v2
+            node apps/desktop/scripts/bundle-node-services.mjs "$PWD" "$stage/node-services" --v2 --imports-json "$stage/node-services-imports.json"
             if [ -d apps/node-services/prompts ]; then
               cp -r apps/node-services/prompts "$stage/node-services/prompts"
             fi
+            node apps/desktop/scripts/stage-v2-node-native-deps.mjs \
+              --repo "$PWD" \
+              --out "$stage/node-native-deps" \
+              --targets darwin-arm64,win32-x64,linux-x64 \
+              --node-services-dir "$stage/node-services" \
+              --imports-json "$stage/node-services-imports.json"
           else
             echo "apps/node-services not present in this checkout; pack script will emit runnable test service stub."
-            rm -rf "$stage/node-services"
+            rm -rf "$stage/node-services" "$stage/node-native-deps"
           fi
 
           echo "==> 4/4 Cross-compiling TeamHub & Computer Daemon for darwin-arm64, win32-x64, linux-x64"
@@ -449,6 +455,19 @@ jobs:
                 --code-signature-flags runtime \
                 "$bin"
             done
+            if [ -d "$stage/node-native-deps/darwin-arm64/node_modules" ]; then
+              while IFS= read -r -d '' macho; do
+                if [ -s "$macho" ] && file -b "$macho" | grep -q "Mach-O"; then
+                  echo "rcodesign: signing native addon ${macho#$stage/node-native-deps/darwin-arm64/}"
+                  "$RCODESIGN" sign \
+                    --p12-file "$keys/developer-id.p12" \
+                    --p12-password-file "$keys/developer-id.password" \
+                    --for-notarization \
+                    --code-signature-flags runtime \
+                    "$macho"
+                fi
+              done < <(find "$stage/node-native-deps/darwin-arm64/node_modules" -type f \( -name '*.node' -o -name '*.dylib' \) -print0)
+            fi
           fi
 
           if [ -n "$WINDOWS_SIGNING_P12_BASE64" ]; then
@@ -493,6 +512,9 @@ jobs:
           extra_args=()
           if [ -d "$stage/node-services" ]; then
             extra_args+=(--node-services-dir "$stage/node-services")
+          fi
+          if [ -d "$stage/node-native-deps" ]; then
+            extra_args+=(--node-native-deps-dir "$stage/node-native-deps")
           fi
           if [ -n "$DESKTOP_UPDATE_KEY_PEM" ]; then
             key="$RUNNER_TEMP/v2-signing/update.pem"

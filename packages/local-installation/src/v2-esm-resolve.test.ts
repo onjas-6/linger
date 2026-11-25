@@ -181,4 +181,106 @@ describe("V2 Node 26 ESM module.registerHooks() resolution (P0-3)", () => {
       },
     });
   });
+
+  it("falls back to LINGER_FALLBACK_NODE_DEPS_DIR when a package is missing from primary LINGER_NODE_DEPS_DIR while keeping primary priority", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "linger-v2-fallback-"));
+    tempDirs.push(root);
+
+    const bundleDir = path.join(root, "store", "backend", "backend-v1", "node-services");
+    const primaryDepsDir = path.join(root, "infra", "node-deps", "nd-empty");
+    const fallbackDepsDir = path.join(root, "offline", "node-services");
+
+    await mkdir(path.join(bundleDir, "dist"), { recursive: true });
+    await mkdir(path.join(primaryDepsDir, "node_modules", "shared-pkg"), { recursive: true });
+    await mkdir(path.join(fallbackDepsDir, "node_modules", "shared-pkg"), { recursive: true });
+    await mkdir(path.join(fallbackDepsDir, "node_modules", "pdfjs-dist"), { recursive: true });
+    await mkdir(path.join(fallbackDepsDir, "node_modules", "cjs-fallback"), { recursive: true });
+
+    // Primary has v2 of shared-pkg; fallback has v1 of shared-pkg + pdfjs-dist + cjs-fallback.
+    await writeFile(
+      path.join(primaryDepsDir, "node_modules", "shared-pkg", "package.json"),
+      JSON.stringify({ name: "shared-pkg", version: "2.0.0", type: "module", main: "index.mjs" }),
+    );
+    await writeFile(
+      path.join(primaryDepsDir, "node_modules", "shared-pkg", "index.mjs"),
+      'export const source = "primary-v2";\n',
+    );
+
+    await writeFile(
+      path.join(fallbackDepsDir, "node_modules", "shared-pkg", "package.json"),
+      JSON.stringify({ name: "shared-pkg", version: "1.0.0", type: "module", main: "index.mjs" }),
+    );
+    await writeFile(
+      path.join(fallbackDepsDir, "node_modules", "shared-pkg", "index.mjs"),
+      'export const source = "fallback-v1";\n',
+    );
+
+    await writeFile(
+      path.join(fallbackDepsDir, "node_modules", "pdfjs-dist", "package.json"),
+      JSON.stringify({
+        name: "pdfjs-dist",
+        version: "4.0.0",
+        type: "module",
+        exports: { ".": "./index.mjs" },
+      }),
+    );
+    await writeFile(
+      path.join(fallbackDepsDir, "node_modules", "pdfjs-dist", "index.mjs"),
+      'export const pdfReady = "fallback-pdfjs";\n',
+    );
+
+    await writeFile(
+      path.join(fallbackDepsDir, "node_modules", "cjs-fallback", "package.json"),
+      JSON.stringify({ name: "cjs-fallback", version: "1.0.0", main: "index.cjs" }),
+    );
+    await writeFile(
+      path.join(fallbackDepsDir, "node_modules", "cjs-fallback", "index.cjs"),
+      'module.exports = { cjsFrom: "fallback" };\n',
+    );
+
+    const entryScript = path.join(bundleDir, "dist", "app.mjs");
+    await writeFile(
+      entryScript,
+      [
+        'import { createRequire } from "node:module";',
+        'import { source } from "shared-pkg";',
+        'import { pdfReady } from "pdfjs-dist";',
+        'const req = createRequire(import.meta.url);',
+        'const cjsFallback = req("cjs-fallback");',
+        'process.stdout.write(JSON.stringify({ source, pdfReady, cjsFallback }));',
+      ].join("\n"),
+    );
+
+    const hookPath = fileURLToPath(
+      new URL("./v2-esm-resolve.mjs", import.meta.url),
+    );
+    const runtimeEnv = resolveBundleRuntimeEnv({
+      nodeDepsDir: primaryDepsDir,
+      fallbackNodeDepsDir: fallbackDepsDir,
+      esmResolveHookPath: hookPath,
+    });
+
+    expect(runtimeEnv.LINGER_FALLBACK_NODE_DEPS_DIR).toBe(path.resolve(fallbackDepsDir));
+    const nodePaths = runtimeEnv.NODE_PATH!.split(path.delimiter);
+    expect(nodePaths[0]).toBe(path.join(path.resolve(primaryDepsDir), "node_modules"));
+    expect(nodePaths[1]).toBe(path.join(path.resolve(fallbackDepsDir), "node_modules"));
+
+    const { stdout } = await runExec(
+      process.execPath,
+      ["--import", hookPath, entryScript],
+      {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH,
+          ...runtimeEnv,
+        },
+      },
+    );
+
+    expect(JSON.parse(stdout)).toEqual({
+      source: "primary-v2",
+      pdfReady: "fallback-pdfjs",
+      cjsFallback: { cjsFrom: "fallback" },
+    });
+  });
 });

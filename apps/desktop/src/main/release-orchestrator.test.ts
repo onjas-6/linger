@@ -327,4 +327,99 @@ describe("ReleaseOrchestratorModule & HealthWatchdogModule", () => {
       await host.stop("quit");
     }
   });
+
+  it("restores Shell baseline services and verifies baseline probes when first upgrade fails (previousRelease === undefined)", async () => {
+    const home = await makeTempDir("linger-orch-baseline-rollback-");
+    const store = new BundleStoreModule({ home, target: "darwin-arm64" });
+    const watchdog = new HealthWatchdogModule();
+    const config = new ConfigStore(path.join(home, "config.json"));
+    const bus = new EventBus();
+
+    const events: string[] = [];
+    const baselineRestored: string[][] = [];
+    const probeReleases: Array<string | undefined> = [];
+    let baselineRestoredFlag = false;
+    const progressStages: Array<[string, string]> = [];
+    const notices: Array<{ fromVersion: string; toVersion: string }> = [];
+
+    const orch = new ReleaseOrchestratorModule({
+      activeOperations: () => 0,
+      restartServices: async (release, changed) => {
+        events.push(`restart:${release.appVersion}:${changed.join(",")}`);
+      },
+      restoreBaselineServices: async (changed) => {
+        events.push(`restoreBaseline:${changed.join(",")}`);
+        baselineRestored.push([...changed]);
+        baselineRestoredFlag = true;
+      },
+      buildHealthProbes: (release) => {
+        probeReleases.push(release?.appVersion);
+        return [
+          {
+            name: release ? "v2-node-services" : "baseline-node-services",
+            check: async () => (release ? false : baselineRestoredFlag),
+          },
+        ];
+      },
+      onProgress: (p) => {
+        progressStages.push([p.stage, p.tone]);
+        events.push(`progress:${p.stage}`);
+      },
+      onRollbackComplete: (notice) => {
+        notices.push({
+          fromVersion: notice.fromVersion,
+          toVersion: notice.toVersion,
+        });
+        events.push(`rollbackComplete:${notice.toVersion}`);
+      },
+      completePauseMs: 0,
+      rollbackPauseMs: 0,
+      healthGateTimeoutMs: 60,
+      healthGateIntervalMs: 15,
+    });
+
+    const host = new ModuleHost(
+      [
+        { name: "Config", dependsOn: [], start: async () => {}, stop: async () => {} },
+        store,
+        watchdog,
+        orch,
+      ],
+      { config, log: noopLog, bus },
+    );
+    await host.start();
+    try {
+      // No state/current.json exists yet (upgrading from Shell baseline for the first time).
+      expect(await store.currentRelease()).toBeUndefined();
+
+      await store.writeReleaseDescriptor(makeRelease("0.1.10-v2test.0"));
+      await orch.onBundleStaged("0.1.10-v2test.0");
+      expect(await orch.applyStaged()).toBe(false);
+
+      expect(await store.readCurrent()).toBeUndefined();
+      expect(await store.readPending()).toBeUndefined();
+      expect(await store.isDenylisted("0.1.10-v2test.0")).toBe(true);
+      expect(baselineRestored).toEqual([["web", "backend"]]);
+      expect(probeReleases).toEqual(["0.1.10-v2test.0", undefined]);
+      expect(notices).toEqual([
+        { fromVersion: "0.1.10-v2test.0", toVersion: "baseline" },
+      ]);
+      expect(progressStages).toEqual([
+        ["preparing", "normal"],
+        ["stopping", "normal"],
+        ["switching", "normal"],
+        ["verifying", "normal"],
+        ["rolling_back", "rollback"],
+        ["rolled_back", "rollback"],
+      ]);
+      expect(events.indexOf("restoreBaseline:web,backend")).toBeLessThan(
+        events.indexOf("progress:rolled_back"),
+      );
+      expect(events.indexOf("progress:rolled_back")).toBeLessThan(
+        events.indexOf("rollbackComplete:baseline"),
+      );
+    } finally {
+      await host.stop("quit");
+    }
+  });
 });

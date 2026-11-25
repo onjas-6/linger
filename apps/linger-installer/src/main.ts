@@ -421,7 +421,10 @@ async function stopLocalModels(
 async function switchReleaseCommand(
   options: ReturnType<typeof parseInstallerArguments>,
 ) {
-  const [{ loadInstance }, { switchNativeRelease }] = await Promise.all([
+  const [
+    { loadInstance },
+    { restoreBaselineNativeRelease, switchNativeRelease },
+  ] = await Promise.all([
     import("@linger/local-installation/instance"),
     import("@linger/local-installation/native-source"),
   ]);
@@ -442,13 +445,27 @@ async function switchReleaseCommand(
       );
       return;
     }
-    const result = await switchNativeRelease(instance, {
-      home: options.home,
-      appVersion: options.switchRelease!,
-      ...(options.switchServices ? { services: options.switchServices } : {}),
-      signal: controller.signal,
-      log: (message) => process.stderr.write(message.replace(/\n?$/, "\n")),
-    });
+    const result =
+      options.switchRelease === "baseline"
+        ? await restoreBaselineNativeRelease(instance, {
+            home: options.home,
+            ...(options.switchServices
+              ? { services: options.switchServices }
+              : {}),
+            signal: controller.signal,
+            log: (message) =>
+              process.stderr.write(message.replace(/\n?$/, "\n")),
+          })
+        : await switchNativeRelease(instance, {
+            home: options.home,
+            appVersion: options.switchRelease!,
+            ...(options.switchServices
+              ? { services: options.switchServices }
+              : {}),
+            signal: controller.signal,
+            log: (message) =>
+              process.stderr.write(message.replace(/\n?$/, "\n")),
+          });
     process.stdout.write(
       `${JSON.stringify({ ok: true, ...result })}\n`,
       () => process.exit(0),

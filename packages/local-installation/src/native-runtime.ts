@@ -143,6 +143,7 @@ function mergeNodeImportOption(
  */
 export function resolveBundleRuntimeEnv(options: {
   readonly nodeDepsDir: string;
+  readonly fallbackNodeDepsDir?: string;
   readonly voiceRuntimeDir?: string;
   readonly esmResolveHookPath?: string;
   readonly promptsDir?: string;
@@ -150,14 +151,27 @@ export function resolveBundleRuntimeEnv(options: {
 }): Record<string, string> {
   const resolvedDepsDir = path.resolve(options.nodeDepsDir);
   const depsNodeModules = path.join(resolvedDepsDir, "node_modules");
+  const resolvedFallbackDir = options.fallbackNodeDepsDir
+    ? path.resolve(options.fallbackNodeDepsDir)
+    : undefined;
+  const fallbackNodeModules =
+    resolvedFallbackDir && resolvedFallbackDir !== resolvedDepsDir
+      ? path.join(resolvedFallbackDir, "node_modules")
+      : undefined;
   const existingNodePath = options.baseEnv?.NODE_PATH;
-  const nodePath = existingNodePath
-    ? `${depsNodeModules}${path.delimiter}${existingNodePath}`
-    : depsNodeModules;
+  const nodePathEntries = [
+    depsNodeModules,
+    ...(fallbackNodeModules ? [fallbackNodeModules] : []),
+    ...(existingNodePath ? [existingNodePath] : []),
+  ];
+  const nodePath = nodePathEntries.join(path.delimiter);
   const env: Record<string, string> = {
     NODE_PATH: nodePath,
     LINGER_NODE_DEPS_DIR: resolvedDepsDir,
   };
+  if (resolvedFallbackDir && resolvedFallbackDir !== resolvedDepsDir) {
+    env.LINGER_FALLBACK_NODE_DEPS_DIR = resolvedFallbackDir;
+  }
   if (options.voiceRuntimeDir) {
     env.LINGER_VOICE_RUNTIME_DIR = path.resolve(options.voiceRuntimeDir);
   }

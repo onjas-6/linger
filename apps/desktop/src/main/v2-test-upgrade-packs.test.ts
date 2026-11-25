@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -84,6 +84,7 @@ describe("V2 (2+1) signed test upgrade packs & portable feed server", () => {
     const home = await makeTempDir("linger-v2-home-");
     const tinyWeb = await makeTempDir("linger-v2-web-");
     const tinyInstaller = await makeTempDir("linger-v2-inst-");
+    const tinyNativeDeps = await makeTempDir("linger-v2-ndeps-");
     await writeFile(
       path.join(tinyWeb, "index.html"),
       "<!doctype html><html><body>Linger Base Web</body></html>",
@@ -94,6 +95,20 @@ describe("V2 (2+1) signed test upgrade packs & portable feed server", () => {
       "export const v = 'base';\n",
       "utf8",
     );
+    for (const target of ["darwin-arm64", "win32-x64", "linux-x64"]) {
+      const pdfDir = path.join(tinyNativeDeps, target, "node_modules", "pdfjs-dist");
+      await mkdir(pdfDir, { recursive: true });
+      await writeFile(
+        path.join(pdfDir, "package.json"),
+        JSON.stringify({ name: "pdfjs-dist", version: "4.0.0" }),
+        "utf8",
+      );
+      await writeFile(
+        path.join(tinyNativeDeps, target, "models.json"),
+        JSON.stringify({ packages: {} }),
+        "utf8",
+      );
+    }
 
     const built = await buildV2TestUpgradePacks({
       outDir: kitDir,
@@ -104,6 +119,7 @@ describe("V2 (2+1) signed test upgrade packs & portable feed server", () => {
       windowsSigned: true,
       webDistDir: tinyWeb,
       installerDistDir: tinyInstaller,
+      nodeNativeDepsDir: tinyNativeDeps,
     });
 
     expect(built.verification.ok).toBe(true);
