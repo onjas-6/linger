@@ -555,6 +555,7 @@ function resolveAgentRunStatusHistory({
           marks: item.marks,
           outputs: item.outputs,
           plan: item.plan,
+          stage: item.stage,
           status: item.status,
           t,
           terminalOutcome: item.terminalOutcome,
@@ -575,6 +576,7 @@ function resolveAgentRunStatusHistory({
       resolveAgentRuntimeStatusSegment({
         first: true,
         key: "snapshot",
+        stage: presentation.currentStage,
         status: presentation.currentStatus,
         t,
         title: presentation.currentTitle,
@@ -621,6 +623,7 @@ function resolveAgentRuntimeStatusSegment({
   marks = [],
   outputs = [],
   plan,
+  stage,
   status,
   t,
   terminalOutcome,
@@ -636,6 +639,7 @@ function resolveAgentRuntimeStatusSegment({
   marks?: readonly RuntimeStatusMark[];
   outputs?: readonly RuntimeOutputPresentation[];
   plan?: RuntimePlanPresentation;
+  stage?: "loading_local_model";
   status: "queued" | "working" | "thinking";
   t: Translate;
   terminalOutcome?: "canceled" | "completed" | "failed";
@@ -714,20 +718,22 @@ function resolveAgentRuntimeStatusSegment({
                 text: activityStatusLine(t, stateActivity.kind).steps[0]!,
                 runningActivityId: stateActivity.activityId,
               }
-            : status === "queued"
-              ? { tone: "wait" }
-              : outputs.length > 0 && lineRunning.length === 0
-                ? { tone: "live", text: t(m.stateWorking) }
-                : queue.length > 0
-                  ? queue.at(-1)!.content
-                  : status === "thinking"
-                    ? {
-                        tone: "live",
-                        text: title?.trim() || t(m.stateThinking),
-                      }
-                    : first && activities.length === 0
-                      ? { tone: "wait" }
-                      : { tone: "live", text: t(m.stateWorking) };
+            : status === "queued" && stage === "loading_local_model"
+              ? { tone: "live", text: t(m.loadingLocalModel) }
+              : status === "queued"
+                ? { tone: "wait" }
+                : outputs.length > 0 && lineRunning.length === 0
+                  ? { tone: "live", text: t(m.stateWorking) }
+                  : queue.length > 0
+                    ? queue.at(-1)!.content
+                    : status === "thinking"
+                      ? {
+                          tone: "live",
+                          text: title?.trim() || t(m.stateThinking),
+                        }
+                      : first && activities.length === 0
+                        ? { tone: "wait" }
+                        : { tone: "live", text: t(m.stateWorking) };
   const lineQueue =
     queue.length > 0 && line === queue.at(-1)!.content ? queue : undefined;
   return {

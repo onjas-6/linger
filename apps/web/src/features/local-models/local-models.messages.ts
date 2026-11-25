@@ -138,10 +138,25 @@ export const localModelsMessages = defineMessages("localModels", {
   variantOptionDetail: "{label} · {detail}",
   noRoomYet: "no room to load yet",
   standbyAutoLoad: "loads automatically",
+  lowMemoryModePill: "Low-memory mode",
+  lowMemoryModePillPosture: "Low-memory mode · {posture}",
+  postureSlotCount: { one: "{count} slot", other: "{count} slots" },
+  postureSummary: "{slots} · {context}",
+  degradedPostureTooltip: "Requested: {requested} → Active: {effective}",
+  degradedPostureDetail:
+    "Running in low-memory mode ({effective} instead of {requested}) to fit current memory.",
+  degradedPostureDetailSimple:
+    "Running in low-memory mode to fit current memory.",
+  tightMemoryIndicator: "Tight memory",
+  tightMemoryDetail:
+    "Loaded under tight memory — closing unused apps improves responsiveness.",
+  tightMemoryHighDetail:
+    "Loaded under high memory pressure — closing unused apps improves responsiveness.",
   usedByNames: "Used by {names}",
   actionDownload: "Download",
   actionResumeDownload: "Resume download",
   actionLoad: "Load",
+  actionLoadAnyway: "Load Anyway",
   actionUnload: "Unload",
   downloadModel: "Download {name}",
   cancelModel: "Cancel {name}",
@@ -149,6 +164,7 @@ export const localModelsMessages = defineMessages("localModels", {
   removeModel: "Remove {name}",
   retryModel: "Retry {name}",
   loadModel: "Load {name}",
+  loadAnywayModel: "Load {name} anyway",
   unloadModel: "Unload {name}",
   useForAgentsNamed: "Use {name} for Agents",
   useForAgents: "Use for Agents",
@@ -226,6 +242,8 @@ export const localModelsMessages = defineMessages("localModels", {
   noAgentUses: "No Agent uses this model.",
   makeRoomTitle: "Make room to load",
   makeRoomDescription: "{name} needs {need} on {pool}; {free} is free.",
+  loadAnywayWarning:
+    "Forcing a load overrides the memory safety guard and may cause heavy system swap or slowdown.",
   unloadAndLoad: "Unload and load",
   roomFreeNow:
     "Enough memory is free now ({free} available). Click Load to start.",
@@ -392,6 +410,9 @@ export const localModelsMessages = defineMessages("localModels", {
   errorInvalidState: "The model was busy with another step.",
   errorJobRunning: "Another step was still running.",
   errorLoadNoRoom: "There wasn't enough free memory to load it.",
+  errorLoadNoRoomShortfall:
+    "Needs {shortfall} more free memory ({free} free, {need} minimum required).",
+  errorLoadNoRoomShortfallOnly: "Needs {shortfall} more free memory to load.",
   errorMemoryInsufficient: "The computer doesn't have enough memory for it.",
   errorModelFilesMissing:
     "Its files are missing. Remove the model and download it again.",
@@ -415,6 +436,7 @@ export const localModelsMessages = defineMessages("localModels", {
   shortHealthCheckFailed: "model didn't answer",
   shortBusy: "busy with another step",
   shortLoadNoRoom: "not enough free memory",
+  shortLoadNoRoomShortfall: "needs {shortfall} more free memory",
   shortMemoryInsufficient: "not enough memory",
   shortModelFilesMissing: "files missing",
   shortModelUnknown: "no longer on computer",

@@ -36,8 +36,10 @@ import {
 } from "./local-model-agents";
 import { ModelFacts } from "./local-model-details";
 import {
+  degradedBadgeCopy,
   engineBadgeCopy,
   modelErrorShortCopy,
+  pressureWarningCopy,
   unavailableShortCopy,
 } from "./local-models-copy";
 import { localModelsMessages as m } from "./local-models.messages";
@@ -181,6 +183,7 @@ const endingLabels: Partial<Record<LocalModelAction, Message<string>>> = {
 interface Handlers {
   onCancel: () => void;
   onDownload: () => void;
+  onForceLoad?: () => void;
   onLoad: () => void;
   onRemove: () => void;
   onToggle: () => void;
@@ -218,12 +221,14 @@ function OpenChatLink({
 function RowStatusLine({
   availableSummary,
   detail,
+  pressureWarning,
   slower,
   status,
   tag,
 }: {
   availableSummary: string;
   detail: string | null;
+  pressureWarning?: { detail: string; label: string };
   slower: boolean;
   status: ModelStatus;
   tag: { dot?: string; label: Message<string>; working?: boolean };
@@ -268,6 +273,18 @@ function RowStatusLine({
           </>
         ) : detail ? (
           ` · ${detail}`
+        ) : null}
+        {pressureWarning ? (
+          <>
+            {" · "}
+            <span
+              className="font-medium text-app-warning"
+              data-pressure-warning=""
+              title={pressureWarning.detail}
+            >
+              {pressureWarning.label}
+            </span>
+          </>
         ) : null}
       </span>
     </span>
@@ -327,6 +344,7 @@ function variantDetailCopy(entry: ModelEntry, t: Translate): string {
 
 function RowMetadataPills({
   badges,
+  degradedBadge,
   engine,
   engineBadge,
   engineTitle,
@@ -337,6 +355,7 @@ function RowMetadataPills({
   usedByTitle,
 }: {
   badges: string[];
+  degradedBadge?: { label: string; title?: string };
   engine?: LocalModel["engine"];
   engineBadge?: string;
   engineTitle?: string;
@@ -358,6 +377,15 @@ function RowMetadataPills({
       {featured ? (
         <span className="inline-flex h-[22px] items-center rounded-sm bg-[var(--app-mention-surface)] px-2 text-xs font-medium text-app-info">
           {t(m.featured)}
+        </span>
+      ) : null}
+      {degradedBadge ? (
+        <span
+          className="inline-flex h-[22px] items-center rounded-sm border border-[var(--app-status-warning-border)] bg-[var(--app-status-warning-surface)] px-2 text-xs font-medium text-app-warning"
+          data-degraded="true"
+          title={degradedBadge.title}
+        >
+          {degradedBadge.label}
         </span>
       ) : null}
       {usedBy ? (
@@ -568,9 +596,16 @@ export function ModelRow({
       ? engineBadgeCopy(model.engine)
       : undefined;
   const engineTitle = model.engine_label ?? engineBadge;
+  const degradedBadge =
+    status === "loaded" ? degradedBadgeCopy(model, t) : undefined;
+  const pressureWarning =
+    status === "loaded" && !ending
+      ? pressureWarningCopy(model.memory_pressure_warning, t)
+      : undefined;
   const { badges, overflowTitle } = collapsedRowBadges(model, t);
   const hasMeta =
     showFeaturedPill ||
+    Boolean(degradedBadge) ||
     Boolean(usedBy) ||
     Boolean(engineBadge) ||
     badges.length > 0;
@@ -578,6 +613,12 @@ export function ModelRow({
     status === "failed" &&
     (model.error?.code === "CHECKSUM_MISMATCH" ||
       model.error?.code === "MODEL_FILES_MISSING");
+  const canForceNoRoom =
+    status === "failed" &&
+    !stopped &&
+    model.error?.code === "LOAD_NO_ROOM" &&
+    model.error.can_force === true &&
+    Boolean(handlers.onForceLoad);
   const detail = {
     available: availableSummary,
     downloading: started ? null : downloadStatusDetail(model, t),
@@ -700,6 +741,7 @@ export function ModelRow({
             <RowStatusLine
               availableSummary={availableSummary}
               detail={ending ? null : detail}
+              pressureWarning={pressureWarning}
               slower={slower}
               status={status}
               tag={tag}
@@ -709,6 +751,7 @@ export function ModelRow({
         {hasMeta ? (
           <RowMetadataPills
             badges={badges}
+            degradedBadge={degradedBadge}
             engine={model.engine}
             engineBadge={engineBadge}
             engineTitle={engineTitle}
@@ -820,6 +863,22 @@ export function ModelRow({
             anotherMeChatHref ? (
             <OpenChatLink href={anotherMeChatHref} onClick={stopRowClick} />
           ) : null}
+          {canForceNoRoom && handlers.onForceLoad ? (
+            <Button
+              aria-label={t(m.loadAnywayModel, { name: model.name })}
+              className="px-2.5"
+              disabled={disabled}
+              onClick={(event) => {
+                stopRowClick(event);
+                handlers.onForceLoad?.();
+              }}
+              size="compact"
+              title={t(m.loadAnywayWarning)}
+              tone="ghost"
+            >
+              {t(m.actionLoadAnyway)}
+            </Button>
+          ) : null}
           {action ? (
             <Button
               aria-label={t(action[3], { name: model.name })}
@@ -903,7 +962,9 @@ export function ModelRow({
               hasPrimaryAssignAction={showsPrimaryAssignButton}
               hasReadyAlternatives={hasReadyAlternatives}
               onAssignAgent={onAssignAgent}
+              onForceLoad={handlers.onForceLoad}
               onRecheck={onRecheck}
+              onRetryLoad={handlers.onLoad}
               onUpdateDriver={onUpdateDriver}
               rechecking={rechecking}
               view={view}
