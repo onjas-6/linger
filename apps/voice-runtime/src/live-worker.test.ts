@@ -790,6 +790,126 @@ describe("LiveVoiceWorker", () => {
     await test.shutdown();
   });
 
+  it("switches a new response to the newer user turn after an earlier turn's tool round", async () => {
+    const test = await harness({
+      toolOutput: () => '{"status":"ok","page":"search results"}',
+    });
+    test.session().emit(
+      { type: "speech_started", itemId: "item-a" },
+      { type: "transcript_completed", itemId: "item-a", text: "Search for it" },
+      { type: "response_started" },
+      {
+        type: "function_calls",
+        update: false,
+        calls: [
+          {
+            callId: "call-1",
+            name: "computer_browser",
+            arguments: '{"action":"open"}',
+          },
+        ],
+      },
+      { type: "response_finished", canceled: false },
+    );
+    await vi.waitFor(() =>
+      expect(test.session().sendToolResults).toHaveBeenCalledOnce(),
+    );
+    // The user speaks a follow-up while the earlier turn's reply stayed open
+    // across tool rounds with no active audio playback.
+    test.session().emit(
+      { type: "speech_started", itemId: "item-b" },
+      {
+        type: "transcript_completed",
+        itemId: "item-b",
+        text: "Open Wikipedia history",
+      },
+      { type: "response_started" },
+      { type: "text_delta", text: "Found the history section.", update: false },
+      { type: "audio_delta", pcm: pcm(480) },
+      { type: "response_finished", canceled: false },
+    );
+    await vi.waitFor(() =>
+      expect(test.client.reportLiveReply).toHaveBeenCalledOnce(),
+    );
+    expect(test.ofType("reply_delta")).toEqual([
+      {
+        type: "reply_delta",
+        turn_id: turnB,
+        text: "Found the history section.",
+      },
+    ]);
+    expect(test.ofType("reply_done")).toEqual([
+      { type: "reply_done", turn_id: turnA, text: "" },
+      {
+        type: "reply_done",
+        turn_id: turnB,
+        text: "Found the history section.",
+      },
+    ]);
+    expect(test.client.reportLiveReply.mock.calls[0]![0]).toEqual({
+      event_id: liveReplyEventId(sessionId, turnB),
+      voice_session_id: sessionId,
+      turn_id: turnB,
+      text: "Found the history section.",
+    });
+    await test.shutdown();
+  });
+
+  it("finishes an in-flight tool call quietly once a newer turn's response has started", async () => {
+    const test = await harness();
+    let resolveSlowTool: (output: string) => void = () => undefined;
+    test.client.executeLiveToolCall.mockImplementationOnce(
+      (call: { call_id: string }) =>
+        new Promise((resolve) => {
+          resolveSlowTool = (output) =>
+            resolve({ call_id: call.call_id, output });
+        }),
+    );
+    test.session().emit(
+      { type: "speech_started", itemId: "item-a" },
+      { type: "transcript_completed", itemId: "item-a", text: "Check tab" },
+      { type: "response_started" },
+      {
+        type: "function_calls",
+        update: false,
+        calls: [
+          {
+            callId: "call-slow",
+            name: "computer_browser",
+            arguments: '{"action":"open"}',
+          },
+        ],
+      },
+      { type: "response_finished", canceled: false },
+    );
+    await vi.waitFor(() =>
+      expect(test.client.executeLiveToolCall).toHaveBeenCalledOnce(),
+    );
+    test
+      .session()
+      .emit(
+        { type: "speech_started", itemId: "item-b" },
+        { type: "transcript_completed", itemId: "item-b", text: "Never mind" },
+        { type: "response_started" },
+        { type: "text_delta", text: "Okay.", update: false },
+        { type: "response_finished", canceled: false },
+      );
+    await vi.waitFor(() =>
+      expect(test.ofType("reply_done")).toEqual([
+        { type: "reply_done", turn_id: turnA, text: "" },
+        { type: "reply_done", turn_id: turnB, text: "Okay." },
+      ]),
+    );
+    resolveSlowTool('{"status":"ok"}');
+    await vi.waitFor(() =>
+      expect(test.session().sendToolResults).toHaveBeenCalledWith(
+        [{ callId: "call-slow", output: '{"status":"ok"}' }],
+        { reply: false },
+      ),
+    );
+    await test.shutdown();
+  });
+
   it("waits for a write the user said yes to past the usual tool budget", async () => {
     const test = await harness({ toolTimeoutMs: 50 });
     // TeamHub answers in 150 ms; the client gives up when the signal aborts.

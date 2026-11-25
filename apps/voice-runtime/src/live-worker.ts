@@ -884,6 +884,15 @@ export class LiveVoiceWorker {
       case "response_started":
         this.repliedSinceSpeech = true;
         this.saidSinceReply = [];
+        // A new response after the user spoke again answers their latest turn,
+        // even when the earlier turn's reply stayed open across tool rounds.
+        if (
+          this.reply &&
+          !this.reply.speech &&
+          this.latestTurn &&
+          this.reply.turn !== this.latestTurn
+        )
+          this.finishReply(true);
         if (this.latestTurn) {
           this.latestTurn.answered = true;
           clearTimeout(this.latestTurn.swallowTimer);
@@ -1642,6 +1651,7 @@ export class LiveVoiceWorker {
     // first, or the user is left with half a sentence.
     const quiet =
       reply.interrupted ||
+      reply.finished === true ||
       (reply.outputStarted === true &&
         sentenceEnded(
           reply.speech ? (reply.spokenText ?? "") : reply.turn.text,
