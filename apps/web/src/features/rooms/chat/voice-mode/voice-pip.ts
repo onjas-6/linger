@@ -41,7 +41,8 @@ export type VoicePipOwner = "voice-mode" | "recording";
 // About each page window's size when it opens; the Human drags it bigger and
 // the browser remembers that size.
 const pipSizes = {
-  "voice-mode": { height: 240, width: 320 },
+  // Voice Mode floats as its island alone; the desktop app keeps it 96px tall.
+  "voice-mode": { height: 96, width: 360 },
   recording: { height: 720, width: 420 },
 } satisfies Record<VoicePipOwner, PipSize>;
 
@@ -77,8 +78,10 @@ function desktopVoiceWindow(): DesktopVoiceWindow | undefined {
     : undefined;
 }
 
-/** How this client opens the floating window, if it can. */
-function floatingWindowOpener():
+/** How this client opens the floating window for `owner`, if it can. */
+function floatingWindowOpener(
+  owner: VoicePipOwner,
+):
   | ((
       size: PipSize & { preferInitialWindowPlacement: boolean },
     ) => Promise<Window | null>)
@@ -96,6 +99,9 @@ function floatingWindowOpener():
   // its window, so there voice windows stay in the page and offer no float
   // button.
   if (isDesktopShell()) return undefined;
+  // A browser draws its own title bar on picture-in-picture, which Voice
+  // Mode's island cannot hide or style, so Voice Mode stays in the page there.
+  if (owner === "voice-mode") return undefined;
   const pictureInPicture = (
     window as Window & { documentPictureInPicture?: DocumentPictureInPicture }
   ).documentPictureInPicture;
@@ -104,9 +110,9 @@ function floatingWindowOpener():
     : undefined;
 }
 
-/** Whether this client can float a voice window over other windows and apps. */
-export function voicePipSupported() {
-  return floatingWindowOpener() !== undefined;
+/** Whether this client can float `owner`'s window over other windows and apps. */
+export function voicePipSupported(owner: VoicePipOwner) {
+  return floatingWindowOpener(owner) !== undefined;
 }
 
 function publish(next: typeof pip) {
@@ -126,7 +132,7 @@ export async function openVoicePip(
     preferInitialWindowPlacement = false,
   }: { preferInitialWindowPlacement?: boolean } = {},
 ): Promise<Window | undefined> {
-  const open = floatingWindowOpener();
+  const open = floatingWindowOpener(owner);
   if (!open) return undefined;
   // A page gets one such window; the newest owner takes it.
   if (pip?.owner === owner) return pip.window;

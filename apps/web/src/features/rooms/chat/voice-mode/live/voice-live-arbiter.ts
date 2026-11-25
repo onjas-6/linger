@@ -287,7 +287,7 @@ export function createVoiceLiveArbiter(options: {
       const turn = ensureTurn(turnId);
       turn.text = text;
       const heardBy = options.active() ? options.voiceSessionId() : undefined;
-      const sendHeardTurn = () =>
+      const sendHeardTurn = (onQueued?: () => void) =>
         track(
           (async () => {
             // Saved once the whole reply ended, so TeamHub already knows
@@ -309,6 +309,7 @@ export function createVoiceLiveArbiter(options: {
               heardBy && (turn.answered || turn.superseded)
                 ? { voice_session_id: heardBy, turn_id: turnId }
                 : undefined,
+              onQueued,
             );
           })(),
         );

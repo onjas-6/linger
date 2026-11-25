@@ -38,13 +38,18 @@ export interface VoiceModeMicrophone {
 
 /**
  * `keepsText` marks a send that first waits before the turn reaches the
- * outbox (live Voice Mode waits for its verdict), so the words stay shown.
+ * outbox (live Voice Mode waits for its verdict), so the words stay shown
+ * until the send says, through its callback, that the outbox shows them.
  */
-type TurnSend = (() => Promise<void>) & { keepsText?: boolean };
+type TurnSend = ((onQueued?: () => void) => Promise<void>) & {
+  keepsText?: boolean;
+};
 interface Turn {
   id: string;
   text: string;
   send?: TurnSend;
+  /** The outbox shows this turn now, so its words are no longer shown here. */
+  queued?: boolean;
 }
 
 /**
@@ -330,7 +335,12 @@ export class VoiceModeController {
     const turn = this.queue[0]!;
     this.inFlightId = turn.id;
     this.publish({});
-    await (turn.send ? turn.send() : this.options.send(turn));
+    await (turn.send
+      ? turn.send(() => {
+          turn.queued = true;
+          this.publish({});
+        })
+      : this.options.send(turn));
     this.queue.shift();
     this.inFlightId = undefined;
     this.publish({});
@@ -384,7 +394,7 @@ export class VoiceModeController {
   private publish(update: Partial<VoiceModeState>) {
     const queuedText: string[] = [];
     for (const turn of this.queue)
-      if (turn.id !== this.inFlightId || turn.send?.keepsText)
+      if (turn.id !== this.inFlightId || (turn.send?.keepsText && !turn.queued))
         queuedText.push(turn.text);
     // Submitted text is retained by the ordinary durable outbox, not also
     // copied into an editable draft while its result is still unknown.

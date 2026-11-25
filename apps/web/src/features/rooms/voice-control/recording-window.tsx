@@ -286,7 +286,7 @@ export default function RecordingWindow() {
         fill={fill}
         floating={pip ? "pip" : "page"}
         onFloat={
-          !pip && voicePipSupported()
+          !pip && voicePipSupported("recording")
             ? () => {
                 void openVoicePip("recording");
               }

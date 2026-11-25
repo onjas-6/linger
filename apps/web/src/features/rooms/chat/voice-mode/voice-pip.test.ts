@@ -88,7 +88,8 @@ describe("Voice Mode picture-in-picture window", () => {
     for (const bridge of [{}, { voiceWindow: {} }]) {
       desktop.lingerDesktop = bridge;
       try {
-        expect(voicePipSupported()).toBe(false);
+        expect(voicePipSupported("voice-mode")).toBe(false);
+        expect(voicePipSupported("recording")).toBe(false);
         await expect(openVoicePip("voice-mode")).resolves.toBeUndefined();
         expect(fake.requestWindow).not.toHaveBeenCalled();
         expect(open).not.toHaveBeenCalled();
@@ -98,19 +99,29 @@ describe("Voice Mode picture-in-picture window", () => {
     }
   });
 
+  it("keeps Voice Mode in the page in a browser, floating only a recording", async () => {
+    // The browser's own title bar on that window cannot be hidden or styled.
+    const fake = installFakeVoicePip();
+    expect(voicePipSupported("voice-mode")).toBe(false);
+    await expect(openVoicePip("voice-mode")).resolves.toBeUndefined();
+    expect(fake.requestWindow).not.toHaveBeenCalled();
+    expect(voicePipSupported("recording")).toBe(true);
+    await expect(openVoicePip("recording")).resolves.toBe(fake.pipWindow);
+  });
+
   it("floats in the desktop app's own window where the app offers one", async () => {
     const browser = installFakeVoicePip();
     const fake = installFakeDesktopVoiceWindow();
     document.documentElement.setAttribute("data-desktop-shell", "");
     document.documentElement.setAttribute("data-desktop-chrome", "inset");
-    expect(voicePipSupported()).toBe(true);
+    expect(voicePipSupported("voice-mode")).toBe(true);
 
     await expect(openVoicePip("voice-mode")).resolves.toBe(fake.voiceWindow);
     expect(fake.open).toHaveBeenCalledOnce();
     expect(fake.open).toHaveBeenCalledWith(
       "",
       expect.stringMatching(/^linger-voice-window-\d+$/),
-      "popup=yes,width=320,height=240",
+      "popup=yes,width=360,height=96",
     );
     expect(browser.requestWindow).not.toHaveBeenCalled();
     expect(fake.document.title).toBe("Voice Mode");
@@ -216,7 +227,7 @@ describe("Voice Mode picture-in-picture window", () => {
     document.documentElement.setAttribute("data-theme", "dark");
     const fake = installFakeVoicePip();
 
-    await openVoicePip("voice-mode");
+    await openVoicePip("recording");
     expect(fake.document.documentElement.dataset.theme).toBe("dark");
     expect(fake.document.head.textContent).toContain(".early {}");
 
@@ -231,16 +242,16 @@ describe("Voice Mode picture-in-picture window", () => {
 
   it("opens one window and tells a desktop close apart from the page closing it", async () => {
     const fake = installFakeVoicePip();
-    const first = await openVoicePip("voice-mode");
-    await expect(openVoicePip("voice-mode")).resolves.toBe(first);
+    const first = await openVoicePip("recording");
+    await expect(openVoicePip("recording")).resolves.toBe(first);
     expect(fake.requestWindow).toHaveBeenCalledOnce();
     const closedByHuman = vi.fn();
-    const stop = onVoicePipClosedByHuman("voice-mode", closedByHuman);
-    closeVoicePip("voice-mode");
+    const stop = onVoicePipClosedByHuman("recording", closedByHuman);
+    closeVoicePip("recording");
     expect(fake.pipWindow.close).toHaveBeenCalledOnce();
     expect(closedByHuman).not.toHaveBeenCalled();
 
-    await openVoicePip("voice-mode");
+    await openVoicePip("recording");
     fake.pipWindow.close();
     expect(closedByHuman).toHaveBeenCalledOnce();
     stop();
@@ -248,7 +259,7 @@ describe("Voice Mode picture-in-picture window", () => {
 
   it("reads back to tab only from the page coming to the front", async () => {
     installFakeVoicePip();
-    await openVoicePip("voice-mode");
+    await openVoicePip("recording");
     const focused = vi.spyOn(document, "hasFocus").mockReturnValue(true);
     try {
       // Back to tab from a background tab brings the page to the front.
@@ -266,17 +277,17 @@ describe("Voice Mode picture-in-picture window", () => {
   });
 
   it("gives the window to one owner at a time", async () => {
-    const fake = installFakeVoicePip();
+    const fake = installFakeDesktopVoiceWindow();
     const voiceModeClosed = vi.fn();
     const stop = onVoicePipClosedByHuman("voice-mode", voiceModeClosed);
     await openVoicePip("voice-mode");
-    // Recording takes the tab's one window; Voice Mode's closes, not by the Human.
+    // Recording takes the page's one window; Voice Mode's closes, not by the Human.
     await openVoicePip("recording");
-    expect(fake.pipWindow.close).toHaveBeenCalledOnce();
+    expect(fake.voiceWindow.close).toHaveBeenCalledOnce();
     expect(voiceModeClosed).not.toHaveBeenCalled();
     // Closing someone else's window does nothing.
     closeVoicePip("voice-mode");
-    expect(fake.pipWindow.close).toHaveBeenCalledOnce();
+    expect(fake.voiceWindow.close).toHaveBeenCalledOnce();
     stop();
   });
 });

@@ -161,22 +161,41 @@ build:assets` to check the initial JS budget.
   switch, the new mode opens in the page and can be floated from there.
   During Live, the Meeting entry offers to start a new Meeting even while an
   earlier one is saving. Both in-page voice windows retain a visible, draggable
-  title bar: dark in browsers, the window's own surface colour in the desktop
-  app. Picture-in-picture keeps the browser title bar. The desktop app floats
+  bar. The recording window's title bar is dark in browsers and the window's
+  own surface colour in the desktop app. Voice Mode's bar is its white
+  island: Another Me, a one-line state, four pill bars that follow the
+  microphone, and the controls (mute, reply sound, conversation, hang up). It
+  says Waking up until the call listens and, in Live, until the runtime's
+  `linger.voice_provider_ready` attribute says the live model is connected
+  (a runtime without it counts as connected); meanwhile Another Me rests grey
+  and breathes, with every control already in place, then it leans in once.
+  In the Room the Human's live words fade in phrase by phrase as in the
+  window, and leave the moment the turn shows in the outbox. A recording's
+  picture-in-picture keeps the browser title bar;
+  Voice Mode never opens a browser's picture-in-picture, whose title bar it
+  cannot hide or style, so in a browser it stays in the page. The desktop app floats
   them in its own always-on-top window, which stays up while the main window
   is minimized or closed to the tray: when the preload offers
   `window.lingerDesktop.voiceWindow`, `voice-pip.ts` opens it with
   `window.open("")` (the desktop main process allows only that call) and is
   the only place that knows which kind of window it got. A desktop app without that field keeps voice windows
-  in the page with no float button. In the page on macOS they stay out of the
+  in the page with no float button. Voice Mode has no float button: it floats
+  when it starts. In the page on macOS they stay out of the
   window drag strip. In the page both windows resize by any edge or corner
   (`voice-window-resize.tsx`), down to a minimum size and never past the
   viewport; the corner grip also takes arrow keys. Dragging the title bar
   keeps the whole window inside the viewport too, and a window that grows
   where it sits, or whose viewport shrinks, moves back in. Neither window can
   be taller than the viewport leaves room for, so the header stays reachable.
-  The size lasts while the window is open and is not stored. Voice Mode's expand button switches
-  between its two preset sizes and drops a dragged size; a minimized
+  The size lasts while the window is open and is not stored. Voice Mode opens
+  as the island alone; its arrow (and the spoken expand and shrink) opens the
+  conversation directly under it with the chat's resize timing
+  (`AutoHeight`); a dragged size lasts through closing (its width) and
+  opening again (its height), and the window keeps one width either way. Only
+  the open conversation resizes by its edges. A floated Voice Mode window
+  also opens as the island alone (96px, the desktop app's minimum) and grows
+  to show the conversation or shrinks back inside the arrow's click, keeping
+  its width and the open height the Human gave it. A minimized
   recording resizes in width only. A floated window has no handles: the
   browser or the desktop app resizes it.
 - The compact primary rail reveals labels on hover and keyboard focus without
@@ -200,15 +219,17 @@ build:assets` to check the initial JS budget.
   they stay on screen wherever the row sits and never draw over the controls;
   the timer stays beside them while it fits. An open window keeps the vertical
   confirmation card. Escape or Keep recording returns focus to Stop.
-- Recording and Voice Mode distinguish the native window's close action from
-  back to tab through the shared PiP return detection. Back to tab keeps the
-  session running in the page and exposes a Float action; close ends it.
-  Every floated window also draws its own return button, in the browser and
-  in the desktop app: `returnVoicePipToPage` brings the tab or the main
-  window to the front, reports the return itself and closes the floated
-  window. Voice Mode then opens the Room the call started in; a recording
-  stays on the page the main window shows. The desktop app's window has no
-  back to tab button, so every other close of it ends the session.
+- A recording distinguishes the native window's close action from back to
+  tab through the shared PiP return detection. Back to tab keeps the
+  recording running in the page and exposes a Float action; close ends it.
+  Voice Mode floats only in the desktop app's window, so closing that window
+  always ends the call. A floated
+  recording window also draws its own return button, in the browser and in
+  the desktop app: `returnVoicePipToPage` brings the tab or the main window
+  to the front, reports the return itself and closes the floated window; the
+  recording stays on the page the main window shows. A floated Voice Mode
+  window draws no return button. The desktop app's window has no back to tab
+  button, so every other close of it ends the session.
   Recording moves one portal host between documents so paused state, Ask
   drafts and transcript scroll survive the move. Hide it while classifying a
   native close, and ignore a late result after unmount or a replacement window.
