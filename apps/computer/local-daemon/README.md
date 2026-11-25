@@ -1119,7 +1119,9 @@ commands Pi starts never resolve a package from the bundle.
 
 The same extension carries Pi's permission review and dynamic MCP attachment, so
 resident Pi processes and provider pre-starts load it with an empty managed MCP
-config file and `mcp__*` in `--tools`. On Room-presence `provider.prepare`, Pi
+config file and `tool_search,mcp__*` in `--tools`; managed servers are
+registered with `deferred` exposure, so the model loads their tools through
+`tool_search`. On Room-presence `provider.prepare`, Pi
 starts with a 40-second timeout, verifies `get_state` and applies any clamped
 thinking level, then parks without submitting a prompt. When a Run adopts a
 parked Pi process whose MCP server set changed, the Daemon writes the new

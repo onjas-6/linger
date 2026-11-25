@@ -382,7 +382,6 @@ export async function handleSessionBeforeCompact(event, ctx, deps = {}) {
   return { compaction: result };
 }
 
-
 // This explicit extension uses Pi's public MCP implementation. It does not
 // discover ambient configuration or create another Agent execution loop.
 export function loadManagedMcpConfig(configPath) {

@@ -356,6 +356,9 @@ func (p *piRuntime) canSyncMCP() bool {
 	return p.profile.ManagedMCPExtension != "" && piResidents.enabled()
 }
 
+// extensionPath is the managed extension a launch loads, or empty. A Run that
+// needs MCP, review, or the shell text check requires it; otherwise it loads
+// only when installed, for prompt hygiene and compaction bounds.
 func (p *piRuntime) extensionPath(spec RunSpec, wired bool) string {
 	if wired || spec.PermissionReviewer != nil || p.guardsShellText(spec) {
 		return p.profile.ManagedMCPExtension
