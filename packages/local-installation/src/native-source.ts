@@ -65,6 +65,7 @@ import {
   writeSetupChoice,
 } from "./setup-selection.js";
 import {
+  hasPendingLibraryModelsToRestore,
   isLocalRuntimeModel,
   localModelsDegradedFromError,
   localModelsDegradedFromOutcome,
@@ -73,6 +74,7 @@ import {
   restoreLocalModels,
   type LocalModelsDegraded,
 } from "./local-models.js";
+import { clearResumeLocalModels } from "./localmodels-tool.js";
 import { prepareSourceComputer } from "./source-computer.js";
 import { connectComputer, stopComputer } from "./computer.js";
 import { prepareLocalEnrollment } from "./local-enrollment.js";
@@ -490,17 +492,25 @@ async function runNativeSource(
         Boolean(options.localModelsApproval) ||
         Boolean(options.localModelsReplan) ||
         options.shareGpu !== undefined;
+      if (
+        Boolean(options.byok) ||
+        options.setupChoice !== undefined ||
+        Boolean(options.localModelsApproval)
+      ) {
+        await clearResumeLocalModels(home).catch(() => undefined);
+      }
       // A restart reads the choice from setup-choice.json, which a source
-      // switched since on the Models page does not update, so a saved BYOK or
-      // local source keeps its own runtime and gateway/model, and a
-      // local-models choice switched to BYOK or subscription leaves the local
-      // stack stopped.
+      // switched since on the Models page does not update, so a saved BYOK,
+      // subscription, or local source keeps its own runtime and model state
+      // instead of resetting or unloading loaded library models.
       const saved =
         !options.byok && !options.setupChoice && !explicitLocal
           ? await readByokEnvironment(home)
           : undefined;
       const restoredByok = saved?.mode === "byok" ? saved : undefined;
       const restoredLocal = saved?.mode === "local" ? saved : undefined;
+      const restoredSubscription =
+        saved?.mode === "subscription" ? saved : undefined;
       await writeSetupChoice(current, choice);
       if (options.shareGpu !== undefined)
         await writeGpuSharing(current, options.shareGpu);
@@ -519,6 +529,8 @@ async function runNativeSource(
       let runtimePending = true;
       let byokGateway: ByokGatewayFailure | undefined;
       let localModelsDegraded: LocalModelsDegraded | undefined;
+      let localModelsRestored = false;
+      const restoredLocalModels: string[] = [];
       const resumeLocalModels =
         Boolean(options.resume || options.degradeLocalModels) &&
         !options.setupChoice &&
@@ -536,6 +548,13 @@ async function runNativeSource(
           const restored = await restoreLocalModels(current, {
             signal,
             onEvent: emit,
+            onRestored: (models) => {
+              localModelsRestored = true;
+              for (const id of models) {
+                if (!restoredLocalModels.includes(id))
+                  restoredLocalModels.push(id);
+              }
+            },
           });
           if (restored) {
             localModelsDegraded = localModelsDegradedFromOutcome(restored);
@@ -566,12 +585,17 @@ async function runNativeSource(
               },
             );
             // A gateway that does not come back leaves the services usable,
-            // so the outcome only reports it.
-            if (!runtimeOutcome)
+            // so the outcome only reports it. Mount BYOK first because
+            // `source apply --mode byok` unloads local models, then restore
+            // any previously loaded library models afterwards.
+            if (!runtimeOutcome) {
               byokGateway = await restoreByokSource(home, {
                 signal,
                 onEvent: emit,
               });
+              if (await hasPendingLibraryModelsToRestore(home))
+                await restoreSavedLocalModel();
+            }
           } else if (options.byok) {
             const byokRuntime =
               choice === "local-models"
@@ -588,6 +612,33 @@ async function runNativeSource(
                 env: await managedRuntimeEnvironment(home, current.root),
               },
             );
+          } else if (restoredSubscription) {
+            // Keep the saved subscription source without re-running
+            // `source apply --mode subscription` (which unloads loaded local
+            // library models during updates and restarts), and restore any
+            // library models that were loaded before stop or crash.
+            runtimeOutcome = await prepareRuntime(
+              restoredSubscription.runtime,
+              {
+                home,
+                signal,
+                onEvent: emit,
+                ...(options.resume
+                  ? { reuseInstalled: true }
+                  : {
+                      env: await managedRuntimeEnvironment(home, current.root),
+                    }),
+                onDescriptor: (descriptor) =>
+                  options.onRuntimeDescriptors?.([descriptor]),
+              },
+            );
+            if (
+              (runtimeOutcome.code === 0 ||
+                (runtimeOutcome.details as { code?: string } | undefined)
+                  ?.code === "RUNTIME_AUTH_REQUIRED") &&
+              (await hasPendingLibraryModelsToRestore(home))
+            )
+              await restoreSavedLocalModel();
           } else if (choice === "local-models") {
             // A restart or app upgrade from the saved setup choice keeps a
             // model source the person switched to on the Models page (BYOK or
@@ -637,8 +688,9 @@ async function runNativeSource(
                 !runtimeOutcome &&
                 !localModelsDegraded &&
                 !options.localModelsReplan &&
-                restoredLocal &&
-                isLocalRuntimeModel(restoredLocal.runtimeModel)
+                ((restoredLocal &&
+                  isLocalRuntimeModel(restoredLocal.runtimeModel)) ||
+                  (await hasPendingLibraryModelsToRestore(home)))
               )
                 await restoreSavedLocalModel();
             }
@@ -679,12 +731,25 @@ async function runNativeSource(
               (runtimeOutcome.code === 0 ||
                 (runtimeOutcome.details as { code?: string } | undefined)
                   ?.code === "RUNTIME_AUTH_REQUIRED")
-            )
-              runtimeOutcome =
-                (await applyNativeSource(home, "subscription", choice, {
-                  signal,
-                  onEvent: emit,
-                })) ?? runtimeOutcome;
+            ) {
+              if (options.setupChoice !== undefined)
+                runtimeOutcome =
+                  (await applyNativeSource(home, "subscription", choice, {
+                    signal,
+                    onEvent: emit,
+                  })) ?? runtimeOutcome;
+              else if (await hasPendingLibraryModelsToRestore(home))
+                await restoreSavedLocalModel();
+            } else if (
+              choice === "pi" &&
+              options.setupChoice === undefined &&
+              (runtimeOutcome.code === 0 ||
+                (runtimeOutcome.details as { code?: string } | undefined)
+                  ?.code === "RUNTIME_AUTH_REQUIRED") &&
+              (await hasPendingLibraryModelsToRestore(home))
+            ) {
+              await restoreSavedLocalModel();
+            }
           }
           if (
             runtimeOutcome &&
@@ -1230,13 +1295,16 @@ async function runNativeSource(
             // sign-in, retires one an earlier release started.
             await prepareModelGateway(
               current,
-              // A restored BYOK source keeps its gateway whatever the saved
-              // choice: a local-models choice would require the local stack.
+              // A restored BYOK or subscription source keeps its own gateway
+              // posture whatever the saved setup choice: a local-models setup
+              // choice would otherwise require the local stack controller.
               restoredByok
                 ? { runtime: restoredByok.runtime, modelSource: "byok" }
-                : options.byok && choice !== "local-models"
-                  ? { runtime: choice, modelSource: "byok" }
-                  : choice,
+                : restoredSubscription
+                  ? restoredSubscription.runtime
+                  : options.byok && choice !== "local-models"
+                    ? { runtime: choice, modelSource: "byok" }
+                    : choice,
               {
                 home,
                 signal,
@@ -1405,6 +1473,8 @@ async function runNativeSource(
               businessVerification: "not_run",
               ...(byokGateway ? { byokGateway } : {}),
               ...(localModelsDegraded ? { localModelsDegraded } : {}),
+              ...(localModelsRestored ? { localModelsRestored: true } : {}),
+              ...(restoredLocalModels.length ? { restoredLocalModels } : {}),
             },
           };
         }
@@ -1448,6 +1518,8 @@ async function runNativeSource(
               businessVerification: "not_run",
               ...(byokGateway ? { byokGateway } : {}),
               ...(localModelsDegraded ? { localModelsDegraded } : {}),
+              ...(localModelsRestored ? { localModelsRestored: true } : {}),
+              ...(restoredLocalModels.length ? { restoredLocalModels } : {}),
               ...(authPending && typeof runtimeOutcome?.details === "object"
                 ? runtimeOutcome.details
                 : {}),

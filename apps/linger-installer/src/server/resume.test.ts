@@ -130,7 +130,7 @@ test("brings the local models back while the services keep running", async () =>
   expect(run).not.toHaveBeenCalled();
 });
 
-test("mounts a saved BYOK source again after the local models", async () => {
+test("mounts a saved BYOK source before restoring local models", async () => {
   const order: string[] = [];
   const restore = vi.fn(async () => {
     order.push("restore");
@@ -149,11 +149,44 @@ test("mounts a saved BYOK source again after the local models", async () => {
       restoreByok,
     }),
   ).toMatchObject({ code: 0, message: "Services are already running." });
-  expect(order).toEqual(["restore", "byok"]);
+  expect(order).toEqual(["byok", "restore"]);
   expect(restoreByok).toHaveBeenCalledWith(
     "/home",
     expect.objectContaining({ signal: options.signal }),
   );
+});
+
+test("reports restored local models and still restores them when BYOK mount fails", async () => {
+  const byokGateway = {
+    code: "BYOK_UNREACHABLE",
+    message: "Endpoint did not answer.",
+  };
+  const restore = vi.fn(
+    async (
+      _instance: Instance,
+      opts: { onRestored?: (models: string[]) => void },
+    ) => {
+      opts.onRestored?.(["spark-x2.6-4b:Q4_K_M"]);
+      return undefined;
+    },
+  );
+  expect(
+    await resumeSourceInstance(options, {
+      load: async () => instance,
+      engines: native(vi.fn(), true),
+      pending: async () => false,
+      restore,
+      restoreByok: async () => byokGateway,
+    }),
+  ).toMatchObject({
+    code: 0,
+    state: "ready",
+    details: {
+      byokGateway,
+      localModelsRestored: true,
+      restoredLocalModels: ["spark-x2.6-4b:Q4_K_M"],
+    },
+  });
 });
 
 test("reports a BYOK gateway that did not come back on a ready resume", async () => {
@@ -172,7 +205,7 @@ test("reports a BYOK gateway that did not come back on a ready resume", async ()
   ).toMatchObject({ code: 0, state: "ready", details: { byokGateway } });
 });
 
-test("reports a local model library reload failure as localModelsDegraded without blocking resume", async () => {
+test("reports a local model library reload failure as localModelsDegraded without blocking resume or BYOK", async () => {
   const failed = {
     code: 1,
     state: "failed" as const,
@@ -205,11 +238,11 @@ test("reports a local model library reload failure as localModelsDegraded withou
       },
     },
   });
-  expect(restoreByok).not.toHaveBeenCalled();
+  expect(restoreByok).toHaveBeenCalledTimes(1);
   expect(logs.join("")).toContain("LOAD_NO_ROOM");
 });
 
-test("reports a local model restore that failed without blocking resume", async () => {
+test("reports a local model restore that failed without blocking resume or BYOK", async () => {
   const failed = {
     code: 4,
     state: "action_required" as const,
@@ -245,11 +278,11 @@ test("reports a local model restore that failed without blocking resume", async 
       },
     },
   });
-  expect(restoreByok).not.toHaveBeenCalled();
+  expect(restoreByok).toHaveBeenCalledTimes(1);
   expect(logs.join("")).toContain("LOCAL_MODELS_RECOVERY_REQUIRED");
 });
 
-test("reports a local model restore that throws without blocking resume", async () => {
+test("reports a local model restore that throws without blocking resume or BYOK", async () => {
   const logs: string[] = [];
   const restoreByok = vi.fn(async () => undefined);
   expect(
@@ -277,7 +310,7 @@ test("reports a local model restore that throws without blocking resume", async 
       },
     },
   });
-  expect(restoreByok).not.toHaveBeenCalled();
+  expect(restoreByok).toHaveBeenCalledTimes(1);
   expect(logs.join("")).toContain("Invalid upstream local model binding.");
 });
 
