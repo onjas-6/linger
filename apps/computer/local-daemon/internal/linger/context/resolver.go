@@ -73,9 +73,9 @@ const teamHubWebToolGuide = "Web tools: search the web with `teamhub web search 
 // link that still has its own web tools.
 const teamHubWebOverOwnTools = "Use them instead of your built-in web search and fetch tools, which may not work through the API this model is served by."
 
-// staticPrefixEndMarker marks the end of the cacheable static system-prompt
-// prefix. Static host guides sit before this marker and volatile agent or
-// context sections follow it.
+// staticPrefixEndMarker is the internal insertion slot emitted between the
+// static prefix and volatile context sections by node-services. It is consumed
+// and removed by assembleResolvedInstructions so the model never sees it.
 const staticPrefixEndMarker = "<!-- LINGER_STATIC_PREFIX_END -->"
 
 // webToolGuide describes the web tools an Operation has. A Runtime on a
@@ -205,7 +205,7 @@ func (r ExecutionResolver) Resolve(ctx context.Context, command protocol.Command
 	if webGuide != "" {
 		daemonStaticGuides = append(daemonStaticGuides, webGuide)
 	}
-	resolvedDeveloper, systemPrompt := assembleResolvedInstructions(
+	resolvedDeveloper, systemPrompt, hadMarker := assembleResolvedInstructions(
 		instructionValue(request.SessionOptions.BaseInstructions),
 		developerInstructions,
 		daemonStaticGuides,
@@ -231,7 +231,7 @@ func (r ExecutionResolver) Resolve(ctx context.Context, command protocol.Command
 		WithoutNativeWebTools: installation.ModelGateway,
 		TenantID:              command.TenantID, OwnerActorID: binding.OwnerActorID, AgentID: command.AgentID,
 	}
-	if len(daemonStaticGuides) > 0 {
+	if len(daemonStaticGuides) > 0 || hadMarker {
 		spec.DeveloperInstructions = &resolvedDeveloper
 	}
 	// The profile path is stable and depends only on the Agent-level credential,
@@ -498,21 +498,20 @@ func joinNonEmptySections(parts ...string) string {
 	return strings.Join(nonEmpty, "\n\n")
 }
 
-// assembleResolvedInstructions places static Daemon guides before
-// staticPrefixEndMarker and places per-Agent BaseInstructions after it when
-// the marker is present. Legacy inputs without the marker keep BaseInstructions
-// first and append guides at the end.
-func assembleResolvedInstructions(base, developer string, daemonStaticGuides []string) (string, string) {
+// assembleResolvedInstructions replaces staticPrefixEndMarker with static Daemon
+// guides and places per-Agent BaseInstructions before the dynamic tail when the
+// internal slot is present. Legacy inputs without the marker keep
+// BaseInstructions first and append guides at the end.
+func assembleResolvedInstructions(base, developer string, daemonStaticGuides []string) (string, string, bool) {
 	if staticPart, dynamicPart, hasMarker := strings.Cut(developer, staticPrefixEndMarker); hasMarker {
-		staticParts := append([]string{staticPart}, daemonStaticGuides...)
-		staticSection := joinNonEmptySections(staticParts...)
-		resolvedDeveloper := joinNonEmptySections(staticSection, staticPrefixEndMarker, dynamicPart)
-		systemPrompt := joinNonEmptySections(staticSection, staticPrefixEndMarker, base, dynamicPart)
-		return resolvedDeveloper, systemPrompt
+		staticSection := joinNonEmptySections(append([]string{staticPart}, daemonStaticGuides...)...)
+		resolvedDeveloper := joinNonEmptySections(staticSection, dynamicPart)
+		systemPrompt := joinNonEmptySections(staticSection, base, dynamicPart)
+		return resolvedDeveloper, systemPrompt, true
 	}
 	resolvedDeveloper := joinNonEmptySections(append([]string{developer}, daemonStaticGuides...)...)
 	systemPrompt := joinNonEmptySections(base, resolvedDeveloper)
-	return resolvedDeveloper, systemPrompt
+	return resolvedDeveloper, systemPrompt, false
 }
 
 const trustedHostServiceInstructions = "When the user asks for a local server or other process that must remain available after this turn, start it through the Computer daemon with `linger-computer daemon service start <name> -- <command> [args...]`. Do not use shell backgrounding or nohup for a persistent service because command-process containment will stop it. Use `linger-computer daemon service stop <name>` before replacing it, and verify the final localhost URL after the managed start returns."

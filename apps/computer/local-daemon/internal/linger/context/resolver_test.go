@@ -422,31 +422,57 @@ func TestExecutionResolverPlacesStaticGuidesBeforeMarkerAndBaseAfter(t *testing.
 		t.Fatal(err)
 	}
 
-	markerIdx := strings.Index(specA.SystemPrompt, staticPrefixEndMarker)
-	if markerIdx <= 0 {
-		t.Fatalf("missing static prefix marker in SystemPrompt: %q", specA.SystemPrompt)
+	if strings.Contains(specA.SystemPrompt, staticPrefixEndMarker) || strings.Contains(specB.SystemPrompt, staticPrefixEndMarker) {
+		t.Fatalf("internal static prefix marker leaked into SystemPrompt: A=%q B=%q", specA.SystemPrompt, specB.SystemPrompt)
 	}
-	staticPrefixA := specA.SystemPrompt[:markerIdx+len(staticPrefixEndMarker)]
-	staticPrefixB := specB.SystemPrompt[:strings.Index(specB.SystemPrompt, staticPrefixEndMarker)+len(staticPrefixEndMarker)]
-	if staticPrefixA != staticPrefixB {
-		t.Fatalf("static prefix diverged across agents:\nA=%q\nB=%q", staticPrefixA, staticPrefixB)
+	if specA.DeveloperInstructions == nil || strings.Contains(*specA.DeveloperInstructions, staticPrefixEndMarker) {
+		t.Fatalf("internal static prefix marker leaked into DeveloperInstructions: %v", specA.DeveloperInstructions)
 	}
-	for _, wantStatic := range []string{"StaticCore", trustedHostServiceInstructions, boundServiceInstructions(nil), "StaticToolGuide"} {
-		if !strings.Contains(staticPrefixA, wantStatic) {
-			t.Fatalf("static prefix missing %q: %q", wantStatic, staticPrefixA)
-		}
+
+	expectedStaticPrefix := strings.Join([]string{
+		"StaticCore",
+		trustedHostServiceInstructions,
+		boundServiceInstructions(nil),
+		"StaticToolGuide",
+	}, "\n\n")
+	if !strings.HasPrefix(specA.SystemPrompt, expectedStaticPrefix+"\n\n") || !strings.HasPrefix(specB.SystemPrompt, expectedStaticPrefix+"\n\n") {
+		t.Fatalf("static prefix mismatch across agents:\nwant prefix=%q\nA=%q\nB=%q", expectedStaticPrefix, specA.SystemPrompt, specB.SystemPrompt)
 	}
-	tailA := specA.SystemPrompt[markerIdx+len(staticPrefixEndMarker):]
-	if !strings.Contains(tailA, "Agent A Prompt") || !strings.Contains(tailA, "DynamicA") || !strings.Contains(tailA, "<user-memory") {
-		t.Fatalf("dynamic tail missing expected sections: %q", tailA)
+	wantSystemA := expectedStaticPrefix + "\n\nAgent A Prompt\n\nDynamicA\n\n<user-memory version=\"1\">MemA</user-memory>"
+	if specA.SystemPrompt != wantSystemA {
+		t.Fatalf("specA.SystemPrompt = %q, want %q", specA.SystemPrompt, wantSystemA)
 	}
-	if strings.Index(tailA, "Agent A Prompt") > strings.Index(tailA, "DynamicA") {
-		t.Fatalf("expected BaseInstructions right after marker before DynamicA: %q", tailA)
+	wantSystemB := expectedStaticPrefix + "\n\nAgent B Prompt\n\nDynamicB\n\n<user-memory version=\"2\">MemB</user-memory>"
+	if specB.SystemPrompt != wantSystemB {
+		t.Fatalf("specB.SystemPrompt = %q, want %q", specB.SystemPrompt, wantSystemB)
+	}
+	wantDevA := expectedStaticPrefix + "\n\nDynamicA\n\n<user-memory version=\"1\">MemA</user-memory>"
+	if *specA.DeveloperInstructions != wantDevA {
+		t.Fatalf("specA.DeveloperInstructions = %q, want %q", *specA.DeveloperInstructions, wantDevA)
 	}
 	if specA.BaseInstructions == nil || *specA.BaseInstructions != "Agent A Prompt" {
 		t.Fatalf("BaseInstructions altered: %v", specA.BaseInstructions)
 	}
-	if specA.DeveloperInstructions == nil || !strings.Contains(*specA.DeveloperInstructions, "StaticToolGuide\n\n"+staticPrefixEndMarker) {
-		t.Fatalf("DeveloperInstructions did not insert static guide before marker: %v", specA.DeveloperInstructions)
+
+	// Even when the Daemon adds zero static guides, the internal slot marker is stripped.
+	untrustedResolver := ExecutionResolver{
+		Providers:       resolver.Providers,
+		WorkspaceGrants: resolver.WorkspaceGrants,
+		Views:           resolver.Views,
+		Registrations:   resolver.Registrations,
+	}
+	untrustedCmd := cmd
+	untrustedCmd.HostAccess = ""
+	specNoGuides, err := untrustedResolver.Resolve(context.Background(), untrustedCmd, reqA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNoGuidesSystem := "StaticCore\n\nAgent A Prompt\n\nDynamicA\n\n<user-memory version=\"1\">MemA</user-memory>"
+	if specNoGuides.SystemPrompt != wantNoGuidesSystem {
+		t.Fatalf("specNoGuides.SystemPrompt = %q, want %q", specNoGuides.SystemPrompt, wantNoGuidesSystem)
+	}
+	wantNoGuidesDev := "StaticCore\n\nDynamicA\n\n<user-memory version=\"1\">MemA</user-memory>"
+	if specNoGuides.DeveloperInstructions == nil || *specNoGuides.DeveloperInstructions != wantNoGuidesDev {
+		t.Fatalf("specNoGuides.DeveloperInstructions = %v, want %q", specNoGuides.DeveloperInstructions, wantNoGuidesDev)
 	}
 }
