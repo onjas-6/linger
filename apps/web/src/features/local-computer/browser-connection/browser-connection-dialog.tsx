@@ -193,7 +193,7 @@ export function BrowserConnectionDialog({
                 />
               </p>
             ) : (
-              <label className="block">
+              <div>
                 <span className="mb-1.5 block text-sm font-medium text-foreground">
                   {t(computersMessages.computer)}
                 </span>
@@ -214,7 +214,7 @@ export function BrowserConnectionDialog({
                     </SelectItem>
                   ))}
                 </Select>
-              </label>
+              </div>
             )}
 
             <BrowserConnectionStatusSection
