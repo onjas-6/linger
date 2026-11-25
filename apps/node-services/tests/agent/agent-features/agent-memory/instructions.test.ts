@@ -10,8 +10,6 @@ const common = {
   agentName: "Research Partner",
   agentActorId: "actor:agent-1",
   agentType: "anotherme",
-  canSendDirectMessage: true,
-  developerInstructions: undefined,
   sponsor: { actorId: "actor:sponsor", displayName: "Test Sponsor" },
   connectedApps: true,
   connectedAppKeys: [],

@@ -379,3 +379,74 @@ func TestContextSkillDigest(t *testing.T) {
 		}
 	}
 }
+
+func TestExecutionResolverPlacesStaticGuidesBeforeMarkerAndBaseAfter(t *testing.T) {
+	resolver := ExecutionResolver{
+		Providers: map[string]ProviderInstallation{
+			"pi": {Type: "pi", ExecutablePath: "/local/bin/pi", ModelGateway: true, APILink: true},
+		},
+		WorkspaceGrants: map[string]WorkspaceGrant{
+			"grant-local": {GrantID: "grant-local", TenantID: "tenant-acme", Path: "/local/workspace"},
+		},
+		Views: testContextViews{root: "/local/workspace"},
+		Registrations: map[string]RegistrationBinding{
+			"registration-pi": {RegistrationID: "registration-pi", TenantID: "tenant-acme", OwnerActorID: "actor-alice", ProviderType: "pi", Status: registration.StatusOnline},
+		},
+		ToolGuide: "StaticToolGuide",
+	}
+	cmd := protocol.Command{
+		TenantID: "tenant-acme", RegistrationID: "registration-pi", AssignmentRevision: 1,
+		WorkspaceGrantID: "grant-local", RuntimeType: "pi", HostAccess: "trusted",
+		ContextViewRef: json.RawMessage(`{"receipt_ref":"receipt-1"}`),
+	}
+	reqA := json.RawMessage(`{
+		"kind":"run.start",
+		"runtime":{"type":"pi","model":"localmodels/model-a"},
+		"session_options":{"thread_name":"Agent A","base_instructions":"Agent A Prompt","developer_instructions":"StaticCore\n\n` + staticPrefixEndMarker + `\n\nDynamicA\n\n<user-memory version=\"1\">MemA</user-memory>"},
+		"session":{},
+		"input":{"type":"text","text":"Hi"}
+	}`)
+	reqB := json.RawMessage(`{
+		"kind":"run.start",
+		"runtime":{"type":"pi","model":"localmodels/model-a"},
+		"session_options":{"thread_name":"Agent B","base_instructions":"Agent B Prompt","developer_instructions":"StaticCore\n\n` + staticPrefixEndMarker + `\n\nDynamicB\n\n<user-memory version=\"2\">MemB</user-memory>"},
+		"session":{},
+		"input":{"type":"text","text":"Hi"}
+	}`)
+	specA, err := resolver.Resolve(context.Background(), cmd, reqA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specB, err := resolver.Resolve(context.Background(), cmd, reqB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	markerIdx := strings.Index(specA.SystemPrompt, staticPrefixEndMarker)
+	if markerIdx <= 0 {
+		t.Fatalf("missing static prefix marker in SystemPrompt: %q", specA.SystemPrompt)
+	}
+	staticPrefixA := specA.SystemPrompt[:markerIdx+len(staticPrefixEndMarker)]
+	staticPrefixB := specB.SystemPrompt[:strings.Index(specB.SystemPrompt, staticPrefixEndMarker)+len(staticPrefixEndMarker)]
+	if staticPrefixA != staticPrefixB {
+		t.Fatalf("static prefix diverged across agents:\nA=%q\nB=%q", staticPrefixA, staticPrefixB)
+	}
+	for _, wantStatic := range []string{"StaticCore", trustedHostServiceInstructions, boundServiceInstructions(nil), "StaticToolGuide"} {
+		if !strings.Contains(staticPrefixA, wantStatic) {
+			t.Fatalf("static prefix missing %q: %q", wantStatic, staticPrefixA)
+		}
+	}
+	tailA := specA.SystemPrompt[markerIdx+len(staticPrefixEndMarker):]
+	if !strings.Contains(tailA, "Agent A Prompt") || !strings.Contains(tailA, "DynamicA") || !strings.Contains(tailA, "<user-memory") {
+		t.Fatalf("dynamic tail missing expected sections: %q", tailA)
+	}
+	if strings.Index(tailA, "Agent A Prompt") > strings.Index(tailA, "DynamicA") {
+		t.Fatalf("expected BaseInstructions right after marker before DynamicA: %q", tailA)
+	}
+	if specA.BaseInstructions == nil || *specA.BaseInstructions != "Agent A Prompt" {
+		t.Fatalf("BaseInstructions altered: %v", specA.BaseInstructions)
+	}
+	if specA.DeveloperInstructions == nil || !strings.Contains(*specA.DeveloperInstructions, "StaticToolGuide\n\n"+staticPrefixEndMarker) {
+		t.Fatalf("DeveloperInstructions did not insert static guide before marker: %v", specA.DeveloperInstructions)
+	}
+}

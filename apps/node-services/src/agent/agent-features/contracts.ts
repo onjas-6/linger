@@ -260,6 +260,16 @@ export type MaintenanceEvent =
       readonly outcome: MaintenanceOutcome;
     };
 
+export interface ContextInstructionSections {
+  readonly static?: string;
+  readonly dynamic?: string;
+}
+
+export type ContextInstructionContribution =
+  | string
+  | ContextInstructionSections
+  | undefined;
+
 /**
  * Context-scope ports. Handlers run in deterministic declared order. Pure
  * contribution ports receive only FeatureContextView; `afterInboxInputAccepted`
@@ -282,7 +292,7 @@ export interface ContextFeatureHandlers {
   contributeContextInstructions?(
     view: FeatureContextView,
     facts: ContextInstructionFacts,
-  ): string | undefined;
+  ): ContextInstructionContribution;
   /** Pure contribution to notification prompt context (first render + replay). */
   contributeNotificationContext?(
     view: FeatureContextView,

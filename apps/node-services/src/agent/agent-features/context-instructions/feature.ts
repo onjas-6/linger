@@ -1,12 +1,12 @@
 import { defineFeature, type FeatureDeclaration } from "../contracts.js";
 import type { MetaRoomKind } from "../../executor/context-ref.js";
-import { assembleExecutionContextDeveloperInstructions } from "./context-instructions.js";
+import { assembleExecutionContextDeveloperInstructionsSections } from "./context-instructions.js";
 
 export const CONTEXT_INSTRUCTIONS_FEATURE_ID = "context-instructions";
 
 /**
- * Contributes Context identity and role-capability instructions. No external dependencies; the instruction content is determined only by the activation's facts and trusted
- * identity, configuration, and Context ref facts.
+ * Contributes Context identity and role-capability instructions split into
+ * static and dynamic sections around the static prefix marker.
  */
 export const createContextInstructionsFeature = (): FeatureDeclaration =>
   defineFeature({
@@ -28,11 +28,10 @@ export const createContextInstructionsFeature = (): FeatureDeclaration =>
                     roomId: ref.roomId,
                     roomKind: view.roomKind as MetaRoomKind,
                   } as const);
-          return assembleExecutionContextDeveloperInstructions({
+          return assembleExecutionContextDeveloperInstructionsSections({
             agentName: view.agent.name,
             agentActorId: view.identity.actorId,
             agentType: view.identity.agentType,
-            developerInstructions: view.agent.developerInstructions,
             representedHuman: view.identity.representedHuman,
             sponsor: view.identity.sponsor,
             connectedApps: facts.connectedApps,
