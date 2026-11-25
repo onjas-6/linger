@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -233,6 +234,26 @@ func TestCodexReasoningTitles(t *testing.T) {
 	}
 	if _, ok := ReasoningTitle("no newline yet", false); ok {
 		t.Fatal("incomplete line resolved")
+	}
+}
+
+func TestReasoningTitleBoundsLength(t *testing.T) {
+	overLimit := strings.Repeat("a", MaxReasoningTitleRunes+100)
+	got, ok := ReasoningTitle(overLimit, false)
+	if !ok {
+		t.Fatal("over-limit incomplete line stayed buffered")
+	}
+	if utf8.RuneCountInString(got) != MaxReasoningTitleRunes || !strings.HasSuffix(got, "…") {
+		t.Fatalf("over-limit line = %d runes, suffix=%v", utf8.RuneCountInString(got), strings.HasSuffix(got, "…"))
+	}
+
+	unclosedBold := "**" + strings.Repeat("b", MaxReasoningTitleRunes+100)
+	got, ok = ReasoningTitle(unclosedBold, false)
+	if !ok {
+		t.Fatal("over-limit unclosed bold span stayed buffered")
+	}
+	if utf8.RuneCountInString(got) != MaxReasoningTitleRunes || !strings.HasSuffix(got, "…") {
+		t.Fatalf("over-limit bold = %d runes, suffix=%v", utf8.RuneCountInString(got), strings.HasSuffix(got, "…"))
 	}
 }
 

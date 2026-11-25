@@ -29,6 +29,41 @@ func TestToolNameFitsTheGatewayLimit(t *testing.T) {
 	}
 }
 
+func TestThinkingTitleFitsTheGatewayLimit(t *testing.T) {
+	unicodeTitle := strings.Repeat("\u00e9", native.MaxReasoningTitleRunes+25)
+	expandedSecretTitle := strings.Repeat("x", native.MaxReasoningTitleRunes-5) + " password=a"
+	for _, raw := range []string{unicodeTitle, expandedSecretTitle} {
+		event := normalizeMessage(native.Event{Kind: native.EventReasoning, Title: raw}, "operation-1").(map[string]any)
+		title, ok := event["title"].(string)
+		if !ok || title == "" {
+			t.Fatalf("thinking title missing: %v", event)
+		}
+		if got := utf8.RuneCountInString(title); got > native.MaxReasoningTitleRunes {
+			t.Fatalf("thinking title has %d characters", got)
+		}
+	}
+
+	projection := eventProjection{operationID: "operation-1"}
+	first := projection.project(native.Event{Kind: native.EventReasoning, Body: strings.Repeat("p", native.MaxReasoningTitleRunes-10)})
+	if len(first) != 1 || first[0].(map[string]any)["title"] != nil {
+		t.Fatalf("thinking did not start untitled: %v", first)
+	}
+	resolved := projection.project(native.Event{Kind: native.EventReasoning, Body: strings.Repeat("q", 20) + " password=a"})
+	if len(resolved) != 1 {
+		t.Fatalf("over-limit streamed thinking events = %v", resolved)
+	}
+	title, ok := resolved[0].(map[string]any)["title"].(string)
+	if !ok || title == "" {
+		t.Fatalf("over-limit streamed thinking title missing: %v", resolved)
+	}
+	if got := utf8.RuneCountInString(title); got > native.MaxReasoningTitleRunes {
+		t.Fatalf("streamed thinking title has %d characters", got)
+	}
+	if projection.reasoning != "" {
+		t.Fatalf("projection retained resolved reasoning buffer: %d bytes", len(projection.reasoning))
+	}
+}
+
 func TestFirstTurnPublishesNativeSessionBeforeExecution(t *testing.T) {
 	event := normalizeMessage(native.Event{Kind: native.EventStatus, TurnID: "turn-first", SessionID: "thread-created"}, "operation-first").(map[string]any)
 	session, ok := event["session"].(map[string]any)
