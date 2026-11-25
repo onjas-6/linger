@@ -1,19 +1,15 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
-  createWriteStream,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
-  writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-
-import type { LocalReleaseDescriptor } from "@linger/local-installation/release-descriptor";
 
 import {
   Notification,
@@ -355,15 +351,21 @@ async function main(): Promise<void> {
       ? rawCheckInterval
       : undefined;
 
+  const isLocalServerMode = async (): Promise<boolean> =>
+    (await localServer.hasLocalInstance()) ||
+    (!app.isPackaged && process.env.LINGER_ENABLE_BUNDLE_UPDATER === "1");
+
   const bundleStore = new BundleStoreModule({
     home,
     seedDirectory,
     target: bundleTarget,
+    shouldImportSeed: isLocalServerMode,
   });
   const bundleUpdater = new BundleUpdaterModule({
     shellVersion,
     target: bundleTarget,
     enabled: app.isPackaged || process.env.LINGER_ENABLE_BUNDLE_UPDATER === "1",
+    isLocalMode: isLocalServerMode,
     ...(bundlePublicKey ? { publicKey: bundlePublicKey } : {}),
     ...(bundleCheckDelayMs !== undefined
       ? { checkDelayMs: bundleCheckDelayMs }
@@ -373,159 +375,6 @@ async function main(): Promise<void> {
       : {}),
   });
   const runExec = promisify(execFile);
-  let managedTeamhub: ChildProcess | undefined;
-  const stopManagedTeamhub = async (): Promise<void> => {
-    const child = managedTeamhub;
-    managedTeamhub = undefined;
-    if (!child || child.exitCode !== null) return;
-    await new Promise<void>((resolveStop) => {
-      const killTimer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already exited
-        }
-        resolveStop();
-      }, 4_000);
-      child.once("exit", () => {
-        clearTimeout(killTimer);
-        resolveStop();
-      });
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        clearTimeout(killTimer);
-        resolveStop();
-      }
-    });
-  };
-  const startManagedTeamhub = async (
-    release: LocalReleaseDescriptor,
-  ): Promise<void> => {
-    if (process.env.LINGER_TEAMHUB_MANAGED !== "1") return;
-    await stopManagedTeamhub();
-    const exe = (name: string) =>
-      process.platform === "win32" ? `${name}.exe` : name;
-    const backendDir = path.join(home, release.modules.backend.path);
-    const teamhubDir = path.join(backendDir, "teamhub");
-    const migrateExe = path.join(teamhubDir, exe("migrate"));
-    const teamhubExe = path.join(teamhubDir, exe("teamhub"));
-    if (existsSync(migrateExe) && process.env.TEAMHUB_DATABASE_URL) {
-      await runExec(migrateExe, [], { cwd: teamhubDir, env: process.env });
-    }
-    if (!existsSync(teamhubExe)) {
-      throw new Error(`Managed teamhub binary missing: ${teamhubExe}`);
-    }
-    const logDir = path.join(userData, "logs");
-    mkdirSync(logDir, { recursive: true });
-    const logStream = createWriteStream(path.join(logDir, "teamhub.log"), {
-      flags: "a",
-    });
-    const child = spawn(teamhubExe, [], {
-      cwd: teamhubDir,
-      env: {
-        ...process.env,
-        GIN_MODE: "release",
-        TEAMHUB_SKILLS_DIR: path.join(backendDir, "skills"),
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout?.pipe(logStream);
-    child.stderr?.pipe(logStream);
-    managedTeamhub = child;
-    if (child.pid) {
-      writeFileSync(
-        path.join(userData, "teamhub.pid"),
-        JSON.stringify({
-          pid: child.pid,
-          appVersion: release.appVersion,
-          artifactId: release.modules.backend.artifactId,
-        }),
-        "utf8",
-      );
-    }
-    log.info("managed_teamhub.started", {
-      pid: child.pid,
-      appVersion: release.appVersion,
-      artifactId: release.modules.backend.artifactId,
-    });
-  };
-
-  let managedVoiceRuntime: ChildProcess | undefined;
-  let activeVoiceSessions = 0;
-  let voicePollTimer: ReturnType<typeof setInterval> | undefined;
-  const stopManagedVoiceRuntime = async (): Promise<void> => {
-    const child = managedVoiceRuntime;
-    managedVoiceRuntime = undefined;
-    if (!child || child.exitCode !== null) return;
-    await new Promise<void>((resolveStop) => {
-      const killTimer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already exited
-        }
-        resolveStop();
-      }, 4_000);
-      child.once("exit", () => {
-        clearTimeout(killTimer);
-        resolveStop();
-      });
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        clearTimeout(killTimer);
-        resolveStop();
-      }
-    });
-  };
-  const startManagedVoiceRuntime = async (
-    release: LocalReleaseDescriptor,
-  ): Promise<void> => {
-    if (process.env.LINGER_VOICE_RUNTIME_MANAGED !== "1") return;
-    await stopManagedVoiceRuntime();
-    const nsDir = path.join(home, release.modules.backend.path, "node-services");
-    const entry = path.join(nsDir, "voice-runtime.mjs");
-    if (!existsSync(entry)) {
-      throw new Error(`Managed voice-runtime entry missing: ${entry}`);
-    }
-    const logDir = path.join(userData, "logs");
-    mkdirSync(logDir, { recursive: true });
-    const logStream = createWriteStream(path.join(logDir, "voice-runtime.log"), {
-      flags: "a",
-    });
-    const nodeBin = process.env.LINGER_NODE_BIN || process.execPath;
-    const child = spawn(nodeBin, [entry], {
-      cwd: nsDir,
-      env: {
-        ...process.env,
-        ...(nodeBin === process.execPath ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
-        LINGER_APP_VERSION: release.appVersion,
-        LINGER_BACKEND_ARTIFACT_ID: release.modules.backend.artifactId,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout?.pipe(logStream);
-    child.stderr?.pipe(logStream);
-    managedVoiceRuntime = child;
-    if (child.pid) {
-      writeFileSync(
-        path.join(userData, "voice-runtime.pid"),
-        JSON.stringify({
-          pid: child.pid,
-          appVersion: release.appVersion,
-          artifactId: release.modules.backend.artifactId,
-          port: Number(process.env.LINGER_VOICE_RUNTIME_PORT || 0),
-        }),
-        "utf8",
-      );
-    }
-    log.info("managed_voice_runtime.started", {
-      pid: child.pid,
-      appVersion: release.appVersion,
-      artifactId: release.modules.backend.artifactId,
-    });
-  };
 
   const healthWatchdog = new HealthWatchdogModule();
   const healthGateTimeoutMs =
@@ -539,7 +388,6 @@ async function main(): Promise<void> {
   const releaseOrchestrator = new ReleaseOrchestratorModule({
     activeOperations: () =>
       computerDaemon.running() +
-      activeVoiceSessions +
       (!app.isPackaged &&
       process.env.LINGER_TEST_BUSY_FILE &&
       existsSync(process.env.LINGER_TEST_BUSY_FILE)
@@ -572,7 +420,6 @@ async function main(): Promise<void> {
       : undefined,
     restoreDatabase: process.env.TEAMHUB_DATABASE_URL
       ? async (relFile) => {
-          await stopManagedTeamhub();
           const absFile = path.join(home, relFile);
           const pgRestoreBin =
             process.env.LINGER_PG_RESTORE_BIN || "pg_restore";
@@ -596,6 +443,10 @@ async function main(): Promise<void> {
       const origin = config.get().serverUrl;
       const token = process.env.LINGER_WEB_CONTROL_TOKEN;
       if (!origin || !token) return;
+      // Thin Client guard (P1-2): never POST internal reload-static to a remote server.
+      if (!(await localServer.servesWindow()) && !isLoopbackOrigin(origin)) {
+        return;
+      }
       const nextRoot = path.join(home, release.modules.web.path, "dist");
       const res = await fetch(new URL("/__internal/reload-static", origin), {
         method: "POST",
@@ -620,8 +471,12 @@ async function main(): Promise<void> {
     },
     restartServices: async (release, changed) => {
       if (changed.includes("backend")) {
-        await startManagedTeamhub(release);
-        await startManagedVoiceRuntime(release);
+        // P0-4: Delegate backend release switching (teamhub + node-services)
+        // exclusively through installer.js so PID tracking & uninstall --stop
+        // remain under a single lifecycle owner with zero orphan processes.
+        if (await localServer.hasLocalInstance()) {
+          await localServer.switchRelease(release.appVersion);
+        }
         const daemonDir = path.join(
           home,
           release.modules.backend.path,
@@ -640,13 +495,23 @@ async function main(): Promise<void> {
             "bin",
             process.platform === "win32" ? "node.exe" : "node",
           );
+          const toolsDir = computerToolsDirectory();
           computerDaemon.reloadBinary({
             spawn: spawnDaemon(
               daemonExe,
               path.join(userData, "logs", "computer-daemon.log"),
             ),
             teamhubCliDirectory: path.join(daemonDir, "teamhub-cli"),
-            extraEnv: { LINGER_TOOLS_NODE_PATH: sharedNode },
+            extraEnv: {
+              LINGER_TOOLS_NODE_PATH: sharedNode,
+              // P0-2: Allow externalized teamhub-cli wrappers to locate the Electron shell binary.
+              LINGER_CLI_NODE_PATH: process.execPath,
+              // P1-1: Keep Shell-bundled computer-tools (Playwright, CuaDriver.app, QuickJS)
+              // reachable after daemon binary moves into `<home>/store/backend/<id>/`.
+              ...(existsSync(toolsDir)
+                ? { LINGER_COMPUTER_TOOLS_DIR: toolsDir }
+                : {}),
+            },
             whenIdle: false,
           });
         }
@@ -658,12 +523,13 @@ async function main(): Promise<void> {
     },
     buildHealthProbes: (_release, changed) => {
       const origin = config.get().serverUrl;
+      const localOrigin = origin && isLoopbackOrigin(origin) ? origin : undefined;
       const probes = [];
-      if (changed.includes("web") && origin) {
+      if (changed.includes("web") && localOrigin) {
         probes.push({
           name: "web-healthz",
           check: async () => {
-            const res = await fetch(new URL("/healthz", origin)).catch(
+            const res = await fetch(new URL("/healthz", localOrigin)).catch(
               () => undefined,
             );
             return res?.ok ?? false;
@@ -673,7 +539,7 @@ async function main(): Promise<void> {
       if (changed.includes("backend")) {
         const teamhubHealth =
           (!app.isPackaged && process.env.LINGER_TEAMHUB_HEALTH_URL) ||
-          (origin ? new URL("/healthz", origin).toString() : undefined);
+          (localOrigin ? new URL("/healthz", localOrigin).toString() : undefined);
         if (teamhubHealth) {
           probes.push({
             name: "teamhub-healthz",
@@ -695,21 +561,6 @@ async function main(): Promise<void> {
             },
           });
         }
-        const vrHealth =
-          !app.isPackaged && process.env.LINGER_VOICE_RUNTIME_HEALTH_URL;
-        if (vrHealth) {
-          probes.push({
-            name: "voice-runtime-healthz",
-            check: async () => {
-              const res = await fetch(vrHealth).catch(() => undefined);
-              if (!res?.ok) return false;
-              const body = (await res.json().catch(() => undefined)) as
-                | { ok?: boolean; livekitReachable?: boolean }
-                | undefined;
-              return Boolean(body?.ok && body?.livekitReachable);
-            },
-          });
-        }
       }
       return probes;
     },
@@ -722,57 +573,6 @@ async function main(): Promise<void> {
       stop: async () => {},
     },
     bundleStore,
-    {
-      name: "ManagedTeamhub",
-      dependsOn: ["BundleStore"],
-      start: async () => {
-        if (process.env.LINGER_TEAMHUB_MANAGED !== "1") return;
-        const current = await bundleStore.currentRelease();
-        if (current) await startManagedTeamhub(current);
-      },
-      stop: async () => {
-        await stopManagedTeamhub();
-      },
-    },
-    {
-      name: "ManagedVoiceRuntime",
-      dependsOn: ["BundleStore"],
-      start: async (ctx) => {
-        if (process.env.LINGER_VOICE_RUNTIME_MANAGED !== "1") return;
-        const current = await bundleStore.currentRelease();
-        if (current) await startManagedVoiceRuntime(current);
-        const port = Number(process.env.LINGER_VOICE_RUNTIME_PORT || 0);
-        if (port > 0) {
-          let prev = 0;
-          voicePollTimer = setInterval(() => {
-            void fetch(`http://127.0.0.1:${port}/v1/voice/active`)
-              .then((r) => (r.ok ? r.json() : undefined))
-              .then((data: unknown) => {
-                const next = Number(
-                  (data as { activeSessions?: number } | undefined)
-                    ?.activeSessions ?? 0,
-                );
-                if (!Number.isFinite(next)) return;
-                activeVoiceSessions = next;
-                if (prev > 0 && next === 0) {
-                  ctx.bus.emit("runtime.activity", computerDaemon.running());
-                }
-                prev = next;
-              })
-              .catch(() => undefined);
-          }, 250);
-          voicePollTimer.unref();
-        }
-      },
-      stop: async () => {
-        if (voicePollTimer) {
-          clearInterval(voicePollTimer);
-          voicePollTimer = undefined;
-        }
-        activeVoiceSessions = 0;
-        await stopManagedVoiceRuntime();
-      },
-    },
     healthWatchdog,
     language,
     new EnrollmentModule({
@@ -910,6 +710,35 @@ function daemonExecutable(): string {
       );
 }
 
+// Shell-bundled computer tools (CuaDriver.app, Playwright, QuickJS). Kept in
+// the signed Shell bundle and passed explicitly via LINGER_COMPUTER_TOOLS_DIR
+// when the daemon binary is hot-reloaded from `<LINGER_HOME>/store/backend/`.
+function computerToolsDirectory(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "cli", "computer-tools")
+    : path.join(
+        here,
+        "../computer-tools",
+        `${process.platform}-${process.arch}`,
+        "cli",
+        "computer-tools",
+      );
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const { hostname } = new URL(origin);
+    return (
+      hostname === "127.0.0.1" ||
+      hostname === "localhost" ||
+      hostname === "::1" ||
+      hostname === "[::1]"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function electronPower(): PowerApi {
   return {
     block: () => powerSaveBlocker.start("prevent-app-suspension"),
@@ -952,6 +781,9 @@ async function daemonEnv(log: Logger): Promise<Record<string, string>> {
     const value = process.env[name];
     if (value) env[name] = value;
   }
+  env.LINGER_CLI_NODE_PATH = process.execPath;
+  const toolsDir = computerToolsDirectory();
+  if (existsSync(toolsDir)) env.LINGER_COMPUTER_TOOLS_DIR = toolsDir;
   return env;
 }
 

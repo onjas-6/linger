@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // The services Native runs, built by a desktop release from the source package
 // it ships (apps/desktop/scripts/build-native-runtime.mjs): Web's production
@@ -103,25 +104,73 @@ export function parseNativeRuntime(value: unknown): NativeRuntime {
   };
 }
 
+export const V2_ESM_RESOLVE_FILENAME = "v2-esm-resolve.mjs";
+
+/**
+ * Resolves the absolute path to the V2 Node 26 `module.registerHooks()` ESM
+ * loader script. Prefers the script packaged inside `<nodeServicesDir>/dist/`,
+ * falling back to the co-located script next to `@linger/local-installation` /
+ * `installer.js`.
+ */
+export function resolveV2EsmResolveHookPath(nodeServicesDir?: string): string {
+  if (nodeServicesDir) {
+    const bundled = path.join(nodeServicesDir, "dist", V2_ESM_RESOLVE_FILENAME);
+    if (existsSync(bundled)) return bundled;
+  }
+  return fileURLToPath(new URL(`./${V2_ESM_RESOLVE_FILENAME}`, import.meta.url));
+}
+
+function mergeNodeImportOption(
+  existing: string | undefined,
+  hookPath: string,
+): string {
+  const flag = `--import=${pathToFileURL(path.resolve(hookPath)).href}`;
+  if (!existing?.trim()) return flag;
+  if (existing.includes(flag)) return existing;
+  return `${flag} ${existing.trim()}`;
+}
+
 /**
  * Builds the process environment that wires a decoupled V2 node-services JS
- * bundle directory (`store/node-services/<id>`) to its shared native dependency
- * cache (`infra/node-deps/<hash>/node_modules`) and optional hot-loaded prompts.
+ * bundle directory (`store/backend/<id>/node-services`) to its shared native
+ * dependency cache (`infra/node-deps/<hash>/node_modules`), sibling
+ * `@linger/voice-runtime` bundle, and optional hot-loaded prompts.
+ *
+ * Uses `NODE_PATH` for CommonJS `require()` / `createRequire()` AND
+ * `LINGER_NODE_DEPS_DIR` + `NODE_OPTIONS=--import=<fileURL>` so Node 26 ESM
+ * `import` statements work in both the supervisor and every spawned worker
+ * process without symlinks or Windows NTFS junctions.
  */
 export function resolveBundleRuntimeEnv(options: {
   readonly nodeDepsDir: string;
+  readonly voiceRuntimeDir?: string;
+  readonly esmResolveHookPath?: string;
   readonly promptsDir?: string;
   readonly baseEnv?: Readonly<Record<string, string | undefined>>;
 }): Record<string, string> {
-  const depsNodeModules = path.join(options.nodeDepsDir, "node_modules");
+  const resolvedDepsDir = path.resolve(options.nodeDepsDir);
+  const depsNodeModules = path.join(resolvedDepsDir, "node_modules");
   const existingNodePath = options.baseEnv?.NODE_PATH;
   const nodePath = existingNodePath
     ? `${depsNodeModules}${path.delimiter}${existingNodePath}`
     : depsNodeModules;
-  return {
+  const env: Record<string, string> = {
     NODE_PATH: nodePath,
-    ...(options.promptsDir ? { LINGER_PROMPTS_DIR: options.promptsDir } : {}),
+    LINGER_NODE_DEPS_DIR: resolvedDepsDir,
   };
+  if (options.voiceRuntimeDir) {
+    env.LINGER_VOICE_RUNTIME_DIR = path.resolve(options.voiceRuntimeDir);
+  }
+  if (options.esmResolveHookPath) {
+    env.NODE_OPTIONS = mergeNodeImportOption(
+      options.baseEnv?.NODE_OPTIONS,
+      options.esmResolveHookPath,
+    );
+  }
+  if (options.promptsDir) {
+    env.LINGER_PROMPTS_DIR = options.promptsDir;
+  }
+  return env;
 }
 
 async function readManifest(

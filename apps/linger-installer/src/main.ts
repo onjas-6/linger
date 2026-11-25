@@ -27,6 +27,7 @@ export function parseInstallerArguments(args: string[]) {
     migrate?: boolean;
     stop?: boolean;
     stopLocalModels?: boolean;
+    switchRelease?: string;
   } = {
     home: lingerHome(),
   };
@@ -75,6 +76,7 @@ export function parseInstallerArguments(args: string[]) {
         "--source-repo",
         "--instance",
         "--inspect-target",
+        "--switch-release",
       ].includes(flag ?? "")
     )
       throw new Error("Invalid installer option.");
@@ -85,7 +87,11 @@ export function parseInstallerArguments(args: string[]) {
     else if (flag === "--inspect-target")
       options.inspectTarget = path.resolve(value);
     else if (flag === "--source-repo") options.sourceRepo = path.resolve(value);
-    else if (flag === "--instance") {
+    else if (flag === "--switch-release") {
+      if (!/^[A-Za-z0-9._+-]{1,64}$/.test(value))
+        throw new Error("Invalid release version.");
+      options.switchRelease = value;
+    } else if (flag === "--instance") {
       if (!/^[a-z][a-z0-9-]{0,39}$/.test(value))
         throw new Error("Invalid instance name.");
       options.instanceName = value;
@@ -103,7 +109,8 @@ export function parseInstallerArguments(args: string[]) {
     !options.userKeys &&
     !options.migrate &&
     !options.stop &&
-    !options.stopLocalModels
+    !options.stopLocalModels &&
+    !options.switchRelease
   )
     throw new Error("The installer needs a source checkout (--source-repo).");
   if (options.inspectTarget && !options.inspect)
@@ -114,6 +121,8 @@ export function parseInstallerArguments(args: string[]) {
     throw new Error("Keys need an instance.");
   if (options.stop && !options.instanceName)
     throw new Error("Stop needs an instance.");
+  if (options.switchRelease && !options.instanceName)
+    throw new Error("Switch release needs an instance.");
   return options;
 }
 // The desktop client shows this line, so it carries the real cause; only an
@@ -393,6 +402,53 @@ async function stopLocalModels(
     process.exit(outcome.failed.length ? 1 : 0),
   );
 }
+// Headless backend release switch for V2 incremental updates: switches only
+// `teamhub` and `node-services` under the instance lock and native/state PID
+// tracking while keeping PostgreSQL, LiveKit, and Web alive.
+async function switchReleaseCommand(
+  options: ReturnType<typeof parseInstallerArguments>,
+) {
+  const [{ loadInstance }, { switchNativeRelease }] = await Promise.all([
+    import("@linger/local-installation/instance"),
+    import("@linger/local-installation/native-source"),
+  ]);
+  const controller = new AbortController();
+  process.once("SIGTERM", () => controller.abort());
+  try {
+    const instance = await loadInstance({
+      name: options.instanceName!,
+      home: options.home,
+    });
+    if (!instance) {
+      process.stdout.write(
+        `${JSON.stringify({
+          ok: false,
+          message: `No source instance named ${options.instanceName}.`,
+        })}\n`,
+        () => process.exit(1),
+      );
+      return;
+    }
+    const result = await switchNativeRelease(instance, {
+      home: options.home,
+      appVersion: options.switchRelease!,
+      signal: controller.signal,
+      log: (message) => process.stderr.write(message.replace(/\n?$/, "\n")),
+    });
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, ...result })}\n`,
+      () => process.exit(0),
+    );
+  } catch (error: unknown) {
+    process.stdout.write(
+      `${JSON.stringify({
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      })}\n`,
+      () => process.exit(1),
+    );
+  }
+}
 async function serve(options: ReturnType<typeof parseInstallerArguments>) {
   const server = await launchInstaller({
     ...options,
@@ -453,7 +509,13 @@ if (
   // warning on stderr would read as the reason a start failed. A skipped
   // instance is refused with its own error when a mode opens it.
   let skipped: LegacyInstanceSkipped[] = [];
-  if (options && !options.inspect && !options.stop && !options.stopLocalModels)
+  if (
+    options &&
+    !options.inspect &&
+    !options.stop &&
+    !options.stopLocalModels &&
+    !options.switchRelease
+  )
     await import("@linger/local-installation/legacy-migration")
       .then(async ({ migrateLegacyInstallation }) => {
         skipped = await migrateLegacyInstallation({ home: options!.home });
@@ -467,6 +529,7 @@ if (
       });
   if (options?.stop) await stopInstallation(options);
   else if (options?.stopLocalModels) await stopLocalModels(options);
+  else if (options?.switchRelease) await switchReleaseCommand(options);
   else if (options?.migrate)
     process.stdout.write(`${JSON.stringify({ skipped })}\n`, () =>
       process.exit(0),

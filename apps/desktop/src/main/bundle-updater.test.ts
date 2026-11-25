@@ -254,4 +254,45 @@ describe("BundleUpdaterModule", () => {
     expect(await store.isDenylisted("0.2.20")).toBe(true);
     await host.stop("quit");
   });
+
+  it("stays idle with zero fetches or seed imports in Thin Client mode (P1-2)", async () => {
+    const home = await makeTempDir("linger-thin-home-");
+    const seedDir = await makeTempDir("linger-thin-seed-");
+    let fetchCalls = 0;
+    const store = new BundleStoreModule({
+      home,
+      seedDirectory: seedDir,
+      target: "darwin-arm64",
+      shouldImportSeed: () => false,
+    });
+    const config = new ConfigStore(path.join(home, "config.json"));
+    config.update({
+      serverUrl: "https://remote.linger.example",
+      updateFeedUrl: "https://cdn.example.com/linger",
+    });
+    const updater = new BundleUpdaterModule({
+      shellVersion: "0.2.0",
+      target: "darwin-arm64",
+      checkDelayMs: 60 * 60_000,
+      isLocalMode: () => false,
+      fetch: async () => {
+        fetchCalls += 1;
+        return new Response("unexpected", { status: 500 });
+      },
+    });
+    const host = new ModuleHost(
+      [
+        { name: "Config", dependsOn: [], start: async () => {}, stop: async () => {} },
+        store,
+        updater,
+      ],
+      { config, log: noopLog, bus: new EventBus() },
+    );
+    await host.start();
+    await updater.check();
+    expect(fetchCalls).toBe(0);
+    expect(updater.state()).toEqual({ kind: "idle" });
+    expect(await store.readCurrent()).toBeUndefined();
+    await host.stop("quit");
+  });
 });

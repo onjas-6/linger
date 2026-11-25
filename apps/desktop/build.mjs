@@ -312,7 +312,9 @@ const buildTeamhubCli = async () => {
     "dist/teamhub-cli/teamhub.cmd",
     `@echo off\r
 setlocal\r
-set "app=%~dp0..\\..\\..\\..\\Linger.exe"\r
+set "app="\r
+if defined LINGER_CLI_NODE_PATH if exist "%LINGER_CLI_NODE_PATH%" set "app=%LINGER_CLI_NODE_PATH%"\r
+if not defined app set "app=%~dp0..\\..\\..\\..\\Linger.exe"\r
 if not exist "%app%" set "app=node"\r
 set ELECTRON_RUN_AS_NODE=1\r
 "%app%" --use-env-proxy "%~dp0teamhub.js" %*\r

@@ -301,11 +301,11 @@ jobs:
           node apps/teamhub-cli/scripts/build-cli.mjs --outdir "$stage/teamhub-cli"
           cp apps/desktop/scripts/teamhub.sh "$stage/teamhub-cli/teamhub"
           chmod +x "$stage/teamhub-cli/teamhub"
-          printf '@echo off\r\nsetlocal\r\nset "app=%%~dp0..\\..\\..\\..\\Linger.exe"\r\nif not exist "%%app%%" set "app=node"\r\nset ELECTRON_RUN_AS_NODE=1\r\n"%%app%%" --use-env-proxy "%%~dp0teamhub.js" %%*\r\n' >"$stage/teamhub-cli/teamhub.cmd"
+          printf '@echo off\r\nsetlocal\r\nset "app="\r\nif defined LINGER_CLI_NODE_PATH if exist "%%LINGER_CLI_NODE_PATH%%" set "app=%%LINGER_CLI_NODE_PATH%%"\r\nif not defined app set "app=%%~dp0..\\..\\..\\..\\Linger.exe"\r\nif not exist "%%app%%" set "app=node"\r\nset ELECTRON_RUN_AS_NODE=1\r\n"%%app%%" --use-env-proxy "%%~dp0teamhub.js" %%*\r\n' >"$stage/teamhub-cli/teamhub.cmd"
 
           echo "==> 3/4 Building node-services (when present in checkout)"
           if [ -d apps/node-services/src ] && [ -d apps/voice-runtime/src ]; then
-            node apps/desktop/scripts/bundle-node-services.mjs "$PWD" "$stage/node-services"
+            node apps/desktop/scripts/bundle-node-services.mjs "$PWD" "$stage/node-services" --v2
             if [ -d apps/node-services/prompts ]; then
               cp -r apps/node-services/prompts "$stage/node-services/prompts"
             fi

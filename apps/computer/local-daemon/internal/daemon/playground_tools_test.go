@@ -151,6 +151,21 @@ func TestPlaygroundCardFindsTheCLIOnEveryLayout(t *testing.T) {
 	if _, _, _, ok := cardCLIProgram(t.TempDir(), "darwin"); ok {
 		t.Fatal("found a CLI in an empty directory")
 	}
+	// Externalized V2 store directory without Linger.exe 4 levels up succeeds
+	// when LINGER_CLI_NODE_PATH points at the shell/node binary.
+	externalCLI := filepath.Join(t.TempDir(), "store", "backend", "backend-abc", "computer-daemon", "teamhub-cli")
+	touch(filepath.Join(externalCLI, "teamhub.cmd"))
+	touch(filepath.Join(externalCLI, "teamhub.js"))
+	if _, _, _, ok := cardCLIProgram(externalCLI, "windows"); ok {
+		t.Fatal("externalized CLI succeeded without LINGER_CLI_NODE_PATH or Linger.exe")
+	}
+	shellExe := filepath.Join(t.TempDir(), "Linger.exe")
+	touch(shellExe)
+	t.Setenv("LINGER_CLI_NODE_PATH", shellExe)
+	extProgram, extPrefix, extEnv, extOk := cardCLIProgram(externalCLI, "windows")
+	if !extOk || extProgram != shellExe || len(extPrefix) != 2 || extPrefix[1] != filepath.Join(externalCLI, "teamhub.js") || extEnv[0] != "ELECTRON_RUN_AS_NODE=1" {
+		t.Fatalf("externalized Desktop CLI: %s %v %v %v", extProgram, extPrefix, extEnv, extOk)
+	}
 }
 
 func TestPlaygroundImageRefusesAnIncompletePlacement(t *testing.T) {

@@ -1,10 +1,10 @@
 name: App bundle release (V2 2+1 incremental)
 
 # High-frequency incremental business release pipeline (2+1 model: web + unified
-# backend + cached node-native-deps). Builds ONLY modules whose deterministic
-# inputHash changed since the previous release in the target channel; unchanged
-# modules inherit their existing URL and SHA-256 directly into the signed
-# Schema 3 app-manifest.json.
+# backend + cached node-native-deps). Always builds web and backend with pnpm/Go
+# caches and deduplicates unchanged `.tar.zst` artifacts against the previous
+# channel manifest by deterministic SHA-256 (so shared `packages/*` edits are
+# never missed), while skipping `node-native-deps` unless pnpm-lock.yaml changed.
 on:
   push:
     tags: ["app-v*"]
@@ -124,7 +124,6 @@ jobs:
 
   build-web:
     needs: plan
-    if: needs.plan.outputs.build_web == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -144,7 +143,6 @@ jobs:
 
   build-backend-targets:
     needs: plan
-    if: needs.plan.outputs.build_backend == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:

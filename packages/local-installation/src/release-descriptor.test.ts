@@ -137,9 +137,19 @@ describe("V2 local-installation release descriptors & decoupled bundles", () => 
     const nsCmd = planBundleNativeCommand("node-services", home, descriptor, {
       platform: "darwin",
     });
-    expect(nsCmd.args[1]).toBe(
+    expect(nsCmd.args[0]).toBe("--import");
+    expect(nsCmd.args[1]).toContain("v2-esm-resolve.mjs");
+    expect(nsCmd.args[2]).toBe("--conditions=linger-production");
+    expect(nsCmd.args[3]).toBe(
       path.join(home, "store/backend/backend-111111111111/node-services/dist/supervisor.js"),
     );
+    expect(nsCmd.env.LINGER_NODE_DEPS_DIR).toBe(
+      path.join(home, "infra/node-deps/nd-aaaaaaaaaaaaaaaa"),
+    );
+    expect(nsCmd.env.LINGER_VOICE_RUNTIME_DIR).toBe(
+      path.join(home, "store/backend/backend-111111111111/node-services/voice-runtime"),
+    );
+    expect(nsCmd.env.NODE_OPTIONS).toContain("--import=file://");
     expect(nsCmd.env.LINGER_PROMPTS_DIR).toBe(
       path.join(home, "store/backend/backend-111111111111/node-services/prompts"),
     );

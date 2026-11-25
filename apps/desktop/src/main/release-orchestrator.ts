@@ -20,6 +20,8 @@ export interface RollbackNotice {
   readonly fromVersion: string;
   readonly toVersion: string;
   readonly reason: string;
+  readonly manualRecoveryRequired?: boolean;
+  readonly dbBackupFile?: string;
 }
 
 export interface ReleaseOrchestratorHooks {
@@ -271,6 +273,7 @@ export class ReleaseOrchestratorModule implements Module {
               "crash-watchdog",
               reason,
               dbBackupFile,
+              next.compat.rollbackSafe,
             );
           },
         });
@@ -288,6 +291,7 @@ export class ReleaseOrchestratorModule implements Module {
         "healthcheck",
         reason,
         dbBackupFile,
+        next.compat.rollbackSafe,
       );
       return false;
     }
@@ -300,16 +304,58 @@ export class ReleaseOrchestratorModule implements Module {
     stage: "migrate" | "healthcheck" | "crash-watchdog",
     reason: string,
     dbBackupFile?: string,
+    rollbackSafe = true,
   ): Promise<void> {
     const ctx = this.#ctx!;
     const store = ctx.get<BundleStoreModule>("BundleStore");
+    const isPreCommit = stage === "migrate" || stage === "healthcheck";
+
+    // P0-1 safety invariant: NEVER run automated pg_restore after commit
+    // (`crash-watchdog`), because live user writes may have occurred after the
+    // release was committed. If the committed migration was also irreversible
+    // (`rollbackSafe === false`), halt automatic rollback rather than running
+    // older incompatible binaries against the migrated schema, and preserve
+    // `dbBackupFile` for explicit manual recovery.
+    if (!isPreCommit && !rollbackSafe) {
+      ctx.log.error("release_orchestrator.manual_recovery_required", {
+        failedVersion,
+        previousVersion: previousRelease?.appVersion,
+        stage,
+        reason,
+        dbBackupFile,
+      });
+      await store.addDenylist({
+        appVersion: failedVersion,
+        failedAt: new Date().toISOString(),
+        stage,
+        reason,
+      });
+      this.#stagedVersion = undefined;
+      const notice: RollbackNotice = {
+        fromVersion: failedVersion,
+        toVersion: failedVersion,
+        reason: `${reason} (non-rollbackSafe schema already committed; automatic DB restore suppressed to prevent data loss)`,
+        manualRecoveryRequired: true,
+        ...(dbBackupFile ? { dbBackupFile } : {}),
+      };
+      this.#rollbackNotice = notice;
+      this.#setState({ kind: "rolled_back", notice });
+      ctx.bus.emit(
+        "release.rolled_back",
+        notice.fromVersion,
+        notice.toVersion,
+        notice.reason,
+      );
+      return;
+    }
+
     ctx.log.warn("release_orchestrator.rolling_back", {
       failedVersion,
       previousVersion: previousRelease?.appVersion,
       stage,
       reason,
     });
-    if (dbBackupFile && this.#hooks.restoreDatabase) {
+    if (isPreCommit && dbBackupFile && this.#hooks.restoreDatabase) {
       await this.#hooks.restoreDatabase(dbBackupFile).catch((err) => {
         ctx.log.warn("release_orchestrator.db_restore_failed", {
           error: String(err),

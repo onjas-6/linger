@@ -139,8 +139,76 @@ export async function packageBackendBundle({
 }
 
 /**
+ * Compares newly packed deterministic `.tar.zst` artifacts against a previous
+ * Schema 3 manifest by content SHA-256 (P2). When a newly built bundle's
+ * archive digest is byte-for-byte identical to the previous release, its URL,
+ * mirrors, artifactId, and originAppVersion are inherited automatically so CI
+ * never misses shared-package edits while still skipping redundant uploads.
+ */
+export function reconcileBuiltArtifactsWithPrevManifest(
+  builtArtifacts,
+  prevManifest,
+) {
+  const reconciled = structuredClone(builtArtifacts);
+  const inheritedBundles = [];
+  const changedBundles = [];
+
+  for (const [bundleId, built] of Object.entries(reconciled)) {
+    const prevBundle = prevManifest?.bundles?.[bundleId];
+    if (!prevBundle || !built) {
+      changedBundles.push(bundleId);
+      continue;
+    }
+    if (prevBundle.arch === "noarch") {
+      if (built.sha256 && built.sha256 === prevBundle.artifact?.sha256) {
+        reconciled[bundleId] = {
+          ...built,
+          __inheritedEntry: structuredClone(prevBundle),
+        };
+        inheritedBundles.push(bundleId);
+      } else {
+        changedBundles.push(bundleId);
+      }
+      continue;
+    }
+
+    // per-target bundle: deduplicate each target independently by sha256.
+    let allTargetsMatched = true;
+    const targets = Object.keys(built);
+    if (targets.length === 0) {
+      changedBundles.push(bundleId);
+      continue;
+    }
+    for (const target of targets) {
+      const art = built[target];
+      const prevArt = prevBundle.targets?.[target];
+      if (art?.sha256 && prevArt?.sha256 === art.sha256) {
+        built[target] = {
+          ...art,
+          __inheritedArtifact: structuredClone(prevArt),
+        };
+      } else {
+        allTargetsMatched = false;
+      }
+    }
+    if (allTargetsMatched) {
+      reconciled[bundleId] = {
+        ...built,
+        __inheritedEntry: structuredClone(prevBundle),
+      };
+      inheritedBundles.push(bundleId);
+    } else {
+      changedBundles.push(bundleId);
+    }
+  }
+
+  return { reconciled, inheritedBundles, changedBundles };
+}
+
+/**
  * Assembles a Schema 3 `app-manifest.json` from newly built artifacts and
- * inherited entries from `plan`.
+ * inherited entries from `plan` (and optionally deduplicates newly built
+ * artifacts against `prevManifest` by deterministic `.tar.zst` SHA-256).
  */
 export function assembleManifestV3({
   appVersion,
@@ -153,9 +221,14 @@ export function assembleManifestV3({
   shell,
   plan,
   builtArtifacts = {},
+  prevManifest = null,
   baseUrl,
   mirrorBaseUrls = [],
 }) {
+  const effectiveBuilt = prevManifest
+    ? reconcileBuiltArtifactsWithPrevManifest(builtArtifacts, prevManifest)
+        .reconciled
+    : builtArtifacts;
   const makeUrls = (bundleId, fileName) => {
     const relPath = `bundles/${bundleId}/${fileName}`;
     const isRelative = !baseUrl || baseUrl === "relative";
@@ -176,9 +249,17 @@ export function assembleManifestV3({
       continue;
     }
 
-    const built = builtArtifacts[bundleId];
+    const built = effectiveBuilt[bundleId];
     if (!built) {
       throw new Error(`Bundle ${bundleId} marked BUILD but no artifact was provided`);
+    }
+
+    if (built.__inheritedEntry) {
+      bundles[bundleId] = {
+        ...structuredClone(built.__inheritedEntry),
+        inputHash: entry.inputHash,
+      };
+      continue;
     }
 
     if (entry.arch === "noarch") {
@@ -198,15 +279,18 @@ export function assembleManifestV3({
     } else {
       const targets = {};
       for (const [target, art] of Object.entries(built)) {
-        targets[target] = {
-          artifactId: art.artifactId,
-          format: art.format ?? "tar.zst",
-          ...makeUrls(bundleId, art.fileName),
-          sha256: art.sha256,
-          size: art.size,
-          ...(art.signed ? { signed: art.signed } : {}),
-          ...(art.deltas?.length ? { deltas: art.deltas } : {}),
-        };
+        if (target.startsWith("__")) continue;
+        targets[target] = art.__inheritedArtifact
+          ? structuredClone(art.__inheritedArtifact)
+          : {
+              artifactId: art.artifactId,
+              format: art.format ?? "tar.zst",
+              ...makeUrls(bundleId, art.fileName),
+              sha256: art.sha256,
+              size: art.size,
+              ...(art.signed ? { signed: art.signed } : {}),
+              ...(art.deltas?.length ? { deltas: art.deltas } : {}),
+            };
       }
       bundles[bundleId] = {
         arch: "per-target",
@@ -354,6 +438,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       },
       plan,
       builtArtifacts,
+      prevManifest,
       baseUrl,
       mirrorBaseUrls: (flag("--mirrors") ?? "").split(",").filter(Boolean),
     });

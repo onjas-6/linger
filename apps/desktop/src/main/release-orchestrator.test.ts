@@ -182,6 +182,32 @@ describe("ReleaseOrchestratorModule & HealthWatchdogModule", () => {
     expect((await store.readCurrent())?.appVersion).toBe("0.2.14");
     expect(await store.isDenylisted("0.2.16")).toBe(true);
     expect(rolledBackEvents).toContain("0.2.16->0.2.14");
+    // Post-commit crash rollback must NEVER call restoreDatabase
+    expect(restored).toEqual(["instances/desktop/backups/pre-0.2.15.dump"]);
+
+    // Stage 0.2.17 (non-rollbackSafe, healthy at gate so it commits with a backup file),
+    // then crashes post-commit: MUST NEVER call restoreDatabase (data-loss guard) and
+    // must flag manualRecoveryRequired while preserving the backup path.
+    await store.writeReleaseDescriptor(
+      makeRelease("0.2.17", { backend: "4" }, false),
+    );
+    await orch.onBundleStaged("0.2.17");
+    expect(await orch.applyStaged()).toBe(true);
+    expect(backups).toContain("instances/desktop/backups/pre-0.2.17.dump");
+    expect((await store.readCurrent())?.appVersion).toBe("0.2.17");
+    const restoresBeforeWatchdog = restored.length;
+
+    expect(await watchdog.recordCrash("teamhub", "panic")).toBe(false);
+    expect(await watchdog.recordCrash("teamhub", "panic")).toBe(true);
+    expect(restored.length).toBe(restoresBeforeWatchdog);
+    expect(await store.isDenylisted("0.2.17")).toBe(true);
+    expect((await store.readCurrent())?.appVersion).toBe("0.2.17");
+    expect(orch.rollbackNotice()).toMatchObject({
+      fromVersion: "0.2.17",
+      toVersion: "0.2.17",
+      manualRecoveryRequired: true,
+      dbBackupFile: "instances/desktop/backups/pre-0.2.17.dump",
+    });
 
     await host.stop("quit");
   });

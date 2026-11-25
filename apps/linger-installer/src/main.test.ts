@@ -282,3 +282,24 @@ it("tells the desktop client by code why a refused folder kept the keys unsaved"
     vi.resetModules();
   }
 });
+
+it("parses --switch-release without --source-repo and requires --instance", async () => {
+  const { parseInstallerArguments } = await import("./main.js");
+  expect(
+    parseInstallerArguments([
+      "--home",
+      "/tmp/linger-home",
+      "--instance",
+      "desktop",
+      "--switch-release",
+      "0.1.10-v2test.2",
+    ]),
+  ).toMatchObject({
+    home: path.resolve("/tmp/linger-home"),
+    instanceName: "desktop",
+    switchRelease: "0.1.10-v2test.2",
+  });
+  expect(() =>
+    parseInstallerArguments(["--switch-release", "0.1.10-v2test.2"]),
+  ).toThrow(/instance/i);
+});

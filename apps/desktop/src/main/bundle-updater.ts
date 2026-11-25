@@ -56,6 +56,12 @@ export interface BundleUpdaterOptions {
   readonly shellVersion: string;
   readonly target: string;
   readonly enabled?: boolean;
+  /**
+   * Optional predicate indicating whether the local server stack is active on
+   * this computer. When false (Thin Client connected to a remote server),
+   * bundle checks stay idle and never download local backend/web bundles.
+   */
+  readonly isLocalMode?: () => Promise<boolean> | boolean;
   readonly defaultInfra?: ReleaseInfraPaths;
   readonly fetch?: typeof fetch;
   readonly publicKey?: string;
@@ -163,6 +169,10 @@ export class BundleUpdaterModule implements Module {
 
   async #check(): Promise<void> {
     const ctx = this.#ctx!;
+    if (this.#options.isLocalMode && !(await this.#options.isLocalMode())) {
+      this.#setState({ kind: "idle" });
+      return;
+    }
     const store = ctx.get<BundleStoreModule>("BundleStore");
     const cfg = ctx.config.get();
     const feed =

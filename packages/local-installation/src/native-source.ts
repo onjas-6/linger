@@ -2,10 +2,11 @@ import { prepareFoundationServices } from "./foundation-services.js";
 import { portFree } from "./ports.js";
 import { prepareModelGateway, stopModelGateway } from "./model-gateway.js";
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { lstat, open, realpath, statfs } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { parseEnv } from "node:util";
 import {
   prepareSourceConfiguration,
   saveSourceBinding,
@@ -25,11 +26,20 @@ import {
   prepareNativeVoiceTools,
 } from "./native-dependencies.js";
 import { readLiveKitSettings, startNativeLiveKit } from "./native-livekit.js";
-import { checkNativeRuntime, resolveBundleRuntimeEnv } from "./native-runtime.js";
 import {
+  checkNativeRuntime,
+  resolveBundleRuntimeEnv,
+  resolveV2EsmResolveHookPath,
+} from "./native-runtime.js";
+import {
+  parseLocalReleaseDescriptor,
+  parseReleasePointer,
+  readJsonIfExists,
   resolveSafeHomePath,
   type LocalReleaseDescriptor,
 } from "./release-descriptor.js";
+import { readPrivate } from "./private-files.js";
+import { readUserEnvironment } from "./user-environment.js";
 import { checkTeamhubBinaries } from "./teamhub-binaries.js";
 import { sourceRegion } from "@linger/service-kit";
 import { npmRegistryEnvironment } from "./npm-registry.js";
@@ -123,6 +133,7 @@ export function planBundleNativeCommand(
     readonly platform?: NodeJS.Platform;
     readonly baseEnv?: Readonly<Record<string, string | undefined>>;
     readonly webControlToken?: string;
+    readonly esmResolveHookPath?: string;
   } = {},
 ): PlannedBundleCommand {
   const platform = options.platform ?? process.platform;
@@ -154,10 +165,16 @@ export function planBundleNativeCommand(
             : {}),
         },
       };
-    case "node-services":
+    case "node-services": {
+      const voiceRuntimeDir = path.join(nodeServicesDir, "voice-runtime");
+      const esmResolveHookPath =
+        options.esmResolveHookPath ??
+        resolveV2EsmResolveHookPath(nodeServicesDir);
       return {
         command: nodeBin,
         args: [
+          "--import",
+          esmResolveHookPath,
           "--conditions=linger-production",
           path.join(nodeServicesDir, "dist", "supervisor.js"),
           "--compiled",
@@ -165,10 +182,13 @@ export function planBundleNativeCommand(
         cwd: path.resolve(home),
         env: resolveBundleRuntimeEnv({
           nodeDepsDir,
+          voiceRuntimeDir,
+          esmResolveHookPath,
           promptsDir,
           baseEnv: options.baseEnv,
         }),
       };
+    }
     case "teamhub":
       return {
         command: path.join(teamhubDir, exe("teamhub")),
@@ -194,6 +214,51 @@ export function planBundleNativeCommand(
         env: {},
       };
   }
+}
+
+/**
+ * Resolves a V2 LocalReleaseDescriptor from `<home>/releases/<appVersion>/release.json`
+ * or `<home>/state/current.json` when omitted.
+ */
+export async function resolveBundleReleaseDescriptor(
+  home: string,
+  appVersion?: string,
+): Promise<LocalReleaseDescriptor | undefined> {
+  if (appVersion) {
+    return readJsonIfExists(
+      path.join(home, "releases", appVersion, "release.json"),
+      parseLocalReleaseDescriptor,
+    );
+  }
+  const pointer = await readJsonIfExists(
+    path.join(home, "state", "current.json"),
+    parseReleasePointer,
+  );
+  if (!pointer) return undefined;
+  return readJsonIfExists(
+    resolveSafeHomePath(home, pointer.releaseFile),
+    parseLocalReleaseDescriptor,
+  );
+}
+
+function hasBundleServiceArtifacts(
+  home: string,
+  release: LocalReleaseDescriptor,
+  service: "teamhub" | "node-services" | "web",
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const exe = (name: string) => (platform === "win32" ? `${name}.exe` : name);
+  if (service === "web") {
+    const webDir = resolveSafeHomePath(home, release.modules.web.path);
+    return existsSync(path.join(webDir, "static-host.mjs"));
+  }
+  const backendDir = resolveSafeHomePath(home, release.modules.backend.path);
+  if (service === "teamhub") {
+    return existsSync(path.join(backendDir, "teamhub", exe("teamhub")));
+  }
+  return existsSync(
+    path.join(backendDir, "node-services", "dist", "supervisor.js"),
+  );
 }
 /** Marks a native service whose stop failed without a more specific code. */
 export const NATIVE_SERVICE_STOP_FAILED = "NATIVE_SERVICE_STOP_FAILED";
@@ -1201,18 +1266,15 @@ async function runNativeSource(
         const startAndAwaitServices = async (
           ends: Awaited<ReturnType<typeof logEnds>>,
         ) => {
+          const activeBundleRelease = existsSync(
+            path.join(home, "state", "current.json"),
+          )
+            ? await resolveBundleReleaseDescriptor(home).catch(() => undefined)
+            : undefined;
           const serviceOptions = (
             name: "teamhub" | "node-services" | "web",
-          ) => ({
-            root: current.root,
-            name,
-            executable: process.execPath,
-            args: [
-              path.join(current.source!.repo, "scripts/source-native.mjs"),
-              name,
-            ],
-            cwd: current.source!.repo,
-            env:
+          ) => {
+            const baseServiceEnv: NodeJS.ProcessEnv =
               name === "teamhub"
                 ? {
                     ...env,
@@ -1221,19 +1283,68 @@ async function runNativeSource(
                   }
                 : name === "node-services"
                   ? { ...env, ...proxyEnv }
-                  : env,
-            signal,
-            redactions: secrets,
-            // A changed user.env, port, credential, voice tool or system
-            // proxy restarts it.
-            settings:
+                  : env;
+            const baseSettings =
               name === "teamhub"
                 ? teamhubSettings
                 : name === "node-services"
                   ? nodeServicesSettings
-                  : settings,
-            restartOnConfigurationChange: true,
-          });
+                  : settings;
+            if (
+              activeBundleRelease &&
+              hasBundleServiceArtifacts(home, activeBundleRelease, name)
+            ) {
+              const planned = planBundleNativeCommand(
+                name,
+                home,
+                activeBundleRelease,
+                { baseEnv: baseServiceEnv },
+              );
+              const executable =
+                name === "teamhub"
+                  ? planned.command
+                  : existsSync(planned.command)
+                    ? planned.command
+                    : process.execPath;
+              return {
+                root: current.root,
+                name,
+                executable,
+                args: [...planned.args],
+                cwd: planned.cwd,
+                env: { ...baseServiceEnv, ...planned.env },
+                signal,
+                redactions: secrets,
+                settings: JSON.stringify({
+                  base: baseSettings,
+                  release: activeBundleRelease.appVersion,
+                  artifactId:
+                    name === "web"
+                      ? activeBundleRelease.modules.web.artifactId
+                      : activeBundleRelease.modules.backend.artifactId,
+                  nodeDeps: activeBundleRelease.infra.nodeDeps,
+                }),
+                restartOnConfigurationChange: true,
+              };
+            }
+            return {
+              root: current.root,
+              name,
+              executable: process.execPath,
+              args: [
+                path.join(current.source!.repo, "scripts/source-native.mjs"),
+                name,
+              ],
+              cwd: current.source!.repo,
+              env: baseServiceEnv,
+              signal,
+              redactions: secrets,
+              // A changed user.env, port, credential, voice tool or system
+              // proxy restarts it.
+              settings: baseSettings,
+              restartOnConfigurationChange: true,
+            };
+          };
           // Stop the Agent Service only when TeamHub is about to restart for a
           // changed configuration, so its graceful shutdown can requeue
           // in-flight Runs while TeamHub is still up. When TeamHub is not
@@ -1725,6 +1836,161 @@ export async function stopNativeSource(
       path.resolve(instance.root, "../.."),
     );
     await stopModelGateway(instance, signal);
+  });
+}
+
+export interface SwitchNativeReleaseOptions {
+  readonly home: string;
+  readonly appVersion: string;
+  readonly signal?: AbortSignal;
+  readonly log?: (message: string) => void;
+}
+
+export interface SwitchNativeReleaseResult {
+  readonly appVersion: string;
+  readonly backendArtifactId: string;
+  readonly restarted: readonly ("teamhub" | "node-services")[];
+}
+
+/**
+ * Atomically switches the instance's backend services (`teamhub` and
+ * `node-services`) to a staged V2 LocalReleaseDescriptor while keeping
+ * `postgres`, `livekit`, and `web` running. Reuses `withInstanceLock` and
+ * `native/state` process tracking so `installer.js --stop` on uninstall or
+ * upgrade terminates every backend process with zero orphans.
+ */
+export async function switchNativeRelease(
+  instance: Instance,
+  options: SwitchNativeReleaseOptions,
+): Promise<SwitchNativeReleaseResult> {
+  requireNative(instance);
+  const { home, appVersion, signal, log } = options;
+  return withInstanceLock(instance, async () => {
+    const release = await resolveBundleReleaseDescriptor(home, appVersion);
+    if (!release) {
+      throw new Error(
+        `Release descriptor not found for appVersion ${appVersion} under ${home}.`,
+      );
+    }
+
+    const rawNativeEnv = await readPrivate(
+      path.join(instance.root, "native.env"),
+    ).catch(() => undefined);
+    const parsedNativeEnv: Record<string, string> = rawNativeEnv
+      ? Object.fromEntries(
+          Object.entries(parseEnv(rawNativeEnv)).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        )
+      : {};
+    const userEnv = await readUserEnvironment(instance.root).catch(() => ({}));
+    const identityKey = await readLocalIdentityKey(instance.root).catch(
+      () => undefined,
+    );
+    const baseEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...parsedNativeEnv,
+      ...userEnv,
+    };
+    delete baseEnv.TEAMHUB_LOCAL_IDENTITY_KEY;
+    const proxyEnv = systemProxyEnvironment(baseEnv);
+
+    // Stop node-services first so in-flight runs requeue cleanly while TeamHub
+    // is still up, then stop TeamHub. PostgreSQL, LiveKit, and Web remain up.
+    log?.(`Stopping node-services and teamhub for release ${appVersion}.`);
+    await stopNativeProcess(instance.root, "node-services");
+    await stopNativeProcess(instance.root, "teamhub");
+
+    // Run database migration from the target backend bundle before starting
+    // the new TeamHub process.
+    const migrateCmd = planBundleNativeCommand("migrate", home, release, {
+      baseEnv,
+    });
+    if (existsSync(migrateCmd.command)) {
+      log?.(`Running migrate for release ${appVersion}.`);
+      const { code, stderr } = await runProcess(
+        migrateCmd.command,
+        [...migrateCmd.args],
+        {
+          cwd: migrateCmd.cwd,
+          env: { ...baseEnv, ...migrateCmd.env },
+          signal,
+          timeoutMs: 10 * 60_000,
+        },
+      );
+      if (code !== 0) {
+        throw new Error(
+          `Release ${appVersion} database migration failed (exit ${code}): ${stderr.trim().slice(-500)}`,
+        );
+      }
+    }
+
+    const restarted: ("teamhub" | "node-services")[] = [];
+    const teamhubCmd = planBundleNativeCommand("teamhub", home, release, {
+      baseEnv,
+    });
+    if (existsSync(teamhubCmd.command)) {
+      log?.(`Starting teamhub (${release.modules.backend.artifactId}).`);
+      await startNativeProcess({
+        root: instance.root,
+        name: "teamhub",
+        executable: teamhubCmd.command,
+        args: [...teamhubCmd.args],
+        cwd: teamhubCmd.cwd,
+        env: {
+          ...baseEnv,
+          ...proxyEnv,
+          ...teamhubCmd.env,
+          ...(identityKey ? { TEAMHUB_LOCAL_IDENTITY_KEY: identityKey } : {}),
+        },
+        signal,
+        settings: JSON.stringify({
+          release: release.appVersion,
+          artifactId: release.modules.backend.artifactId,
+          proxy: proxyEnv.HTTPS_PROXY ?? "",
+        }),
+        restartOnConfigurationChange: true,
+      });
+      restarted.push("teamhub");
+    }
+
+    const nsCmd = planBundleNativeCommand("node-services", home, release, {
+      baseEnv,
+    });
+    const nsEntry = nsCmd.args.find((arg) => arg.endsWith("supervisor.js"));
+    if (nsEntry && existsSync(nsEntry)) {
+      const nodeExecutable = existsSync(nsCmd.command)
+        ? nsCmd.command
+        : process.execPath;
+      log?.(`Starting node-services (${release.modules.backend.artifactId}).`);
+      await startNativeProcess({
+        root: instance.root,
+        name: "node-services",
+        executable: nodeExecutable,
+        args: [...nsCmd.args],
+        cwd: nsCmd.cwd,
+        env: {
+          ...baseEnv,
+          ...proxyEnv,
+          ...nsCmd.env,
+        },
+        signal,
+        settings: JSON.stringify({
+          release: release.appVersion,
+          artifactId: release.modules.backend.artifactId,
+          nodeDeps: release.infra.nodeDeps,
+          proxy: proxyEnv.HTTPS_PROXY ?? "",
+        }),
+        restartOnConfigurationChange: true,
+      });
+      restarted.push("node-services");
+    }
+
+    return {
+      appVersion: release.appVersion,
+      backendArtifactId: release.modules.backend.artifactId,
+      restarted,
+    };
   });
 }
 export async function nativeSourceLogs(

@@ -1505,6 +1505,112 @@ export class LocalServerModule implements Module {
     return this.#serverCheck.ok;
   }
 
+  /**
+   * Returns true when this computer has a local Linger installation record
+   * (`desktop/local-server.json`). Thin Client installations pointing at a
+   * remote server return false so V2 local bundle seeds/updates are skipped.
+   */
+  async hasLocalInstance(): Promise<boolean> {
+    return (await this.#readRecord()) !== undefined;
+  }
+
+  /**
+   * Delegates a V2 backend release switch (`teamhub` + `node-services`) to the
+   * bundled `installer.js --instance desktop --switch-release <appVersion>` so
+   * `installer.js` remains the single lifecycle & PID owner (preventing orphan
+   * processes on Windows/macOS uninstall or shell upgrades).
+   */
+  async switchRelease(
+    appVersion: string,
+    signal: AbortSignal = this.#abort.signal,
+  ): Promise<void> {
+    const record = await this.#readRecord();
+    if (!record) {
+      throw new Error("Cannot switch release: no local Linger installation.");
+    }
+    if (!existsSync(this.#installerScript())) {
+      throw new Error("Cannot switch release: bundled installer.js is missing.");
+    }
+    const proxyEnv = this.#systemProxyEnv();
+    const node = await this.#ensureNode(signal);
+    const env = {
+      ...process.env,
+      ...(await proxyEnv),
+      LINGER_HOME: record.home,
+    };
+    const outcome = await new Promise<{ ok?: boolean; message?: string }>(
+      (resolve, reject) => {
+        const child = spawn(
+          node,
+          [
+            ...linuxNodeFdHygieneArgs(this.#options.platform),
+            this.#installerScript(),
+            "--home",
+            record.home,
+            "--instance",
+            LOCAL_INSTANCE,
+            "--switch-release",
+            appVersion,
+          ],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+            env,
+            signal,
+          },
+        );
+        let stdout = "";
+        let stderr = "";
+        let settled = false;
+        const finish = (code: number | null) => {
+          if (settled) return;
+          settled = true;
+          const lastLine = stdout.trim().split("\n").at(-1) ?? "";
+          try {
+            const parsed = JSON.parse(lastLine) as {
+              ok?: boolean;
+              message?: string;
+            };
+            if (code === 0 && parsed.ok) {
+              resolve(parsed);
+            } else {
+              reject(
+                new Error(
+                  parsed.message ||
+                    stderr.trim().slice(-500) ||
+                    `installer --switch-release exited with code ${code}`,
+                ),
+              );
+            }
+          } catch {
+            reject(
+              new Error(
+                stderr.trim().slice(-500) ||
+                  `installer --switch-release exited with code ${code}`,
+              ),
+            );
+          }
+        };
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdout += chunk.toString("utf8");
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr = (stderr + chunk.toString("utf8")).slice(-8_192);
+        });
+        child.once("error", (error) => {
+          if (settled) return;
+          settled = true;
+          reject(error);
+        });
+        child.once("close", (code) => finish(code));
+      },
+    );
+    this.#ctx?.log.info("local_server.release_switched", {
+      appVersion,
+      ok: Boolean(outcome.ok),
+    });
+  }
+
   // The owner account the installer created, read from its private file on
   // every call so the password is never kept in memory.
   async account(): Promise<LocalAccount> {

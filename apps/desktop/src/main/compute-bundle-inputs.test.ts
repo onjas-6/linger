@@ -199,5 +199,38 @@ describe("V2 bundle versioning & inputHash planner", () => {
     expect(verified.bundles.web.artifact.mirrors).toEqual([
       `https://mirror.example.com/linger/bundles/web/${packed.fileName}`,
     ]);
+
+    // P2: When a subsequent release rebuilds artifacts (even with plan=BUILD)
+    // and `web`'s deterministic .tar.zst sha256 matches the previous manifest,
+    // assembleManifestV3 automatically inherits originAppVersion and URL.
+    const nextBackend = {
+      ...packed,
+      fileName: "backend-bbbbbbbbbbbb.tar.zst",
+      artifactId: "backend-bbbbbbbbbbbb",
+      sha256: "b".repeat(64),
+    };
+    const nextManifest = assembleManifestV3({
+      appVersion: "0.2.16",
+      channel: "stable",
+      plan,
+      prevManifest: manifest,
+      builtArtifacts: {
+        ...builtArtifacts,
+        backend: {
+          "darwin-arm64": nextBackend,
+          "win32-x64": nextBackend,
+          "linux-x64": nextBackend,
+        },
+      },
+      baseUrl: "https://cdn-new.example.com/linger",
+    });
+    expect(nextManifest.bundles.web.originAppVersion).toBe("0.2.15");
+    expect(nextManifest.bundles.web.artifact.url).toBe(
+      manifest.bundles.web.artifact.url,
+    );
+    expect(nextManifest.bundles.backend.originAppVersion).toBe("0.2.16");
+    expect(nextManifest.bundles.backend.targets["darwin-arm64"].url).toBe(
+      "https://cdn-new.example.com/linger/bundles/backend/backend-bbbbbbbbbbbb.tar.zst",
+    );
   });
 });

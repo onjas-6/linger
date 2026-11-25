@@ -30,6 +30,11 @@ export interface BundleStoreOptions {
   readonly home: string;
   readonly seedDirectory?: string;
   readonly target?: string;
+  /**
+   * Optional predicate gating cold-start offline seed import (e.g. skip seed
+   * import in Thin Client mode when connected to a remote server).
+   */
+  readonly shouldImportSeed?: () => Promise<boolean> | boolean;
 }
 
 export interface GcOptions {
@@ -177,7 +182,10 @@ export class BundleStoreModule implements Module {
     }
 
     const current = await this.readCurrent();
-    if (!current && this.#options.seedDirectory) {
+    const allowSeed = this.#options.shouldImportSeed
+      ? await this.#options.shouldImportSeed()
+      : true;
+    if (!current && allowSeed && this.#options.seedDirectory) {
       const seedManifestPath = path.join(
         this.#options.seedDirectory,
         "seed-manifest.json",

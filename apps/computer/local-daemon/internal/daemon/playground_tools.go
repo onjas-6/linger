@@ -250,10 +250,17 @@ func cardCLIProgram(directory, goos string) (program string, prefix, environment
 		return program, nil, nil, true
 	}
 	script := filepath.Join(directory, "teamhub.js")
-	// The same relative app path teamhub.cmd names; apps/desktop/build.mjs
-	// writes both.
-	app := filepath.Join(directory, "..", "..", "..", "..", "Linger.exe")
-	if !regularFile(script) || !regularFile(app) {
+	if !regularFile(script) {
+		return "", nil, nil, false
+	}
+	// Prefer LINGER_CLI_NODE_PATH when the CLI is served from an externalized
+	// V2 store directory (outside the Electron app bundle); fall back to the
+	// relative app path beside teamhub.cmd written by apps/desktop/build.mjs.
+	app := strings.TrimSpace(os.Getenv("LINGER_CLI_NODE_PATH"))
+	if app == "" || !regularFile(app) {
+		app = filepath.Join(directory, "..", "..", "..", "..", "Linger.exe")
+	}
+	if !regularFile(app) {
 		return "", nil, nil, false
 	}
 	return filepath.Clean(app), []string{"--use-env-proxy", script}, []string{"ELECTRON_RUN_AS_NODE=1"}, true
