@@ -1973,7 +1973,7 @@ describe("LocalServerModule", () => {
     // Simulate a V2 backend hot-reload promoting a newer daemon binary.
     activeDaemon =
       "/home/user/.linger/store/backend/backend-abc123/computer-daemon/linger-computer-daemon";
-    f.module.inspect({ force: true });
+    f.module.recheck();
     await waitForInstaller(() => {
       const updated = JSON.parse(
         readFileSync(path.join(f.home, "runtime", "inspect-env.json"), "utf8"),

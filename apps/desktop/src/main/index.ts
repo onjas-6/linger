@@ -193,12 +193,12 @@ async function main(): Promise<void> {
   };
   const loginShell = resolveLoginShell(log);
   const shellDaemonPath = daemonExecutable();
-  let bundleStoreRef: BundleStoreModule | undefined;
+  const bundleStoreRef: { current?: BundleStoreModule } = {};
   const activeDaemonExecutable = async (): Promise<string> => {
     if (process.env.LINGER_COMPUTER_DAEMON) {
       return path.resolve(process.env.LINGER_COMPUTER_DAEMON);
     }
-    const bundled = await bundleStoreRef?.currentDaemonExecutable();
+    const bundled = await bundleStoreRef.current?.currentDaemonExecutable();
     return bundled ?? shellDaemonPath;
   };
   const localServer = new LocalServerModule({
@@ -412,7 +412,7 @@ async function main(): Promise<void> {
     target: bundleTarget,
     shouldImportSeed: isLocalServerMode,
   });
-  bundleStoreRef = bundleStore;
+  bundleStoreRef.current = bundleStore;
   const bundleUpdater = new BundleUpdaterModule({
     shellVersion,
     target: bundleTarget,
