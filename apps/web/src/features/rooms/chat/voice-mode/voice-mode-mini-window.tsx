@@ -102,16 +102,14 @@ interface Position {
 }
 
 /**
- * Floating window for the running Voice Mode session. It follows the Human
- * across Rooms, shows this session's turns and the Room's replies, and can be
- * dragged anywhere on screen and resized by its edges and corners. Where the
- * browser or the desktop app supports it, the window lives in an
- * always-on-top window of its own instead, so it stays over other tabs and
- * apps. Closing it, from its own button or the desktop's, ends Voice Mode:
- * the window leaves at once while the session drains its last words in the
- * background, and the Room composer shows that finishing state. The floating
- * window's return button, like the browser's back to tab button, only returns
- * to the conversation.
+ * The running Voice Mode session as an island: it follows the Human across
+ * Rooms, folds this session's turns and the Room's replies under it, and in
+ * the page can be dragged anywhere on screen and resized by its edges and
+ * corners. In the desktop app it lives in that app's always-on-top window
+ * instead, so it stays over other apps; browsers keep it in the page.
+ * Hanging up, or closing the desktop's window, ends Voice Mode: the window
+ * leaves at once while the session drains its last words in the background,
+ * and the Room composer shows that finishing state.
  */
 export default function VoiceModeMiniWindow({
   anotherMeActorId,
@@ -268,10 +266,11 @@ function MiniWindow({
     windowControl.current = (action) => {
       if (action === "mute" || action === "unmute")
         void onMute(action === "mute");
-      // The desktop places a picture-in-picture window; only a drag moves it.
-      else if (pip) showVoiceNotice(translate(m.dragHint));
+      // Spoken expand and shrink fold the conversation as the arrow does,
+      // floated or not; the desktop places its window, so only a drag moves it.
       else if (action === "expand" || action === "shrink")
         openConversation(action === "expand");
+      else if (pip) showVoiceNotice(translate(m.dragHint));
       else place(action === "move_left" ? "left" : "right");
     };
   });

@@ -11,6 +11,7 @@ import VoiceModeMiniWindow, {
 } from "./voice-mode-mini-window";
 import type { VoiceModeSession } from "./voice-mode-session";
 import { openVoicePip, resetVoicePipForTest } from "./voice-pip";
+import { voiceWindowAction } from "./voice-ui-bridge";
 
 const startedAt = "2026-10-02T03:00:00.000Z";
 const message = (
@@ -538,15 +539,14 @@ describe("Voice Mode mini window", () => {
       const frames: FrameRequestCallback[] = [];
       const heights: number[] = [];
       const size = { innerHeight: 96, outerHeight: 124 };
+      // Live sizes: the window reports what it was last resized to.
+      Object.defineProperties(fake.pipWindow, {
+        innerHeight: { get: () => size.innerHeight },
+        outerHeight: { get: () => size.outerHeight },
+      });
       Object.assign(fake.pipWindow, {
         cancelAnimationFrame: () => undefined,
-        get innerHeight() {
-          return size.innerHeight;
-        },
         innerWidth: 360,
-        get outerHeight() {
-          return size.outerHeight;
-        },
         outerWidth: 360,
         performance: { now: () => 0 },
         requestAnimationFrame: (callback: FrameRequestCallback) =>
@@ -577,6 +577,13 @@ describe("Voice Mode mini window", () => {
       run(280);
       expect(heights.at(-1)).toBe(76);
       expect(floating.queryByRole("log")).toBeNull();
+      // Saying "expand" folds it open just as the arrow does.
+      act(() => {
+        voiceWindowAction("expand");
+      });
+      run(280);
+      expect(heights.at(-1)).toBe(508);
+      expect(floating.getByRole("log")).toBeInTheDocument();
       act(() => fake.pipWindow.close());
     } finally {
       fake.remove();

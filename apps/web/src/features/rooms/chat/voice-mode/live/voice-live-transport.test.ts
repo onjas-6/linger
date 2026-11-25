@@ -197,6 +197,25 @@ describe("live Voice Mode transport", () => {
     expect(providerReady.mock.calls).toEqual([[false], [true], [false]]);
   });
 
+  it("reports nothing about the provider until it sees the runtime", async () => {
+    // TeamHub says the call listens before the runtime's attributes arrive.
+    const f = fixture();
+    const providerReady = vi.fn();
+    await openVoiceLive({ ...f.options, providerReady });
+    expect(providerReady).not.toHaveBeenCalled();
+    media.room!.remoteParticipants.set("agent-runtime", {
+      ...participant("agent-runtime"),
+      isAgent: true,
+      attributes: {
+        "linger.voice_ready_generation": "1",
+        "linger.voice_provider_ready": "0",
+      },
+    });
+    emit("attributes");
+    // Waking up from the start, never a Listening that flips back.
+    expect(providerReady.mock.calls).toEqual([[false]]);
+  });
+
   it("takes a runtime that never reports its provider as connected", async () => {
     media.present = [
       {

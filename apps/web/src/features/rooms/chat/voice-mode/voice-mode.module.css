@@ -181,6 +181,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .avatarBeat,
+  .avatarBeat[data-waking],
   .islandWave {
     animation: none;
     transition: none;

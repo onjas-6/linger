@@ -374,7 +374,10 @@ export async function openVoiceLive(input: {
           participant.attributes["linger.voice_ready_generation"] ===
             generation,
       );
-      const next = runtime?.attributes[providerReadyAttribute] !== "0";
+      // Until the runtime shows here, nothing is known: listening may have
+      // started on TeamHub's word before its attributes arrive.
+      if (!runtime) return;
+      const next = runtime.attributes[providerReadyAttribute] !== "0";
       if (next === providerReady || !live()) return;
       providerReady = next;
       input.providerReady?.(next);
