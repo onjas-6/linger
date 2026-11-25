@@ -159,4 +159,26 @@ describe("AccountMenu desktop update", () => {
     view.unmount();
     expect(off).toHaveBeenCalledOnce();
   });
+
+  it("displays appVersion from update.getInfo and refreshes it after an update settles to idle", async () => {
+    let appVersion = "0.1.10-v2test.0";
+    const { update, push } = installDesktop({ kind: "ready", version: "0.1.10-v2test.1" });
+    (update as Record<string, unknown>).getInfo = vi.fn(async () => ({
+      shellVersion: "0.1.10-v2test.0",
+      appVersion,
+      channel: "stable",
+    }));
+
+    renderMenu();
+    const menu = await openMenu();
+    await vi.waitFor(() =>
+      expect(menu).toHaveTextContent("Version 0.1.10-v2test.0"),
+    );
+
+    appVersion = "0.1.10-v2test.1";
+    push({ kind: "idle" });
+    await vi.waitFor(() =>
+      expect(menu).toHaveTextContent("Version 0.1.10-v2test.1"),
+    );
+  });
 });

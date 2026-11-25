@@ -159,6 +159,7 @@ if (args.includes("--inspect")) {
       PATH: process.env.PATH,
       ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
       LINGER_COMPUTER_DAEMON: process.env.LINGER_COMPUTER_DAEMON,
+      LINGER_WEB_CONTROL_TOKEN: process.env.LINGER_WEB_CONTROL_TOKEN,
     }),
   );
   const hardware = { totalMemoryBytes: 64 * 1024 ** 3, diskFreeBytes: 200 * 1024 ** 3, gpus: [{ name: "RTX 4090" }] };
@@ -1918,10 +1919,11 @@ describe("LocalServerModule", () => {
     info.mockRestore();
   });
 
-  it("passes the resolved login-shell environment and daemon binary path to setup inspection", async () => {
+  it("passes the resolved login-shell environment, daemon binary path, and web control token to setup inspection", async () => {
     const f = fixture({
       checkout: "/src",
       daemonExecutable: "/app/resources/computer/linger-computer-daemon",
+      webControlToken: "session-web-token-abc",
       env: Promise.resolve({
         ...(process.env as Record<string, string>),
         PATH: `/custom/nvm/bin${path.delimiter}/usr/bin${path.delimiter}/bin`,
@@ -1942,12 +1944,14 @@ describe("LocalServerModule", () => {
       PATH?: string;
       ANTHROPIC_BASE_URL?: string;
       LINGER_COMPUTER_DAEMON?: string;
+      LINGER_WEB_CONTROL_TOKEN?: string;
     };
     expect(seen.PATH).toContain("/custom/nvm/bin");
     expect(seen.ANTHROPIC_BASE_URL).toBe("https://shell-profile.example");
     expect(seen.LINGER_COMPUTER_DAEMON).toBe(
       "/app/resources/computer/linger-computer-daemon",
     );
+    expect(seen.LINGER_WEB_CONTROL_TOKEN).toBe("session-web-token-abc");
   });
 
   it("re-resolves dynamic V2 daemonExecutable on every setup inspection", async () => {

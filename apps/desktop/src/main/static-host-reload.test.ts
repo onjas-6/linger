@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -101,4 +101,70 @@ describe("apps/web/static-host.mjs V2 zero-downtime hot reload", () => {
     expect(health.ok).toBe(true);
     expect(health.artifactId).toBe("web-222222222222");
   });
+
+  it.skipIf(process.platform === "win32")(
+    "accepts symlinked allowedStaticRoot/root paths (e.g. macOS /tmp -> /private/tmp) while blocking symlink escapes",
+    async () => {
+      const root = await makeTempDir("linger-web-symlink-");
+      const realHome = path.join(root, "private", "tmp", "home");
+      const linkHome = path.join(root, "tmp-link");
+      const storeWebReal = path.join(realHome, "store", "web");
+      const v1Root = path.join(storeWebReal, "web-1111", "dist");
+      const v2Root = path.join(storeWebReal, "web-2222", "dist");
+      const outside = path.join(root, "outside");
+      await mkdir(v1Root, { recursive: true });
+      await mkdir(v2Root, { recursive: true });
+      await mkdir(outside, { recursive: true });
+      await writeFile(path.join(v1Root, "index.html"), "<html>v1</html>", "utf8");
+      await writeFile(path.join(v2Root, "index.html"), "<html>v2-symlink</html>", "utf8");
+      await writeFile(path.join(outside, "index.html"), "<html>escape</html>", "utf8");
+      await symlink(realHome, linkHome);
+      const escapeLink = path.join(storeWebReal, "escape-link");
+      await symlink(outside, escapeLink);
+
+      const controlToken = "symlink-test-token-24bytes";
+      // Configure allowedStaticRoot via symlink path (like /tmp/home/store/web)
+      // while sending realpath in body.root (and vice versa).
+      const handler = createStaticHost({
+        root: v1Root,
+        controlToken,
+        allowedStaticRoot: path.join(linkHome, "store", "web"),
+      });
+      const server = createServer((req, res) => {
+        void handler(req, res);
+      });
+      servers.push(server);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const base = `http://127.0.0.1:${port}`;
+
+      // Symlink escape inside store/web pointing outside must be rejected (403).
+      const escapeRes = await fetch(`${base}/__internal/reload-static`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-linger-control-token": controlToken,
+        },
+        body: JSON.stringify({ root: escapeLink }),
+      });
+      expect(escapeRes.status).toBe(403);
+
+      // Realpath matching symlinked allowedStaticRoot succeeds (200).
+      const swapRes = await fetch(`${base}/__internal/reload-static`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-linger-control-token": controlToken,
+        },
+        body: JSON.stringify({
+          root: await realpath(v2Root),
+          artifactId: "web-2222",
+        }),
+      });
+      expect(swapRes.status).toBe(200);
+      const page = await fetch(`${base}/`, { headers: { accept: "text/html" } });
+      expect(await page.text()).toBe("<html>v2-symlink</html>");
+    },
+  );
 });

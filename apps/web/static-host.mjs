@@ -1,9 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import process from "node:process";
-import { extname, relative, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL, URL } from "node:url";
+import { extname, isAbsolute, relative, resolve } from "node:path";
+import { fileURLToPath, URL } from "node:url";
 
 import Negotiator from "negotiator";
 import sirv from "sirv";
@@ -20,6 +20,15 @@ const reservedPathPrefixes = [
   "/v0",
 ];
 const supportedContentEncodings = ["br", "gzip", "identity"];
+
+function canonicalPath(target) {
+  const resolved = resolve(target);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
 
 function isLoopbackAddress(address = "") {
   return (
@@ -142,11 +151,16 @@ export function createStaticHost({
         response.end(JSON.stringify({ ok: false, error: "missing_root" }));
         return;
       }
-      const nextRoot = resolve(body.root);
+      const nextRoot = canonicalPath(body.root);
       if (allowedStaticRoot) {
-        const base = resolve(allowedStaticRoot);
+        const base = canonicalPath(allowedStaticRoot);
         const rel = relative(base, nextRoot);
-        if (rel.startsWith("..") || rel === "" || nextRoot === base) {
+        if (
+          rel.startsWith("..") ||
+          isAbsolute(rel) ||
+          rel === "" ||
+          nextRoot === base
+        ) {
           response.statusCode = 403;
           response.setHeader("content-type", "application/json; charset=utf-8");
           response.end(
@@ -454,6 +468,6 @@ function isMainModule() {
   const entrypoint = process.argv[1];
   return (
     typeof entrypoint === "string" &&
-    pathToFileURL(resolve(entrypoint)).href === import.meta.url
+    canonicalPath(entrypoint) === canonicalPath(fileURLToPath(import.meta.url))
   );
 }

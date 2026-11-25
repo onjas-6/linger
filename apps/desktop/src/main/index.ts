@@ -48,6 +48,10 @@ import { EnrollmentModule } from "./enrollment.js";
 import { HealthWatchdogModule } from "./health-watchdog.js";
 import { LanguageModule } from "./language.js";
 import {
+  buildV2HealthProbes,
+  resolveToolsNodePath,
+} from "./v2-runtime-helpers.js";
+import {
   LocalServerModule,
   signInWithPassword,
   type SourceArchive,
@@ -192,6 +196,9 @@ async function main(): Promise<void> {
       : undefined;
   };
   const loginShell = resolveLoginShell(log);
+  const webControlToken =
+    process.env.LINGER_WEB_CONTROL_TOKEN?.trim() ||
+    randomBytes(24).toString("hex");
   const shellDaemonPath = daemonExecutable();
   const bundleStoreRef: { current?: BundleStoreModule } = {};
   const activeDaemonExecutable = async (): Promise<string> => {
@@ -205,6 +212,7 @@ async function main(): Promise<void> {
     home,
     daemonDirectory,
     daemonExecutable: activeDaemonExecutable,
+    webControlToken,
     version: VERSION,
     env: installerEnv(loginShell),
     macosVersion: () => process.getSystemVersion(),
@@ -493,8 +501,7 @@ async function main(): Promise<void> {
       : undefined,
     hotReloadWeb: async (release) => {
       const origin = config.get().serverUrl;
-      const token = process.env.LINGER_WEB_CONTROL_TOKEN;
-      if (!origin || !token) return;
+      if (!origin || !webControlToken) return;
       // Thin Client guard (P1-2): never POST internal reload-static to a remote server.
       if (!(await localServer.servesWindow()) && !isLoopbackOrigin(origin)) {
         return;
@@ -504,7 +511,7 @@ async function main(): Promise<void> {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-linger-control-token": token,
+          "x-linger-control-token": webControlToken,
         },
         body: JSON.stringify({
           root: nextRoot,
@@ -541,12 +548,12 @@ async function main(): Promise<void> {
             : "linger-computer-daemon",
         );
         if (existsSync(daemonExe)) {
-          const sharedNode = path.join(
+          const toolsNode = resolveToolsNodePath({
             home,
-            release.infra.node,
-            "bin",
-            process.platform === "win32" ? "node.exe" : "node",
-          );
+            releaseInfraNode: release.infra.node,
+            resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
+            isPackaged: app.isPackaged,
+          });
           const toolsDir = computerToolsDirectory();
           computerDaemon.reloadBinary({
             spawn: spawnDaemon(
@@ -555,7 +562,7 @@ async function main(): Promise<void> {
             ),
             teamhubCliDirectory: path.join(daemonDir, "teamhub-cli"),
             extraEnv: {
-              LINGER_TOOLS_NODE_PATH: sharedNode,
+              ...(toolsNode ? { LINGER_TOOLS_NODE_PATH: toolsNode } : {}),
               // P0-2: Allow externalized teamhub-cli wrappers to locate the Electron shell binary.
               LINGER_CLI_NODE_PATH: process.execPath,
               // P1-1: Keep Shell-bundled computer-tools (Playwright, CuaDriver.app, QuickJS)
@@ -576,45 +583,12 @@ async function main(): Promise<void> {
     buildHealthProbes: (_release, changed) => {
       const origin = config.get().serverUrl;
       const localOrigin = origin && isLoopbackOrigin(origin) ? origin : undefined;
-      const probes = [];
-      if (changed.includes("web") && localOrigin) {
-        probes.push({
-          name: "web-healthz",
-          check: async () => {
-            const res = await fetch(new URL("/healthz", localOrigin)).catch(
-              () => undefined,
-            );
-            return res?.ok ?? false;
-          },
-        });
-      }
-      if (changed.includes("backend")) {
-        const teamhubHealth =
-          (!app.isPackaged && process.env.LINGER_TEAMHUB_HEALTH_URL) ||
-          (localOrigin ? new URL("/healthz", localOrigin).toString() : undefined);
-        if (teamhubHealth) {
-          probes.push({
-            name: "teamhub-healthz",
-            check: async () => {
-              const res = await fetch(teamhubHealth).catch(() => undefined);
-              if (!res?.ok) return false;
-              if (process.env.TEAMHUB_LOCAL_IDENTITY_KEY) {
-                const idUrl = new URL("/v0/local/identity", teamhubHealth);
-                const idRes = await fetch(idUrl, {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({
-                    nonce: randomBytes(32).toString("base64url"),
-                  }),
-                }).catch(() => undefined);
-                if (!idRes?.ok) return false;
-              }
-              return true;
-            },
-          });
-        }
-      }
-      return probes;
+      return buildV2HealthProbes({
+        changed,
+        localOrigin,
+        isPackaged: app.isPackaged,
+        loadLocalPorts: () => localServer.localPorts(),
+      });
     },
   });
   const modules: Module[] = [

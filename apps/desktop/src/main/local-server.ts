@@ -376,6 +376,10 @@ export interface LocalServerOptions {
   readonly daemonExecutable?:
     | string
     | (() => string | undefined | Promise<string | undefined>);
+  // Per-session loopback control token forwarded to static-host.mjs so V2
+  // web-only incremental updates can hot-swap static roots via
+  // POST /__internal/reload-static.
+  readonly webControlToken?: string;
   // The bundled installer (installer.js, web/, native-process-worker.mjs).
   readonly installerDirectory: string;
   readonly sourceArchive?: SourceArchive;
@@ -989,6 +993,9 @@ export class LocalServerModule implements Module {
       typeof configured === "function" ? await configured() : configured;
     if (daemon) {
       base.LINGER_COMPUTER_DAEMON = daemon;
+    }
+    if (this.#options.webControlToken) {
+      base.LINGER_WEB_CONTROL_TOKEN = this.#options.webControlToken;
     }
     return base;
   }
@@ -1654,6 +1661,27 @@ export class LocalServerModule implements Module {
    */
   async hasLocalInstance(): Promise<boolean> {
     return (await this.#readRecord()) !== undefined;
+  }
+
+  /**
+   * Returns the bound local service ports from `instance.json` for the active
+   * local installation, or `undefined` when no native instance exists yet.
+   */
+  async localPorts(): Promise<
+    | Readonly<
+        Record<
+          "web" | "teamhub" | "nodeServices" | "document" | "postgres",
+          number
+        >
+      >
+    | undefined
+  > {
+    const record = await this.#readRecord();
+    const home = record?.home ?? this.#home;
+    const instance = await loadInstance({ name: LOCAL_INSTANCE, home }).catch(
+      () => undefined,
+    );
+    return instance?.source?.ports;
   }
 
   /**

@@ -1273,6 +1273,24 @@ async function runNativeSource(
           )
             ? await resolveBundleReleaseDescriptor(home).catch(() => undefined)
             : undefined;
+          const webControlToken =
+            env.LINGER_WEB_CONTROL_TOKEN?.trim() ||
+            process.env.LINGER_WEB_CONTROL_TOKEN?.trim();
+          const webControlEnv: Record<string, string> = {
+            LINGER_ALLOWED_WEB_ROOT: path.join(path.resolve(home), "store", "web"),
+            ...(webControlToken
+              ? { LINGER_WEB_CONTROL_TOKEN: webControlToken }
+              : {}),
+          };
+          const webSettings = webControlToken
+            ? JSON.stringify({
+                base: settings,
+                webControlTokenHash: createHash("sha256")
+                  .update(webControlToken)
+                  .digest("hex")
+                  .slice(0, 16),
+              })
+            : settings;
           const serviceOptions = (
             name: "teamhub" | "node-services" | "web",
           ) => {
@@ -1285,13 +1303,13 @@ async function runNativeSource(
                   }
                 : name === "node-services"
                   ? { ...env, ...proxyEnv }
-                  : env;
+                  : { ...env, ...webControlEnv };
             const baseSettings =
               name === "teamhub"
                 ? teamhubSettings
                 : name === "node-services"
                   ? nodeServicesSettings
-                  : settings;
+                  : webSettings;
             if (
               activeBundleRelease &&
               hasBundleServiceArtifacts(home, activeBundleRelease, name)
@@ -1300,7 +1318,12 @@ async function runNativeSource(
                 name,
                 home,
                 activeBundleRelease,
-                { baseEnv: baseServiceEnv },
+                {
+                  baseEnv: baseServiceEnv,
+                  ...(name === "web" && webControlToken
+                    ? { webControlToken }
+                    : {}),
+                },
               );
               const executable =
                 name === "teamhub"
