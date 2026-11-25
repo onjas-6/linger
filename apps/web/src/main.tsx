@@ -9,6 +9,7 @@ import { startTeamHubSessionActivity } from "@/app/teamhub-session-activity";
 import { startTeamHubAuthenticationRuntime } from "@/app/teamhub-authentication-runtime";
 import { createAppQueryClient } from "@/app/query-client";
 import { markDesktopShell } from "@/app/desktop-shell";
+import { reportThemeToDesktop } from "@/app/desktop-theme";
 // Fonts load from JS so Vite fingerprints their files; a CSS @import is inlined
 // by Tailwind without rewriting the relative font URLs.
 import "@fontsource-variable/geist";
@@ -29,9 +30,10 @@ import { useT } from "@/i18n/use-translation";
 installVitePreloadRecovery({ buildId: import.meta.url });
 markDesktopShell();
 loadHanFont(navigator.languages);
-// The remembered theme is applied before the first paint, so dark mode never
-// flashes by in light first.
+// index.html already put the remembered theme on screen before the first
+// paint; from here it follows the choice, the system and other tabs.
 restoreTheme();
+reportThemeToDesktop();
 
 const rootElement = document.getElementById("root");
 

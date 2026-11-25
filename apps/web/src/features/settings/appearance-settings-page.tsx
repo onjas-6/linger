@@ -1,34 +1,39 @@
 import { useSyncExternalStore } from "react";
 
-import { Select, SelectItem } from "@/components/ui/select";
-import { useTranslation } from "@/i18n/use-translation";
 import {
+  currentTheme,
+  getThemeChoice,
   isThemeChoice,
   setThemeChoice,
-  storedThemeChoice,
   subscribeToTheme,
-  THEMES,
+  THEME_CHOICES,
   type ThemeChoice,
 } from "@/app/theme";
+import { Select, SelectItem } from "@/components/ui/select";
+import { useTranslation } from "@/i18n/use-translation";
 
 import { SettingsPageHeading } from "./settings-page-heading";
 import { settingsMessages } from "./settings.messages";
 
-/** The choice shown: the stored one, with "System" standing for empty. */
-function shownChoice(): ThemeChoice {
-  return storedThemeChoice() ?? "system";
+const choiceMessages = {
+  system: settingsMessages.system,
+  light: settingsMessages.light,
+  dark: settingsMessages.dark,
+} satisfies Record<ThemeChoice, unknown>;
+
+// The choice and the theme it shows as one value: while System is chosen the
+// choice stays put when the operating system switches, and the hint that
+// names the theme on screen still has to redraw.
+function themeSnapshot() {
+  return `${getThemeChoice()}:${currentTheme()}`;
 }
 
 export function AppearanceSettingsPage() {
   const { t } = useTranslation();
-  // Another tab of this browser may change the theme; follow it.
-  useSyncExternalStore(subscribeToTheme, shownChoice, shownChoice);
-  const choice = shownChoice();
-  const system = t(
-    document.documentElement.hasAttribute("data-theme")
-      ? settingsMessages.dark
-      : settingsMessages.light,
-  );
+  // The theme also changes from outside this page: another tab of this
+  // browser, or the operating system while System is chosen.
+  useSyncExternalStore(subscribeToTheme, themeSnapshot, themeSnapshot);
+  const choice = getThemeChoice();
 
   function choose(value: string) {
     if (!isThemeChoice(value) || value === choice) return;
@@ -52,7 +57,9 @@ export function AppearanceSettingsPage() {
               className="text-sm text-muted-foreground"
               id="interface-theme-hint"
             >
-              {t(settingsMessages.interfaceThemeHint, { current: system })}
+              {t(settingsMessages.interfaceThemeHint, {
+                current: t(choiceMessages[currentTheme()]),
+              })}
             </p>
           </div>
           <Select
@@ -62,15 +69,9 @@ export function AppearanceSettingsPage() {
             onValueChange={choose}
             value={choice}
           >
-            {THEMES.map(({ value }) => (
+            {THEME_CHOICES.map((value) => (
               <SelectItem key={value} value={value}>
-                {t(
-                  value === "light"
-                    ? settingsMessages.light
-                    : value === "dark"
-                      ? settingsMessages.dark
-                      : settingsMessages.system,
-                )}
+                {t(choiceMessages[value])}
               </SelectItem>
             ))}
           </Select>

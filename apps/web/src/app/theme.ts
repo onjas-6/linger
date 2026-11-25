@@ -1,117 +1,114 @@
 /**
  * The interface theme: light, dark, or whatever the operating system uses.
  *
- * The choice is kept per browser, exactly like the language choice: the
- * sign-in page and the desktop shell render before any account is known.
- * No stored value means the person has not chosen, so the interface
- * follows the system (`prefers-color-scheme`) instead.
+ * The choice is kept per browser, like the language choice: the sign-in page
+ * and the desktop shell render before any account is known. No stored value
+ * means the person has not pinned a theme, so the interface follows the
+ * system (`prefers-color-scheme`).
  *
- * The theme is applied as `data-theme="dark"` on the document element.
- * `restoreTheme()` runs before the first paint, so dark mode never
- * flashes by in light first.
+ * The theme on screen is `data-theme="dark"` on the document element, and no
+ * attribute for light. The inline script in `index.html` sets it before the
+ * first paint from the same key and by the same rule; `theme.test.ts` runs
+ * that script against this module so the two cannot drift apart.
  */
 
-export const THEMES = [
-  { value: "system", label: "System" },
-  { value: "light", label: "Light" },
-  { value: "dark", label: "Dark" },
-] as const;
+export const THEME_CHOICES = ["system", "light", "dark"] as const;
 
-export type ThemeChoice = (typeof THEMES)[number]["value"];
+export type ThemeChoice = (typeof THEME_CHOICES)[number];
+
+export type Theme = Exclude<ThemeChoice, "system">;
 
 export const THEME_STORAGE_KEY = "linger.theme";
 
+const DARK_QUERY = "(prefers-color-scheme: dark)";
+
+// Kept in memory as well, so a switch holds for this session where storage
+// cannot be written.
+let choice: ThemeChoice = "system";
+let following = false;
 const listeners = new Set<() => void>();
 
 export function isThemeChoice(value: unknown): value is ThemeChoice {
-  return THEMES.some((theme) => theme.value === value);
+  return THEME_CHOICES.some((candidate) => candidate === value);
 }
 
-/** The theme the person chose on this device; undefined before any choice. */
-export function storedThemeChoice(): ThemeChoice | undefined {
+function storedThemeChoice(): ThemeChoice {
   try {
     const stored = localStorage.getItem(THEME_STORAGE_KEY);
-    return isThemeChoice(stored) ? stored : undefined;
+    return stored === "light" || stored === "dark" ? stored : "system";
   } catch {
-    return undefined;
+    return "system";
   }
 }
 
-/** The theme on screen right now: the stored choice, or the system's. */
-export function currentTheme(): Exclude<ThemeChoice, "system"> {
-  return resolveTheme(storedThemeChoice());
+/** What the person chose on this device; "system" before any choice. */
+export function getThemeChoice(): ThemeChoice {
+  return choice;
 }
 
-function resolveTheme(
-  choice: ThemeChoice | undefined,
-): Exclude<ThemeChoice, "system"> {
-  if (choice && choice !== "system") return choice;
-  const prefersDark =
-    typeof window !== "undefined" &&
-    window.matchMedia("(prefers-color-scheme: dark)").matches;
-  return prefersDark ? "dark" : "light";
+/** The theme on screen right now: the pinned one, or the system's. */
+export function currentTheme(): Theme {
+  if (choice !== "system") return choice;
+  return typeof window !== "undefined" && window.matchMedia(DARK_QUERY).matches
+    ? "dark"
+    : "light";
 }
 
-/** Applies `theme` to the document; a no-op where there is no document. */
-function showTheme(theme: Exclude<ThemeChoice, "system">) {
-  if (typeof document === "undefined") return;
-  const root = document.documentElement;
-  if (theme === "dark") root.setAttribute("data-theme", "dark");
-  else root.removeAttribute("data-theme");
-}
-
+/** Called on every change of the choice or of the theme on screen. */
 export function subscribeToTheme(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
 
+function showTheme() {
+  if (typeof document !== "undefined") {
+    const root = document.documentElement;
+    if (currentTheme() === "dark") root.setAttribute("data-theme", "dark");
+    else root.removeAttribute("data-theme");
+  }
+  for (const listener of listeners) listener();
+}
+
 /**
- * Switches the interface to `choice` and remembers it. The system choice
- * follows the operating system from then on, including while the app is
- * open.
+ * Switches the interface to `next` and remembers it. "system" forgets the
+ * pinned theme, so the interface follows the operating system again.
  */
-export function setThemeChoice(choice: ThemeChoice) {
+export function setThemeChoice(next: ThemeChoice) {
+  choice = next;
   try {
-    if (choice === "system") localStorage.removeItem(THEME_STORAGE_KEY);
-    else localStorage.setItem(THEME_STORAGE_KEY, choice);
+    if (next === "system") localStorage.removeItem(THEME_STORAGE_KEY);
+    else localStorage.setItem(THEME_STORAGE_KEY, next);
   } catch {
     // The switch still holds for this session without saved preferences.
   }
-  applyThemeChoice(choice);
-}
-
-function applyThemeChoice(choice: ThemeChoice | undefined) {
-  showTheme(resolveTheme(choice));
-  for (const listener of listeners) listener();
+  showTheme();
 }
 
 /**
- * Shows the remembered theme before the first paint. Afterward, the
- * system choice keeps following the operating system until the person
- * picks a theme of their own.
+ * Takes up the remembered choice and keeps the interface in step with the
+ * operating system and with other tabs from then on.
  */
 export function restoreTheme() {
-  if (typeof window === "undefined") return;
-  const stored = storedThemeChoice();
-  applyThemeChoice(stored);
-  if (stored && stored !== "system") return;
-  // The person has not pinned a theme: follow the system as it changes.
-  window
-    .matchMedia("(prefers-color-scheme: dark)")
-    .addEventListener("change", () => {
-      if (storedThemeChoice()) return;
-      applyThemeChoice("system");
-    });
+  choice = storedThemeChoice();
+  showTheme();
+  if (typeof window === "undefined" || following) return;
+  following = true;
+  // Both stay installed whatever the choice is now: it can go back to
+  // "system" later, and each handler looks at the choice of the moment.
+  window.matchMedia(DARK_QUERY).addEventListener("change", () => {
+    if (choice === "system") showTheme();
+  });
   // Another tab of this browser changed the theme: follow it.
   window.addEventListener("storage", (event) => {
-    if (event.key !== THEME_STORAGE_KEY) return;
-    applyThemeChoice(storedThemeChoice() ?? "system");
+    // A null key is the whole storage being cleared.
+    if (event.key !== null && event.key !== THEME_STORAGE_KEY) return;
+    choice = storedThemeChoice();
+    showTheme();
   });
 }
 
-/** Puts the interface back to light between tests. */
+/** Puts the interface back to the system's theme between tests. */
 export function resetThemeForTest() {
-  if (typeof document !== "undefined")
-    document.documentElement.removeAttribute("data-theme");
-  for (const listener of listeners) listener();
+  choice = "system";
+  showTheme();
 }
