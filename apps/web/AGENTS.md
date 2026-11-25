@@ -88,7 +88,8 @@ build:assets` to check the initial JS budget.
   `Switch Agent…` in `Used by`, and `Make room` automatic Agent handoff once
   the replacement model loads when `Pi` is ready), maps every code and enum
   label through `local-models-copy.ts` and `local-models.messages.ts`, checks
-  live download memory via `downloadMemoryCheck` when the Computer reports
+  live download memory (row and driver-resume banner downloads alike) via
+  `downloadMemoryCheck` when the Computer reports
   `fits_now === false` (`DownloadLowMemoryDialog`: `Recheck memory` or
   `Download only` with `no_autoload`, keeping direct download when `fits_now`
   is absent while still showing the passive memory-shortfall warning via

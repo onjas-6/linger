@@ -5969,7 +5969,7 @@ describe("Featured Inkling 2 Mini spotlight", () => {
     await waitFor(() => expect(fixture.refreshes).toEqual(["computer-lab"]));
   });
 
-  it("shows post-reboot driver completion banner with direct model download and dismisses cleanly", async () => {
+  function stubCompletedDriverInstall(resumeModelId: string) {
     const clearInstallState = vi.fn(async () => {});
     const previousDesktop = (window as { lingerDesktop?: unknown })
       .lingerDesktop;
@@ -5995,7 +5995,7 @@ describe("Featured Inkling 2 Mini spotlight", () => {
         })),
         getInstallState: vi.fn(async () => ({
           phase: "completed",
-          resumeModelId: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+          resumeModelId,
           version: "621.24",
         })),
         onInstallState: vi.fn(() => () => {}),
@@ -6007,6 +6007,23 @@ describe("Featured Inkling 2 Mini spotlight", () => {
       platform: "win32",
       version: "0.16.20",
     };
+    return {
+      clearInstallState,
+      restore() {
+        if (previousDesktop === undefined) {
+          delete (window as { lingerDesktop?: unknown }).lingerDesktop;
+        } else {
+          (window as { lingerDesktop?: unknown }).lingerDesktop =
+            previousDesktop;
+        }
+      },
+    };
+  }
+
+  it("shows post-reboot driver completion banner with direct model download and dismisses cleanly", async () => {
+    const { clearInstallState, restore } = stubCompletedDriverInstall(
+      "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+    );
 
     try {
       const unlockedInkling = localModel({
@@ -6053,11 +6070,66 @@ describe("Featured Inkling 2 Mini spotlight", () => {
         }),
       );
     } finally {
-      if (previousDesktop === undefined) {
-        delete (window as { lingerDesktop?: unknown }).lingerDesktop;
-      } else {
-        (window as { lingerDesktop?: unknown }).lingerDesktop = previousDesktop;
-      }
+      restore();
+    }
+  });
+
+  it("checks live memory before the driver banner downloads its model", async () => {
+    const { restore } = stubCompletedDriverInstall(
+      "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+    );
+
+    try {
+      const fixture = setup([
+        labView({
+          models: [
+            modelView(
+              localModel({
+                availability: { downloadable: true },
+                fit: "gpu",
+                fits_now: false,
+                id: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+                load_free_bytes: gb(2),
+                load_need_bytes: gb(8),
+                memory_bytes: gb(8),
+                name: "Inkling 2 Mini (UD-Q3_K_XL)",
+                pool: "gpu:0",
+                quant: "UD-Q3_K_XL",
+                state: "absent",
+              }),
+            ),
+          ],
+          pools: [gpuPool(0, 8)],
+        }),
+      ]);
+      await renderPage(fixture);
+      await findModels();
+
+      const banner = await screen.findByRole("complementary", {
+        name: "NVIDIA driver update status",
+      });
+      fireEvent.click(
+        within(banner).getByRole("button", {
+          name: "Download Inkling 2 Mini (UD-Q3_K_XL)",
+        }),
+      );
+      const dialog = await screen.findByRole("dialog", {
+        name: "Not enough free memory to load now",
+      });
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Download only" }),
+      );
+      await waitFor(() =>
+        expect(fixture.actions).toEqual([
+          {
+            body: { action: "download", no_autoload: true },
+            computerId: "computer-lab",
+            modelId: "inkling-2-mini-q3-poly:UD-Q3_K_XL",
+          },
+        ]),
+      );
+    } finally {
+      restore();
     }
   });
 });

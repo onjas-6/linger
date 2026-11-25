@@ -1684,10 +1684,7 @@ function Library({
                   <Button
                     onClick={() => {
                       dismissDriverBanner();
-                      act({
-                        action: "download",
-                        modelId: resumeModelEntry.model.id,
-                      });
+                      download(resumeModelEntry);
                     }}
                     size="compact"
                     tone="primary"
