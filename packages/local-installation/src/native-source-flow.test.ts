@@ -658,7 +658,6 @@ test("a restart keeps a saved local source as before", async () => {
   expect(restoreByokSource).not.toHaveBeenCalled();
   expect(restoreLocalModels).not.toHaveBeenCalled();
 });
-
 test("a fresh BYOK install omits --main-plan and prepares the BYOK gateway", async () => {
   const f = await fixture();
   vi.mocked(prepareByokRuntime).mockResolvedValue({
@@ -693,7 +692,8 @@ test("a fresh BYOK install omits --main-plan and prepares the BYOK gateway", asy
     expect.anything(),
   );
 });
-test("a cold resume restores an adopted stack local model when setup-choice is local-models and setup binding is ready", async () => {
+
+test("a cold resume keeps an adopted stack local model on standby without calling prepareLocalModels or library load", async () => {
   const f = await fixture();
   await installNativeSource({
     home: f.home,
@@ -712,6 +712,19 @@ test("a cold resume restores an adopted stack local model when setup-choice is l
     JSON.stringify({ schema: "localmodels.stack-plan/v1", plan_id: planId }),
   );
   await atomicPrivate(
+    path.join(localmodelsRoot, "binding.json"),
+    JSON.stringify({
+      schema: "localmodels.stack-binding/v1",
+      planId,
+      ready: true,
+      pi: {
+        executable: "/mock/pi",
+        configFingerprint: "b".repeat(64),
+        environment: { PI_CODING_AGENT_DIR: "/mock/pi-agent" },
+      },
+    }),
+  );
+  await atomicPrivate(
     path.join(state, "model-source.json"),
     JSON.stringify({
       schema: "localmodels.model-source/v1",
@@ -726,55 +739,31 @@ test("a cold resume restores an adopted stack local model when setup-choice is l
   vi.mocked(applyNativeSource).mockClear();
   vi.mocked(prepareLocalModels).mockClear();
   vi.mocked(restoreLocalModels).mockClear();
+  vi.mocked(prepareFoundationServices).mockClear();
   const actualLocalModels =
     await vi.importActual<typeof import("./local-models.js")>(
       "./local-models.js",
     );
-  const localmodelsCalls: string[][] = [];
-  const fakeLocalmodels = vi.fn(async (_home: string, args: string[]) => {
-    localmodelsCalls.push(args);
-    if (args[0] === "setup" && args[1] === "binding") {
-      return {
-        code: 0,
-        stdout: JSON.stringify({
-          schema: "localmodels.stack-binding/v1",
-          planId,
-          ready: true,
-          pi: {
-            executable: "/mock/pi",
-            configFingerprint: "b".repeat(64),
-            environment: { PI_CODING_AGENT_DIR: "/mock/pi-agent" },
-          },
-        }),
-        stderr: "",
-      };
-    }
-    if (args[0] === "library" && args[1] === "status") {
-      return {
-        code: 0,
-        stdout: JSON.stringify({
-          schema: "localmodels.library-status/v1",
-          models: [
-            {
-              id: "qwen3.8-27b:UD-Q4_K_M",
-              state: "idle",
-              pi_model: "localmodels/localmodels-agent",
-            },
-          ],
-        }),
-        stderr: "",
-      };
-    }
-    if (args[0] === "library" && args[1] === "load") {
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "{}", stderr: "" };
-  });
+  const fakeLocalmodels = vi.fn();
   vi.mocked(restoreLocalModels).mockImplementationOnce((instance, options) =>
     actualLocalModels.restoreLocalModels(instance, options, {
       localmodels: fakeLocalmodels,
     }),
   );
+
+  const order: string[] = [];
+  const baseStart = vi.mocked(startNativeProcess).getMockImplementation()!;
+  vi.mocked(startNativeProcess).mockImplementation(async (opts) => {
+    order.push(`start:${opts.name}`);
+    return baseStart(opts);
+  });
+  vi.mocked(prepareFoundationServices).mockImplementation(async () => {
+    order.push("foundations");
+  });
+
+  const saved = await loadInstance({ name: "native-flow", home: f.home });
+  await stopNativeSource(saved!, new AbortController().signal);
+  order.length = 0;
 
   const result = await installNativeSource({
     home: f.home,
@@ -788,32 +777,21 @@ test("a cold resume restores an adopted stack local model when setup-choice is l
   expect(
     (result.details as { localModelsDegraded?: unknown }).localModelsDegraded,
   ).toBeUndefined();
-  expect(prepareLocalModels).toHaveBeenCalledTimes(1);
+  expect(prepareLocalModels).not.toHaveBeenCalled();
   expect(restoreLocalModels).toHaveBeenCalledTimes(1);
-  expect(localmodelsCalls.map((args) => `${args[0]} ${args[1]}`)).toEqual([
-    "setup binding",
-    "library status",
-    "library load",
-  ]);
-  expect(localmodelsCalls[2]?.slice(0, 3)).toEqual([
-    "library",
-    "load",
-    "qwen3.8-27b:UD-Q4_K_M",
-  ]);
-  expect(applyNativeSource).toHaveBeenCalledWith(
-    path.resolve(f.home),
-    "local",
-    "pi",
-    expect.objectContaining({
-      model: "qwen3.8-27b:UD-Q4_K_M",
-      signal: expect.any(AbortSignal),
-      onEvent: expect.any(Function),
-    }),
-    expect.objectContaining({ localmodels: fakeLocalmodels }),
-  );
+  expect(fakeLocalmodels).not.toHaveBeenCalled();
+  expect(applyNativeSource).not.toHaveBeenCalled();
   expect(restoreByokSource).not.toHaveBeenCalled();
+  // Foundation services run after all core native services start and settle.
+  expect(order.indexOf("foundations")).toBeGreaterThan(
+    Math.max(
+      order.indexOf("start:teamhub"),
+      order.indexOf("start:node-services"),
+      order.indexOf("start:web"),
+    ),
+  );
 });
-test("a cold resume with setup-choice local-models does not treat a stale BYOK sentinel runtime_model as a local library model", async () => {
+test("a cold resume with setup-choice local-models stays on standby even with a stale BYOK sentinel runtime_model", async () => {
   const f = await fixture();
   await installNativeSource({
     home: f.home,
@@ -853,8 +831,8 @@ test("a cold resume with setup-choice local-models does not treat a stale BYOK s
   expect(
     (result.details as { localModelsDegraded?: unknown }).localModelsDegraded,
   ).toBeUndefined();
-  expect(prepareLocalModels).toHaveBeenCalledTimes(1);
-  expect(restoreLocalModels).not.toHaveBeenCalled();
+  expect(prepareLocalModels).not.toHaveBeenCalled();
+  expect(restoreLocalModels).toHaveBeenCalledTimes(1);
   expect(applyNativeSource).not.toHaveBeenCalled();
 });
 test("a cold resume preserves a saved local model source even when setup-choice is a subscription runtime", async () => {
@@ -3092,7 +3070,7 @@ test("a cold resume degrades gracefully instead of blocking when local models ca
   const saved = await loadInstance({ name, home: f.home });
   await stopNativeSource(saved!, new AbortController().signal);
 
-  vi.mocked(prepareLocalModels).mockResolvedValueOnce({
+  vi.mocked(restoreLocalModels).mockResolvedValueOnce({
     code: 4,
     state: "action_required",
     message: "The upstream tool could not verify the local stack binding.",
@@ -3126,13 +3104,13 @@ test("a cold resume degrades gracefully instead of blocking when local models ca
       },
     },
   });
+  expect(prepareLocalModels).toHaveBeenCalledTimes(1);
   expect(logs.join("")).toContain("Linger is starting without local models");
 });
 
 test("an app update degrades a local model stack an earlier release stopped instead of failing the start", async () => {
-  // A 0.1.6 home that was quit before the update: its deployment is marked
-  // removed in the shared tools directory, so the saved plan cannot come back
-  // and the new kit reports it changed.
+  // A 0.1.6 home that was quit before the update: its binding reports not ready
+  // so standby verification degrades without blocking app startup.
   const f = await fixture();
   const name = "native-flow-local-models-degraded-update";
   vi.mocked(prepareLocalModels).mockResolvedValueOnce(undefined);
@@ -3159,7 +3137,7 @@ test("an app update degrades a local model stack an earlier release stopped inst
       reasons: ["deployment-unavailable"],
     },
   };
-  vi.mocked(prepareLocalModels).mockResolvedValueOnce(changed);
+  vi.mocked(restoreLocalModels).mockResolvedValueOnce(changed);
   vi.mocked(prepareModelGateway).mockRejectedValueOnce(
     new Error("local model gateway unavailable"),
   );
@@ -3182,7 +3160,7 @@ test("an app update degrades a local model stack an earlier release stopped inst
     },
   });
 
-  // Choosing local models again in setup still fails on the same refusal.
+  // Choosing local models again in setup still runs eager prepareLocalModels and fails on the same refusal.
   vi.mocked(prepareLocalModels).mockResolvedValueOnce(changed);
   const chosen = await installNativeSource({
     ...f,
@@ -3211,7 +3189,7 @@ test("a cold resume degrades gracefully when local model preparation throws", as
   const saved = await loadInstance({ name, home: f.home });
   await stopNativeSource(saved!, new AbortController().signal);
 
-  vi.mocked(prepareLocalModels).mockRejectedValueOnce(
+  vi.mocked(restoreLocalModels).mockRejectedValueOnce(
     new Error("Invalid upstream local model binding."),
   );
   vi.mocked(prepareModelGateway).mockRejectedValueOnce(

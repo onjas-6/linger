@@ -65,7 +65,6 @@ import {
   writeSetupChoice,
 } from "./setup-selection.js";
 import {
-  isLocalRuntimeModel,
   localModelsDegradedFromError,
   localModelsDegradedFromOutcome,
   prepareLocalModels,
@@ -596,51 +595,39 @@ async function runNativeSource(
             const switchedAway =
               !explicitLocal && (saved?.mode ?? "local") !== "local";
             if (!switchedAway) {
-              let prepared: InstallOutcome | undefined;
-              try {
-                prepared = await prepareLocalModels(current, {
+              if (resumeLocalModels) {
+                // Warm/cold resumes and app updates keep local models on
+                // standby: wait for any quit-time lock and verify the saved
+                // kit and binding without loading a model at boot.
+                await restoreSavedLocalModel();
+              } else {
+                const prepared = await prepareLocalModels(current, {
                   shareGpu: options.shareGpu,
                   signal,
                   onEvent: emit,
                   localModelsApproval: options.localModelsApproval,
                   localModelsReplan: options.localModelsReplan,
                 });
-              } catch (error) {
-                if (!resumeLocalModels || signal.aborted) throw error;
-                localModelsDegraded = localModelsDegradedFromError(error);
-              }
-              if (prepared && resumeLocalModels) {
-                // Failing a resume for local models would lock the person out
-                // of the workspace and the Models page that switches runtimes.
-                localModelsDegraded = localModelsDegradedFromOutcome(prepared);
-              } else {
                 runtimeOutcome = prepared;
+                // A person who chose local models just now makes them the
+                // source, replacing one an earlier setup left. A restart reads
+                // the choice from setup-choice.json and passes no approval, so
+                // a source the person switched since on the Models page stays.
+                if (
+                  !runtimeOutcome &&
+                  (options.setupChoice === "local-models" ||
+                    options.localModelsApproval)
+                )
+                  runtimeOutcome = await applyNativeSource(
+                    home,
+                    "local",
+                    "pi",
+                    {
+                      signal,
+                      onEvent: emit,
+                    },
+                  );
               }
-              if (localModelsDegraded) {
-                logLocalModelsDegraded(localModelsDegraded);
-              }
-              // A person who chose local models just now makes them the
-              // source, replacing one an earlier setup left. A restart reads
-              // the choice from setup-choice.json and passes no approval, so a
-              // source the person switched since on the Models page stays.
-              if (
-                !runtimeOutcome &&
-                !localModelsDegraded &&
-                (options.setupChoice === "local-models" ||
-                  options.localModelsApproval)
-              )
-                runtimeOutcome = await applyNativeSource(home, "local", "pi", {
-                  signal,
-                  onEvent: emit,
-                });
-              else if (
-                !runtimeOutcome &&
-                !localModelsDegraded &&
-                !options.localModelsReplan &&
-                restoredLocal &&
-                isLocalRuntimeModel(restoredLocal.runtimeModel)
-              )
-                await restoreSavedLocalModel();
             }
           } else if (restoredLocal) {
             // Setup originally chose a subscription runtime, then the person
@@ -1202,6 +1189,66 @@ async function runNativeSource(
           (Boolean(options.resume) ||
             (Boolean(options.setupChoice || options.byok) &&
               (!hadProvisionedAccount || Boolean(legacyBackup))));
+        const prepareLocalStackServices = async (
+          stageForLogs?: InstallStage,
+        ) => {
+          const foundationMainPlan =
+            !restoredByok &&
+            !options.byok &&
+            !(!explicitLocal && saved && saved.mode !== "local");
+          await timed(
+            "Preparing foundation services",
+            () =>
+              prepareFoundationServices(current, choice, {
+                home,
+                signal,
+                onEvent: emit,
+                shareGpu: options.shareGpu,
+                mainPlan: foundationMainPlan,
+              }),
+            { stage: stageForLogs },
+          );
+          // Binds the local stack's gateway for local models; with a runtime's own
+          // sign-in, retires one an earlier release started.
+          await prepareModelGateway(
+            current,
+            // A restored BYOK or subscription source keeps its own gateway
+            // choice whatever setup-choice.json recorded: a local-models
+            // choice would require the local stack.
+            restoredByok
+              ? { runtime: restoredByok.runtime, modelSource: "byok" }
+              : options.byok
+                ? {
+                    runtime:
+                      choice === "local-models"
+                        ? (options.byok.runtime ?? "claude")
+                        : choice,
+                    modelSource: "byok",
+                  }
+                : !explicitLocal && saved?.mode === "subscription"
+                  ? saved.runtime
+                  : choice,
+            {
+              home,
+              signal,
+              onEvent: emit,
+            },
+          );
+        };
+        const prepareLocalStackServicesNonBlocking = async (
+          stageForLogs?: InstallStage,
+        ) => {
+          try {
+            await prepareLocalStackServices(stageForLogs);
+          } catch (error) {
+            signal.throwIfAborted();
+            emit({
+              kind: "log",
+              stage: stageForLogs ?? "runtime",
+              message: `Local model gateway preparation skipped during resume: ${error instanceof Error ? error.message : String(error)}\n`,
+            });
+          }
+        };
         // Without `stageForLogs`, timings log under the current stage.
         // `beforeFoundation` runs once the runtime is ready, before the
         // foundation services.
@@ -1214,63 +1261,13 @@ async function runNativeSource(
           });
           signal.throwIfAborted();
           await beforeFoundation?.();
-          const prepareLocalStackServices = async () => {
-            const foundationMainPlan =
-              !restoredByok &&
-              !options.byok &&
-              !(!explicitLocal && saved && saved.mode !== "local");
-            await timed(
-              "Preparing foundation services",
-              () =>
-                prepareFoundationServices(current, choice, {
-                  home,
-                  signal,
-                  onEvent: emit,
-                  shareGpu: options.shareGpu,
-                  mainPlan: foundationMainPlan,
-                }),
-              { stage: stageForLogs },
-            );
-            // Binds the local stack's gateway for local models; with a runtime's own
-            // sign-in, retires one an earlier release started.
-            await prepareModelGateway(
-              current,
-              // A restored BYOK or subscription source keeps its own gateway
-              // choice whatever setup-choice.json recorded: a local-models
-              // choice would require the local stack.
-              restoredByok
-                ? { runtime: restoredByok.runtime, modelSource: "byok" }
-                : options.byok
-                  ? {
-                      runtime:
-                        choice === "local-models"
-                          ? (options.byok.runtime ?? "claude")
-                          : choice,
-                      modelSource: "byok",
-                    }
-                  : !explicitLocal && saved?.mode === "subscription"
-                    ? saved.runtime
-                    : choice,
-              {
-                home,
-                signal,
-                onEvent: emit,
-              },
-            );
-          };
+          // On cold start or update resume, run foundation services after
+          // core native services settle so they never compete with boot.
+          if (resumeLocalModels) return;
           if (localModelsDegraded) {
-            try {
-              await prepareLocalStackServices();
-            } catch (error) {
-              signal.throwIfAborted();
-              emit({
-                kind: "log",
-                stage: stageForLogs ?? "runtime",
-                message: `Local model gateway preparation skipped during degraded resume: ${error instanceof Error ? error.message : String(error)}\n`,
-              });
-            }
+            await prepareLocalStackServicesNonBlocking(stageForLogs);
           } else {
-            await prepareLocalStackServices();
+            await prepareLocalStackServices(stageForLogs);
           }
         };
         const migrate = (stageForLogs?: InstallStage) =>
@@ -1382,6 +1379,9 @@ async function runNativeSource(
           accountSucceeded();
           await runtime;
           signal.throwIfAborted();
+        }
+        if (resumeLocalModels) {
+          await prepareLocalStackServicesNonBlocking("runtime");
         }
         if (options.externalComputer) {
           const authPending =

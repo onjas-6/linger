@@ -126,6 +126,10 @@ Progress and outcomes travel back only as snapshots:
    knows `model_gateway_unavailable` reports a Run whose local model gateway it
    could not start or reach with `model_gateway_unavailable` instead of
    `execution_failed`.
+   `execute` `model_invoke` carries optional `wake_local_model` (default `true`
+   when omitted; sent only to Computer 0.65.0 and later,
+   `FIRST_MODEL_INVOKE_WAKE_LOCAL_MODEL_COMPUTER_VERSION`) so passive
+   background maintenance calls do not wake standby local models.
 2. Agent Service records it through TeamHub `recordAgentRuntimeLocalModels`
    (`POST /v0/agent-runtime/local-computers/local-models`). TeamHub keeps the
    latest snapshot per Computer, so an offline Computer shows what it last

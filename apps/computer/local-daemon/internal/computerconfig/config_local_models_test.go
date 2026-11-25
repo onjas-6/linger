@@ -31,6 +31,25 @@ func TestLocalModelsConfigReadsToolLocation(t *testing.T) {
 	}
 }
 
+func TestLocalModelsConfigReadsIdleUnloadSeconds(t *testing.T) {
+	root := t.TempDir()
+	base := fmt.Sprintf(`"python":%q,"module_directory":%q,"state_directory":%q,"base_directory":%q`,
+		filepath.Join(root, "kit", "python", "bin", "python3"), filepath.Join(root, "kit"),
+		filepath.Join(root, "state"), filepath.Join(root, "models"))
+	for _, want := range []int{0, 900, 1800} {
+		config, err := loadConfigFields(t, fmt.Sprintf(`,"local_models":{%s,"idle_unload_seconds":%d}`, base, want))
+		if err != nil {
+			t.Fatalf("idle_unload_seconds=%d: %v", want, err)
+		}
+		if config.LocalModels == nil || config.LocalModels.IdleUnloadSeconds == nil || *config.LocalModels.IdleUnloadSeconds != want {
+			t.Fatalf("IdleUnloadSeconds = %+v, want %d", config.LocalModels, want)
+		}
+	}
+	if _, err := loadConfigFields(t, fmt.Sprintf(`,"local_models":{%s,"idle_unload_seconds":-1}`, base)); err == nil {
+		t.Fatal("negative idle_unload_seconds was accepted")
+	}
+}
+
 func TestLocalModelsConfigRejectsRelativeOrMissingPaths(t *testing.T) {
 	for _, field := range []string{
 		`,"local_models":{"python":"python3","module_directory":"/kit","state_directory":"/s","base_directory":"/b"}`,

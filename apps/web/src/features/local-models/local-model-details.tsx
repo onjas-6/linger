@@ -256,7 +256,7 @@ export function ModelFacts({
     poolFreeBytes(pool) < model.memory_bytes;
   const computerId = view.computer.computer_id;
   const usedNames = usedByAgentNames(entry, assignableAgents, computerId);
-  const idleUsedWarning =
+  const standbyUsedNote =
     status === "idle" && !model.note && usedNames.length > 0;
   const unassigned = assignableAgents.filter(
     (agent) => !isAgentUsingModel(entry, agent, computerId),
@@ -377,10 +377,10 @@ export function ModelFacts({
           </Fact>
         </div>
       ) : null}
-      {idleUsedWarning ? (
+      {standbyUsedNote ? (
         <div className="my-1.5">
-          <FormFeedback tone="warning">
-            {t(m.idleUsedWarning, {
+          <FormFeedback tone="info">
+            {t(m.standbyAutoLoadNote, {
               count: usedNames.length,
               names: joinList(usedNames, t),
             })}

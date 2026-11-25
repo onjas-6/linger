@@ -81,6 +81,11 @@ export const FIRST_PREVIOUS_SESSION_COMPUTER_VERSION = "0.63.0";
 // welcome feature and gates per-model `concurrency_probing` behind it.
 export const FIRST_LOCAL_MODELS_CONCURRENCY_PROBE_COMPUTER_VERSION = "0.64.0";
 
+// The first release that decodes `wake_local_model` on `execute`
+// `model_invoke`. An older Computer rejects the unknown field and closes the
+// connection, so the field is omitted for it.
+export const FIRST_MODEL_INVOKE_WAKE_LOCAL_MODEL_COMPUTER_VERSION = "0.65.0";
+
 const COMPUTER_RELEASE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 /** Source builds report `dev` and follow the current wire contract. */

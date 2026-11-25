@@ -44,10 +44,11 @@ type Config struct {
 // and the working directory set to ModuleDirectory, LOCALMODELS_STATE set to
 // StateDirectory and --base-dir set to BaseDirectory.
 type LocalModels struct {
-	Python          string
-	ModuleDirectory string
-	StateDirectory  string
-	BaseDirectory   string
+	Python            string
+	ModuleDirectory   string
+	StateDirectory    string
+	BaseDirectory     string
+	IdleUnloadSeconds *int
 }
 
 // Desktop configures a Daemon owned by the Linger Desktop app. The app ships
@@ -91,10 +92,11 @@ type encodedConfig struct {
 }
 
 type encodedLocalModels struct {
-	Python          string `json:"python"`
-	ModuleDirectory string `json:"module_directory"`
-	StateDirectory  string `json:"state_directory"`
-	BaseDirectory   string `json:"base_directory"`
+	Python            string `json:"python"`
+	ModuleDirectory   string `json:"module_directory"`
+	StateDirectory    string `json:"state_directory"`
+	BaseDirectory     string `json:"base_directory"`
+	IdleUnloadSeconds *int   `json:"idle_unload_seconds,omitempty"`
 }
 
 type encodedDesktop struct {
@@ -151,9 +153,13 @@ func Load(path string, environment map[string]string) (Config, error) {
 				return Config{}, errors.New("local_models paths must be absolute")
 			}
 		}
+		if encoded.IdleUnloadSeconds != nil && *encoded.IdleUnloadSeconds < 0 {
+			return Config{}, errors.New("local_models.idle_unload_seconds must be non-negative")
+		}
 		localModels = &LocalModels{
 			Python: encoded.Python, ModuleDirectory: encoded.ModuleDirectory,
 			StateDirectory: encoded.StateDirectory, BaseDirectory: encoded.BaseDirectory,
+			IdleUnloadSeconds: encoded.IdleUnloadSeconds,
 		}
 	}
 	var token string

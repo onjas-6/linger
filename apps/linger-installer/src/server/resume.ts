@@ -89,14 +89,15 @@ export async function resumeSourceInstance(
     !(await pending(instance))
   ) {
     // A quit stops the local models and the Bifrost gateway a BYOK source
-    // runs on, but leaves the services running, so they come back here
-    // rather than with the services.
+    // runs on, but leaves the services running. Local models stay on standby
+    // (verified here without loading a model) and load on demand on the next
+    // message; a BYOK gateway comes back here.
     const onEvent = (event: { message?: string }) => {
       if (event.message) options.log(event.message);
     };
-    // A local model stack that did not come back is reported, not a failed
-    // resume: the person can still reach the workspace and the Models page
-    // to manage local models or choose another AI runtime.
+    // A local model standby check that did not succeed is reported, not a
+    // failed resume: the person can still reach the workspace and the Models
+    // page to manage local models or choose another AI runtime.
     let localModelsDegraded: LocalModelsDegraded | undefined;
     try {
       const restored = await restore(instance, {

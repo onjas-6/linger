@@ -260,29 +260,26 @@ when `stack up` fails or the binding still needs repair (such as
 `localmodels.stack-up/v1` failures are translated to
 redacted human-readable messages with their `causeCode` in `details.causeCode`,
 and an unreviewable saved plan returns `LOCAL_MODELS_RECOVERY_REQUIRED` with
-`STACK_PLAN_INVALID`. `restoreLocalModels` (`local-models.ts`) brings back a
-local model source's stack and unloaded library model while its services keep
-running (and on cold resume when `model-source.json` says `local`), such as
-after the desktop's quit stopped them, whenever the active model source is
-`local` (or not saved yet on a `local-models` setup): when a saved
-`runtime_model` is recorded, a ready binding checks `library status` so a
-quit-time `library unload` or a `failed` server (`HEALTH_CHECK_FAILED` or other
-non-stopped-download failure, reset with `library unload` first) reloads that
-saved model and re-applies the local source under the same lock (never guessing
-an arbitrary idle model when no `runtime_model` is saved; stopped downloads
-return a degraded outcome without loading), while a stopped plan gets the same
-restore (`stack up`, falling back to `stack apply`), verifies whether a saved
-local model (`localmodels/` or `localmodels-library/`) is loaded, and sets the
-local source again. Quit-time `stopLocalmodels` (`localmodels-tool.ts`) unloads
+`STACK_PLAN_INVALID`. `restoreLocalModels` (`local-models.ts`) uses
+Standby-First resume for warm restarts, cold starts, and app updates whenever
+the active model source is `local` (or not saved yet on a `local-models`
+setup): it waits for any quit-time `operation.sqlite` lock, verifies the pinned
+`localmodels` kit and preserved `binding.json` (`ready: true` is kept intact
+and never overwritten as unready), and skips `stack up` and `library load` at
+boot so downloaded models stay on standby until the Computer Daemon JIT-loads
+them on the first message. First-time Quick Install (`setupChoice ===
+"local-models"` or explicit plan approval) still runs `prepareLocalModels`
+eagerly. On resume/update (`resumeLocalModels`), `prepareFoundationServices`
+and `prepareModelGateway` are deferred non-blockingly until after
+`startAndAwaitServices` settles so they never compete with core service boot.
+Quit-time `stopLocalmodels` (`localmodels-tool.ts`) unloads
 both `loaded` models and non-stopped-download `failed` models so a dead server
-resets to `idle` before `stack down`. Library-model reload failures return a
-failure outcome that warm
-and cold resume surface in `details.localModelsDegraded` so startup stays usable
-and the person can still reach the Models page. The first start after an app
-update onto a new checkout passes `degradeLocalModels` without `resume` (it
-installs newer runtimes in full) and degrades the same way, so a stack an
-earlier release left stopped, which the new kit cannot bring back as saved,
-never locks the person out. On cold resume, a saved `local`
+resets to `idle` before `stack down`. Standby verification failures return an
+outcome that warm and cold resume surface in `details.localModelsDegraded` so
+startup stays usable and the person can still reach the Models page. The first
+start after an app update onto a new checkout passes `degradeLocalModels`
+without `resume` (it installs newer runtimes in full) and degrades the same
+way. On cold resume, a saved `local`
 source preserves local mode and prepares its runtime instead of letting an older
 `setup-choice.json` overwrite `model-source.json` back to `subscription`.
 Deployments, that check and the quit-time stop share one lock per home

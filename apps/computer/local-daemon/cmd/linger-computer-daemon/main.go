@@ -356,12 +356,18 @@ func run(args []string) (resultErr error) {
 	if piEnabled && !hasPi {
 		libraryHarnessDir = localmodels.HarnessRoot(localModelsStateDir)
 	}
+	var idleUnloadTTL *time.Duration
+	if computer.LocalModels != nil && computer.LocalModels.IdleUnloadSeconds != nil {
+		ttl := time.Duration(*computer.LocalModels.IdleUnloadSeconds) * time.Second
+		idleUnloadTTL = &ttl
+	}
 	localModels = localmodels.New(localmodels.Options{
 		Tool: localModelsTool, Environment: baseProviderEnvironment,
 		JobDirectory:        jobDir,
 		ProbeCacheDirectory: filepath.Join(computer.StateDirectory, "local-models"),
 		HarnessDirectory:    libraryHarnessDir,
 		NodePath:            nodePath,
+		IdleUnloadTTL:       idleUnloadTTL,
 		// The library publishes only from Act and Refresh, which the Daemon
 		// calls once it runs.
 		Publish: func(snapshot wire.LocalModelsSnapshot) { localDaemon.PublishLocalModels(snapshot) },

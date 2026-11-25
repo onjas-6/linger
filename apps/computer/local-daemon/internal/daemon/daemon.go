@@ -229,6 +229,7 @@ type activeOperation struct {
 	execution         *provider.Execution
 	reason            string
 	mcpProxies        *mcpproxy.Set
+	releaseLocalModel func()
 	terminalCommitted bool
 	inputMu           sync.Mutex
 	finishing         bool
