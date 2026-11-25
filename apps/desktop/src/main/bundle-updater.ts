@@ -117,7 +117,9 @@ export class BundleUpdaterModule implements Module {
   #timer: NodeJS.Timeout | undefined;
   #checking: Promise<void> | undefined;
   #generation = 0;
+  #started = false;
   #consecutiveFailures = 0;
+  #lastCheckSucceeded = false;
 
   constructor(options: BundleUpdaterOptions) {
     this.#options = options;
@@ -127,42 +129,55 @@ export class BundleUpdaterModule implements Module {
     return this.#state;
   }
 
+  lastCheckSucceeded(): boolean {
+    return this.#lastCheckSucceeded;
+  }
+
   async start(ctx: ModuleContext): Promise<void> {
     this.#ctx = ctx;
     const generation = ++this.#generation;
     clearTimeout(this.#timer);
     this.#timer = undefined;
-    if (this.#options.enabled === false) return;
-
-    const schedule = (delay: number): void => {
-      if (this.#generation !== generation) return;
-      this.#timer = setTimeout(() => {
-        if (this.#generation !== generation) return;
-        void this.check().finally(() => {
-          if (this.#generation !== generation) return;
-          schedule(
-            this.#state.kind === "failed"
-              ? this.#nextRetryDelayMs()
-              : (this.#options.checkIntervalMs ?? CHECK_INTERVAL_MS),
-          );
-        });
-      }, delay);
-      this.#timer.unref?.();
-    };
-    schedule(this.#options.checkDelayMs ?? CHECK_DELAY_MS);
+    if (this.#options.enabled === false) {
+      this.#started = false;
+      return;
+    }
+    this.#started = true;
+    this.#schedule(generation, this.#options.checkDelayMs ?? CHECK_DELAY_MS);
   }
 
   async stop(): Promise<void> {
+    this.#started = false;
     this.#generation += 1;
     clearTimeout(this.#timer);
     this.#timer = undefined;
   }
 
+  #schedule(generation: number, delay: number): void {
+    if (this.#generation !== generation || !this.#started) return;
+    clearTimeout(this.#timer);
+    this.#timer = setTimeout(() => {
+      if (this.#generation !== generation || !this.#started) return;
+      this.#timer = undefined;
+      void this.check();
+    }, delay);
+    this.#timer.unref?.();
+  }
+
   check(): Promise<void> {
     if (this.#options.enabled === false) return Promise.resolve();
     if (this.#checking) return this.#checking;
+    const generation = this.#generation;
     this.#checking = this.#check().finally(() => {
       this.#checking = undefined;
+      if (this.#started && this.#generation === generation) {
+        this.#schedule(
+          generation,
+          this.#state.kind === "failed"
+            ? this.#nextRetryDelayMs()
+            : (this.#options.checkIntervalMs ?? CHECK_INTERVAL_MS),
+        );
+      }
     });
     return this.#checking;
   }
@@ -196,6 +211,7 @@ export class BundleUpdaterModule implements Module {
       );
       if (!manifest) {
         this.#consecutiveFailures = 0;
+        this.#lastCheckSucceeded = true;
         this.#setState({ kind: "idle" });
         return;
       }
@@ -206,6 +222,7 @@ export class BundleUpdaterModule implements Module {
       );
       if (!resolved) {
         this.#consecutiveFailures = 0;
+        this.#lastCheckSucceeded = true;
         return;
       }
 
@@ -216,6 +233,7 @@ export class BundleUpdaterModule implements Module {
         compareVersions(resolved.appVersion, currentPtr.appVersion) <= 0
       ) {
         this.#consecutiveFailures = 0;
+        this.#lastCheckSucceeded = true;
         this.#setState({ kind: "idle" });
         return;
       }
@@ -225,6 +243,7 @@ export class BundleUpdaterModule implements Module {
           appVersion: resolved.appVersion,
         });
         this.#consecutiveFailures = 0;
+        this.#lastCheckSucceeded = true;
         this.#setState({ kind: "idle" });
         return;
       }
@@ -241,6 +260,7 @@ export class BundleUpdaterModule implements Module {
           percent: resolved.rollout.percent,
         });
         this.#consecutiveFailures = 0;
+        this.#lastCheckSucceeded = true;
         this.#setState({ kind: "idle" });
         return;
       }
@@ -252,6 +272,7 @@ export class BundleUpdaterModule implements Module {
         currentDesc,
       );
       this.#consecutiveFailures = 0;
+      this.#lastCheckSucceeded = true;
       this.#setState({
         kind: "staged",
         version: resolved.appVersion,
@@ -264,6 +285,7 @@ export class BundleUpdaterModule implements Module {
       ctx.bus.emit("bundle.staged", resolved.appVersion, changedModules);
     } catch (error) {
       this.#consecutiveFailures += 1;
+      this.#lastCheckSucceeded = false;
       const message =
         error instanceof ManifestError || error instanceof Error
           ? error.message

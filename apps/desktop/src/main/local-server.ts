@@ -4690,22 +4690,24 @@ export async function unpackArchive(
   const fallback = options.fallback ?? extractArchiveFallback;
   await removeRetrying(unpacked);
   await mkdir(unpacked, { recursive: true, mode: 0o700 });
+  const realUnpacked = await realpath(unpacked).catch(() => unpacked);
+  const realFile = await realpath(file).catch(() => file);
   try {
     // Windows' tar may not read zstd; Node's zlib does, and tar reads stdin.
     if (file.endsWith(".zst")) {
       await runCommand(
         command,
         ["-xf", "-", "--strip-components=1"],
-        unpacked,
+        realUnpacked,
         signal,
-        createReadStream(file, { signal }).pipe(createZstdDecompress()),
+        createReadStream(realFile, { signal }).pipe(createZstdDecompress()),
       );
       return;
     }
     await runCommand(
       command,
-      ["-xf", path.relative(unpacked, file), "--strip-components=1"],
-      unpacked,
+      ["-xf", path.relative(realUnpacked, realFile), "--strip-components=1"],
+      realUnpacked,
       signal,
     );
   } catch (error) {

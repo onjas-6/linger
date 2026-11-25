@@ -168,16 +168,38 @@ export class TrayModule implements Module {
 
   #mergedUpdateState(): UpdateState {
     const shellUpdate = this.#ctx!.get<UpdaterModule>("Updater").state();
-    if (shellUpdate.kind !== "idle") return shellUpdate;
+    if (
+      shellUpdate.kind === "available" ||
+      shellUpdate.kind === "downloading" ||
+      shellUpdate.kind === "ready" ||
+      shellUpdate.kind === "waiting" ||
+      shellUpdate.kind === "installing"
+    ) {
+      return shellUpdate;
+    }
     const orch = this.#optional<ReleaseOrchestratorModule>("ReleaseOrchestrator")?.state();
     if (orch?.kind === "ready") return { kind: "ready", version: orch.version };
     if (orch?.kind === "waiting") return { kind: "waiting", version: orch.version };
     if (orch?.kind === "applying") return { kind: "installing", version: orch.version };
-    const bundle = this.#optional<BundleUpdaterModule>("BundleUpdater")?.state();
+    const bundleUpdater = this.#optional<BundleUpdaterModule>("BundleUpdater");
+    const bundle = bundleUpdater?.state();
     if (bundle?.kind === "downloading") return { kind: "downloading", version: bundle.version };
-    if (bundle?.kind === "checking") return { kind: "checking" };
+    if (bundle?.kind === "checking" || shellUpdate.kind === "checking") {
+      return { kind: "checking" };
+    }
+    const hasCustomV2Feed = Boolean(
+      process.env.LINGER_UPDATE_FEED_URL?.trim() ||
+        this.#ctx!.config.get().updateFeedUrl,
+    );
+    if (shellUpdate.kind === "failed") {
+      if (hasCustomV2Feed) {
+        if (bundle?.kind === "failed") return { kind: "failed", error: bundle.error };
+        if (bundleUpdater?.lastCheckSucceeded()) return { kind: "idle" };
+      }
+      return shellUpdate;
+    }
     if (bundle?.kind === "failed") return { kind: "failed", error: bundle.error };
-    return shellUpdate;
+    return { kind: "idle" };
   }
 
   #menu(): Menu {
@@ -230,8 +252,14 @@ export class TrayModule implements Module {
         const updater = ctx.get<UpdaterModule>("Updater");
         const orchestrator = this.#optional<ReleaseOrchestratorModule>("ReleaseOrchestrator");
         const orchState = orchestrator?.state();
+        const shellKind = updater.state().kind;
+        const shellOwnsInstall =
+          shellKind === "available" ||
+          shellKind === "ready" ||
+          shellKind === "waiting" ||
+          shellKind === "installing";
         if (
-          updater.state().kind === "idle" &&
+          !shellOwnsInstall &&
           (orchState?.kind === "ready" || orchState?.kind === "waiting")
         ) {
           void orchestrator!.applyStaged();

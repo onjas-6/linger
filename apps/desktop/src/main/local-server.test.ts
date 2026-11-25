@@ -57,6 +57,7 @@ import {
   SignInRejectedError,
   signInFailure,
   signInWithPassword,
+  unpackArchive,
   type LocalServerIdentity,
   type LocalServerOptions,
 } from "./local-server.js";
@@ -5897,4 +5898,34 @@ describe("InstallerApi polling", () => {
     ).rejects.toThrow();
     expect(fake.reads()).toBe(1);
   });
+});
+
+describe("unpackArchive", () => {
+  it.skipIf(process.platform === "win32")(
+    "unpacks a tar.gz archive when the target path traverses a depth-changing symlink",
+    async () => {
+      const root = tempDirectory();
+      const archiveRoot = path.join(root, "app-bundle");
+      mkdirSync(archiveRoot, { recursive: true });
+      const { bytes } = sourceArchive(archiveRoot);
+      const archiveFile = path.join(archiveRoot, "linger.tar.gz");
+      writeFileSync(archiveFile, bytes);
+
+      // Reproduces macOS /tmp -> /private/tmp where the symlink path is
+      // shallower than its realpath, breaking naive path.relative(unpacked, file).
+      const realHome = path.join(root, "private", "tmp", "home");
+      mkdirSync(realHome, { recursive: true });
+      const symlinkHome = path.join(root, "tmp-link");
+      symlinkSync(realHome, symlinkHome);
+
+      const unpacked = path.join(symlinkHome, "unpacked");
+      await unpackArchive(archiveFile, unpacked, new AbortController().signal);
+      expect(
+        existsSync(path.join(unpacked, "scripts", "source-native.mjs")),
+      ).toBe(true);
+      expect(
+        JSON.parse(readFileSync(path.join(unpacked, "package.json"), "utf8")),
+      ).toEqual({ name: "linger" });
+    },
+  );
 });

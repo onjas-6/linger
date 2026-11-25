@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { packDeterministicTarZst } from "../../scripts/build-app-bundles.mjs";
 import { BundleStoreModule } from "./bundle-store.js";
@@ -294,5 +294,71 @@ describe("BundleUpdaterModule", () => {
     expect(updater.state()).toEqual({ kind: "idle" });
     expect(await store.readCurrent()).toBeUndefined();
     await host.stop("quit");
+  });
+
+  it("resets long retry backoff timer back to checkIntervalMs after a manual check() succeeds", async () => {
+    const home = await makeTempDir("linger-backoff-home-");
+    const store = new BundleStoreModule({ home, target: "darwin-arm64" });
+    const config = new ConfigStore(path.join(home, "config.json"), {
+      updateFeedUrl: "https://cdn.example.com/linger",
+    });
+
+    let failFetch = true;
+    let manifestChecks = 0;
+    const updater = new BundleUpdaterModule({
+      shellVersion: "0.2.0",
+      target: "darwin-arm64",
+      enabled: true,
+      checkDelayMs: 20,
+      retryDelayMs: 60_000,
+      checkIntervalMs: 80,
+      fetch: async (input) => {
+        if (input.toString().endsWith("/app-manifest.json")) {
+          manifestChecks += 1;
+        }
+        if (failFetch) {
+          throw new TypeError("fetch failed");
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    const host = new ModuleHost(
+      [
+        { name: "Config", dependsOn: [], start: async () => {}, stop: async () => {} },
+        store,
+        updater,
+      ],
+      { config, log: noopLog, bus: new EventBus() },
+    );
+    await host.start();
+    try {
+      // Initial scheduled check fails and enters 60s retry backoff.
+      await vi.waitFor(
+        () => {
+          expect(manifestChecks).toBeGreaterThanOrEqual(1);
+          expect(updater.state().kind).toBe("failed");
+        },
+        { timeout: 1_000 },
+      );
+      expect(updater.lastCheckSucceeded()).toBe(false);
+
+      // Manual check succeeds -> must cancel 60s backoff and reschedule at 80ms.
+      failFetch = false;
+      const beforeManual = manifestChecks;
+      await updater.check();
+      expect(updater.state()).toEqual({ kind: "idle" });
+      expect(updater.lastCheckSucceeded()).toBe(true);
+      expect(manifestChecks).toBe(beforeManual + 1);
+
+      // Next scheduled poll fires quickly at ~checkIntervalMs (not 60s).
+      await vi.waitFor(
+        () => {
+          expect(manifestChecks).toBeGreaterThanOrEqual(beforeManual + 2);
+        },
+        { timeout: 1_500 },
+      );
+    } finally {
+      await host.stop("quit");
+    }
   });
 });

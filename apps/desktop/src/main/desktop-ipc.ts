@@ -275,9 +275,24 @@ export class DesktopIpcModule implements Module {
       "ReleaseOrchestrator",
     );
 
+    const ACTIVE_SHELL_UPDATE_KINDS = new Set<DesktopUpdateState["kind"]>([
+      "available",
+      "downloading",
+      "ready",
+      "waiting",
+      "installing",
+    ]);
+    const SHELL_INSTALL_KINDS = new Set([
+      "available",
+      "ready",
+      "waiting",
+      "installing",
+    ]);
+
     const mergedUpdateState = (): DesktopUpdateState => {
       const shellState = updateView(updater.state());
-      if (shellState.kind !== "idle") return shellState;
+      if (ACTIVE_SHELL_UPDATE_KINDS.has(shellState.kind)) return shellState;
+
       const orchState = orchestrator?.state();
       if (orchState?.kind === "ready") {
         return {
@@ -303,6 +318,7 @@ export class DesktopIpcModule implements Module {
           action: orchState.diff.action,
         };
       }
+
       const bState = bundleUpdater?.state();
       if (bState?.kind === "downloading") {
         const onlyWeb =
@@ -319,7 +335,6 @@ export class DesktopIpcModule implements Module {
           },
         };
       }
-      if (bState?.kind === "checking") return { kind: "checking" };
       if (bState?.kind === "shell-required") {
         return {
           kind: "available",
@@ -328,10 +343,29 @@ export class DesktopIpcModule implements Module {
           action: "download-shell",
         };
       }
+      if (bState?.kind === "checking" || shellState.kind === "checking") {
+        return { kind: "checking" };
+      }
+
+      const hasCustomV2Feed = Boolean(
+        process.env.LINGER_UPDATE_FEED_URL?.trim() ||
+          ctx.config.get().updateFeedUrl,
+      );
+      if (shellState.kind === "failed") {
+        if (hasCustomV2Feed) {
+          if (bState?.kind === "failed") {
+            return { kind: "failed", error: bState.error };
+          }
+          if (bundleUpdater?.lastCheckSucceeded()) {
+            return { kind: "idle" };
+          }
+        }
+        return shellState;
+      }
       if (bState?.kind === "failed") {
         return { kind: "failed", error: bState.error };
       }
-      return shellState;
+      return { kind: "idle" };
     };
 
     const versionInfo = async (): Promise<DesktopVersionInfo> => {
@@ -351,7 +385,7 @@ export class DesktopIpcModule implements Module {
     handle(IPC.updateInstall, async () => {
       const orchState = orchestrator?.state();
       if (
-        updater.state().kind === "idle" &&
+        !SHELL_INSTALL_KINDS.has(updater.state().kind) &&
         (orchState?.kind === "ready" || orchState?.kind === "waiting")
       ) {
         await orchestrator!.applyStaged();
